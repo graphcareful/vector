@@ -74,7 +74,7 @@ enum Strategy {
 // when there's required fields.
 //
 // Maybe showing defaults at all, when there are required properties, doesn't actually make sense? :thinkies:
-#[configurable_component(source("aws_s3", "Collect logs from AWS S3."))]
+#[configurable_component(source("aws_s44", "Collect logs from AWS S3."))]
 #[derive(Clone, Debug, Derivative)]
 #[derivative(Default)]
 #[serde(default, deny_unknown_fields)]
