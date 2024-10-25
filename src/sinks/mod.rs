@@ -18,7 +18,7 @@ pub mod aws_cloudwatch_metrics;
     feature = "sinks-aws_kinesis_firehose",
 ))]
 pub mod aws_kinesis;
-#[cfg(feature = "sinks-aws_s3")]
+#[cfg(feature = "sinks-aws_s344")]
 pub mod aws_s3;
 #[cfg(feature = "sinks-aws_sqs")]
 pub mod aws_s_s;
