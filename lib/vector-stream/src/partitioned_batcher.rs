@@ -17,7 +17,7 @@ use vector_core::{partition::Partitioner, time::KeyedTimer};
 use crate::batcher::{
     config::BatchConfigParts,
     data::BatchData,
-    limiter::{ByteSizeOfItemSize, ItemBatchSize, SizeLimit},
+    limiter::{BatchLimiter, ByteSizeOfItemSize, ItemBatchSize, SizeLimit},
     BatchConfig,
 };
 
@@ -129,6 +129,20 @@ impl BatcherSettings {
         }
     }
 
+    /// A batcher config that the user can customize with their own batch limiter. Useful for cases
+    /// where the batch size is not the only deciding factor on when to consider batch closed.
+    /// The output is a `Vec<T>`
+    pub fn as_custom_config<T, BL>(&self, batch_limiter: BL) -> BatchConfigParts<BL, Vec<T>>
+    where
+        BL: BatchLimiter<T, Vec<T>>,
+    {
+        BatchConfigParts {
+            batch_limiter,
+            batch_data: vec![],
+            timeout: self.timeout,
+        }
+    }
+
     /// A batcher config using the `ByteSizeOf` trait to determine batch sizes.
     /// The output is a  `Vec<T>`.
     pub fn as_byte_size_config<T: ByteSizeOf>(
@@ -143,16 +157,12 @@ impl BatcherSettings {
     where
         I: ItemBatchSize<T>,
     {
-        BatchConfigParts {
-            batch_limiter: SizeLimit {
-                batch_size_limit: self.size_limit,
-                batch_item_limit: self.item_limit,
-                current_size: 0,
-                item_size_calculator: item_size,
-            },
-            batch_data: vec![],
-            timeout: self.timeout,
-        }
+        self.as_custom_config(SizeLimit {
+            batch_size_limit: self.size_limit,
+            batch_item_limit: self.item_limit,
+            current_size: 0,
+            item_size_calculator: item_size,
+        })
     }
 
     /// A batcher config using the `ItemBatchSize` trait to determine batch sizes.
@@ -362,6 +372,7 @@ mod test {
     use vector_core::{partition::Partitioner, time::KeyedTimer};
 
     use crate::{
+        //batcher::{data::BatchData, limiter::BatchLimiter, limiter::ItemBatchSize},
         partitioned_batcher::{ExpirationQueue, PartitionedBatcher},
         BatcherSettings,
     };
@@ -458,6 +469,90 @@ mod test {
             key_space: NonZeroU8::new(ks).unwrap(),
         })
     }
+
+    //proptest! {
+    //    #[test]
+    //    fn custom_hint_eq(stream: Vec<u64>,
+    //                      item_limit in 1..u16::MAX,
+    //                      allocation_limit in 8..128,
+    //                      partitioner in arb_partitioner(),
+    //                      timer in arb_timer()) {
+    //        /// Batches until a certain number of odds are observed
+    //        struct OddBatcher<T> {
+    //            max: usize,
+    //            cur: usize,
+    //            size_calculator: T,
+    //        }
+    //        impl<T> OddBatcher<T> {
+    //            fn new(threshold: usize, size_calculator: T) -> Self { Self { max: threshold, cur: 0, size_calculator } }
+    //        }
+    //        struct OddBatchSize;
+    //        impl ItemBatchSize<usize> for OddBatchSize {
+    //            /// BatchSize is 1 if odd, 0 if even
+    //            fn size(&self, item: &usize) -> usize { item % 2 }
+    //        }
+    //        impl<T, B, I> BatchLimiter<T, B> for OddBatcher<I>
+    //        where
+    //            B: BatchData<T>,
+    //            I: ItemBatchSize<T>,
+    //        {
+    //            type ItemMetadata = usize;
+    //
+    //            fn is_batch_full(&self, _batch: &B) -> bool {
+    //                self.cur >= self.max
+    //            }
+    //
+    //            fn item_fits_in_batch(&self, item: &T, _batch: &B) -> (bool, Self::ItemMetadata) {
+    //                let size = self.cur + self.size_calculator.size(item);
+    //                (size < self.max, size)
+    //            }
+    //
+    //            fn push_item(&mut self, meta: Self::ItemMetadata) {
+    //                self.cur = meta
+    //            }
+    //
+    //            fn reset(&mut self) {
+    //                self.cur = 0
+    //            }
+    //        }
+    //
+    //        // Asserts that the size hint of the batcher stream is the same as
+    //        // that of the internal stream. In the future we may want to produce
+    //        // a tighter bound -- since batching will reduce some streams -- but
+    //        // this is the worst case where every incoming item maps to a unique
+    //        // key.
+    //        let noop_waker = futures::task::noop_waker();
+    //        let mut cx = Context::from_waker(&noop_waker);
+    //        let mut stream = stream::iter(stream.into_iter());
+    //        let item_limit = NonZeroUsize::new(item_limit as usize).unwrap();
+    //        let allocation_limit = NonZeroUsize::new(allocation_limit as usize).unwrap();
+    //        let batch_settings = BatcherSettings::new(Duration::from_secs(100), allocation_limit, item_limit);
+    //
+    //        let mut batcher = PartitionedBatcher::with_timer(&mut stream, partitioner, timer,
+    //                                          Box::new(move || batch_settings.as_custom_config(NoLimitBatcher::new())));
+    //        let mut batcher = Pin::new(&mut batcher);
+    //
+    //        let mut batch_itrs = 0;
+    //        loop {
+    //            match batcher.as_mut().poll_next(&mut cx) {
+    //                //advance(timeout + Duration::from_secs(1)).await;
+    //                Poll::Pending => {}
+    //                Poll::Ready(None) => {
+    //                    break;
+    //                }
+    //                Poll::Ready(Some((_, batch))) => {
+    //                    debug_assert!(
+    //                        batch.len() <= item_limit.get(),
+    //                        "{} < {}",
+    //                        batch.len(),
+    //                        item_limit.get()
+    //                    );
+    //                }
+    //            }
+    //        }
+    //        batcher.as_mut().state().total;
+    //    }
+    //}
 
     proptest! {
         #[test]
