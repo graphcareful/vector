@@ -1,5 +1,6 @@
 use std::io::Read;
 
+use itertools::Itertools;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use bytes::Bytes;
 use chrono::Utc;
@@ -16,6 +17,7 @@ use vector_lib::{
     EstimatedJsonEncodedSizeOf,
 };
 use vector_lib::{
+    event::Value,
     finalization::AddBatchNotifier,
     internal_event::{
         ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Registered,
@@ -32,7 +34,7 @@ use super::{
 use crate::{
     codecs::Decoder,
     config::log_schema,
-    event::{BatchStatus, Event},
+    event::{BatchStatus, Event, LogEvent},
     internal_events::{
         AwsKinesisFirehoseAutomaticRecordDecodeError, EventsReceived, StreamClosedError,
     },
@@ -188,6 +190,46 @@ pub(super) async fn firehose(
         timestamp: Utc::now(),
         error_message: None,
     }))
+}
+
+#[derive(Debug, Snafu)]
+pub enum ExpansionError {
+    #[snafu(display("Event is not a log"))]
+    NotLog,
+    #[snafu(display("Firehose element is not an object"))]
+    NotObject,
+    #[snafu(display("Firehose logEvent entry is not an object"))]
+    LogEventItemNotObject,
+}
+
+/// Returns a list of individual events expanded from a list of batches of events
+fn expand_events(events: Vec<Event>) -> Result<Vec<Event>, ExpansionError> {
+    events.into_iter().map(|e| expand_event(e)).flatten_ok().collect::<Result<Vec<Event>, ExpansionError>>()
+}
+
+/// Returns a list of individual events from a single batched firehose event
+fn expand_event(event: Event) -> Result<Vec<Event>, ExpansionError> {
+    let Some(log) = event.try_into_log() else {
+        return Err(ExpansionError::NotLog);
+    };
+    let (value, event_metadata) = log.into_parts();
+    let Some(mut value_obj) = value.into_object() else {
+        return Err(ExpansionError::NotObject);
+    };
+    let log_events = value_obj.remove("logEvent");
+    log_events
+        .into_iter()
+        .map(|e| {
+            let mut content_obj = e
+                .into_object()
+                .ok_or(ExpansionError::LogEventItemNotObject)?;
+            content_obj.extend(value_obj.clone());
+            Ok(Event::Log(LogEvent::from_parts(
+                Value::Object(content_obj),
+                event_metadata.clone(),
+            )))
+        })
+        .collect::<Result<Vec<Event>, ExpansionError>>()
 }
 
 #[derive(Debug, Snafu)]
