@@ -29,6 +29,7 @@ pub fn firehose(
     acknowledgements: bool,
     out: SourceSender,
     log_namespace: LogNamespace,
+    expand_cloudwatch_event_batch: bool,
 ) -> impl Filter<Extract = (impl warp::Reply,), Error = Infallible> + Clone {
     let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
     let context = handlers::Context {
@@ -39,6 +40,7 @@ pub fn firehose(
         bytes_received,
         out,
         log_namespace,
+        expand_cloudwatch_event_batch,
     };
     warp::post()
         .and(emit_received())

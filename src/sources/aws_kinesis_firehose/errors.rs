@@ -1,6 +1,7 @@
 use snafu::Snafu;
 use warp::http::StatusCode;
 
+use super::handlers::ExpansionError;
 use super::handlers::RecordDecodeError;
 
 #[derive(Debug, Snafu)]
@@ -28,6 +29,10 @@ pub enum RequestError {
     ))]
     ParseRecords {
         source: RecordDecodeError,
+        request_id: String,
+    },
+    ParseLogEvents {
+        source: ExpansionError,
         request_id: String,
     },
     #[snafu(display("Could not decode record for request {}: {}", request_id, source))]
@@ -68,6 +73,7 @@ impl RequestError {
             Parse { .. } => StatusCode::UNAUTHORIZED,
             UnsupportedEncoding { .. } => StatusCode::BAD_REQUEST,
             ParseRecords { .. } => StatusCode::BAD_REQUEST,
+            ParseLogEvents { .. } => StatusCode::BAD_REQUEST,
             Decode { .. } => StatusCode::BAD_REQUEST,
             ShuttingDown { .. } => StatusCode::SERVICE_UNAVAILABLE,
             UnsupportedProtocolVersion { .. } => StatusCode::BAD_REQUEST,
@@ -84,6 +90,7 @@ impl RequestError {
             Parse { ref request_id, .. } => Some(request_id),
             UnsupportedEncoding { ref request_id, .. } => Some(request_id),
             ParseRecords { ref request_id, .. } => Some(request_id),
+            ParseLogEvents { ref request_id, .. } => Some(request_id),
             Decode { ref request_id, .. } => Some(request_id),
             ShuttingDown { ref request_id, .. } => Some(request_id),
             UnsupportedProtocolVersion { .. } => None,

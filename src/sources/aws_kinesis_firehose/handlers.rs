@@ -5,6 +5,8 @@ use bytes::Bytes;
 use chrono::Utc;
 use flate2::read::MultiGzDecoder;
 use futures::StreamExt;
+use itertools::Itertools;
+use smallvec::{smallvec, SmallVec};
 use snafu::{ResultExt, Snafu};
 use tokio_util::codec::FramedRead;
 use vector_common::constants::GZIP_MAGIC;
@@ -25,7 +27,7 @@ use vrl::compiler::SecretTarget;
 use warp::reject;
 
 use super::{
-    errors::{ParseRecordsSnafu, RequestError},
+    errors::{ParseLogEventsSnafu, ParseRecordsSnafu, RequestError},
     models::{EncodedFirehoseRecord, FirehoseRequest, FirehoseResponse},
     Compression,
 };
@@ -49,6 +51,7 @@ pub(super) struct Context {
     pub(super) bytes_received: Registered<BytesReceived>,
     pub(super) out: SourceSender,
     pub(super) log_namespace: LogNamespace,
+    pub(super) expand_cloudwatch_event_batch: bool,
 }
 
 /// Publishes decoded events from the FirehoseRequest to the pipeline
@@ -77,6 +80,14 @@ pub(super) async fn firehose(
                         events.len(),
                         events.estimated_json_encoded_size_of(),
                     ));
+
+                    if context.expand_cloudwatch_event_batch {
+                        events = expand_events(events, context.log_namespace)
+                            .with_context(|_| ParseLogEventsSnafu {
+                                request_id: request_id.clone(),
+                            })
+                            .map_err(reject::custom)?;
+                    }
 
                     let (batch, receiver) = context
                         .acknowledgements
@@ -191,6 +202,77 @@ pub(super) async fn firehose(
 }
 
 #[derive(Debug, Snafu)]
+pub enum ExpansionError {
+    #[snafu(display("Event is not a log"))]
+    NotLog,
+    #[snafu(display("Missing field"))]
+    MissingField,
+    #[snafu(display("Payload is malformed JSON"))]
+    BadPayload,
+    #[snafu(display("Firehose element is not an object"))]
+    NotObject,
+    #[snafu(display("Firehose logEvent entry is not an object"))]
+    LogEventItemNotObject,
+}
+
+/// Returns a list of individual events expanded from a list of batches of events
+fn expand_events(
+    events: SmallVec<[Event; 1]>,
+    log_namespace: LogNamespace,
+) -> Result<SmallVec<[Event; 1]>, ExpansionError> {
+    events
+        .into_iter()
+        .map(|e| expand_message(e, log_namespace))
+        .flatten_ok()
+        .collect::<Result<SmallVec<[Event; 1]>, ExpansionError>>()
+}
+
+/// Returns a list of events per one 'message', under the key 'logEvents'
+fn expand_message(
+    event: Event,
+    log_namespace: LogNamespace,
+) -> Result<SmallVec<[Event; 1]>, ExpansionError> {
+    let log_event: serde_json::Value = event.try_into().map_err(|_| ExpansionError::NotLog)?;
+    let serde_json::Value::Object(mut obj_map) = log_event else {
+        return Err(ExpansionError::NotObject);
+    };
+    let Some(message) = obj_map.remove("message") else {
+        return Err(ExpansionError::MissingField);
+    };
+    let as_json: serde_json::Value =
+        serde_json::from_str(message.as_str().unwrap()).map_err(|_| ExpansionError::BadPayload)?;
+    // Return unmodified original event if shape does not match, i.e. it should be an object
+    // with a key named 'logEvents'
+    let serde_json::Value::Object(mut root) = as_json else {
+        return Ok(smallvec![
+            Event::from_json_value(as_json, log_namespace).unwrap()
+        ]);
+    };
+    let Some(serde_json::Value::Array(log_events)) = root.remove("logEvents") else {
+        return Ok(smallvec![Event::from_json_value(
+            serde_json::Value::Object(root),
+            log_namespace
+        )
+        .unwrap()]);
+    };
+    log_events
+        .into_iter()
+        .map(|inner| {
+            if let serde_json::Value::Object(inner_obj) = inner {
+                let mut new_event = obj_map.clone();
+                let mut new_msg = root.clone();
+                new_msg.extend(inner_obj);
+                new_event.insert("message".to_string(), serde_json::Value::Object(new_msg));
+                Event::from_json_value(serde_json::Value::Object(new_event), log_namespace)
+                    .map_err(|_| ExpansionError::BadPayload)
+            } else {
+                Err(ExpansionError::LogEventItemNotObject)
+            }
+        })
+        .collect::<Result<SmallVec<[Event; 1]>, ExpansionError>>()
+}
+
+#[derive(Debug, Snafu)]
 pub enum RecordDecodeError {
     #[snafu(display("Could not base64 decode request data: {}", source))]
     Base64 { source: base64::DecodeError },
@@ -258,11 +340,40 @@ fn decode_gzip(data: &[u8]) -> std::io::Result<Bytes> {
 #[cfg(test)]
 mod tests {
     use flate2::{write::GzEncoder, Compression};
+    use serde_json::{json, Value};
     use std::io::Write as _;
+    use vector_lib::{config::LogNamespace, event::Event};
 
     use super::*;
 
     const CONTENT: &[u8] = b"Example";
+
+    // Inner contents of cloudwatch events are serialized as strings of JSON content
+    fn build_sample_firehose_event(num_events: usize) -> Value {
+        let log_events = (0..num_events)
+            .map(|i| {
+                json!({
+                    "id": &format!("id_value-{}", i),
+                    "timestamp": "123456789",
+                    "message": "message_value",
+                })
+            })
+            .collect::<Vec<Value>>();
+        let inner = json!({
+            "messageType": "message_type_value",
+            "owner": "owner_value",
+            "logGroup": "log_group_value",
+            "logStream": "log_stream_value",
+            "subscriptionFilters": "subscription_filters_value",
+            "logEvents": log_events,
+        });
+        json!({
+            "message": serde_json::to_string(&inner).unwrap(),
+            "request_id": "test-request-id",
+            "source_arn": "arn:aws:firehost:us-east-1:1234678",
+            "source_type": "aws_kinesis_firehose",
+        })
+    }
 
     #[test]
     fn correctly_detects_gzipped_content() {
@@ -271,5 +382,56 @@ mod tests {
         encoder.write_all(CONTENT).unwrap();
         let compressed = encoder.finish().unwrap();
         assert!(is_gzip(&compressed));
+    }
+
+    fn expected_expanded_cw_event(sample_seq_id: usize) -> Value {
+        json!({
+            "message": {
+                "id": &format!("id_value-{}", sample_seq_id),
+                "logGroup": "log_group_value",
+                "logStream": "log_stream_value",
+                "message": "message_value",
+                "messageType": "message_type_value",
+                "owner": "owner_value",
+                "subscriptionFilters": "subscription_filters_value",
+                "timestamp": "123456789"
+            },
+            "request_id":"test-request-id",
+            "source_arn": "arn:aws:firehost:us-east-1:1234678",
+            "source_type": "aws_kinesis_firehose",
+        })
+    }
+
+    #[test]
+    fn expands_valid_cw_event() {
+        let log_namespace = LogNamespace::default();
+        let event = build_sample_firehose_event(10);
+        let result = expand_message(
+            Event::from_json_value(event, log_namespace).unwrap(),
+            log_namespace,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 10);
+        for (i, element) in result.into_iter().enumerate() {
+            let observed: serde_json::Value = element.try_into().unwrap();
+            assert_eq!(expected_expanded_cw_event(i), observed);
+        }
+    }
+
+    #[test]
+    fn expands_valid_cw_events() {
+        let log_namespace = LogNamespace::default();
+        let payload = (0..100)
+            .map(|_| build_sample_firehose_event(10))
+            .map(|v| Event::from_json_value(v, log_namespace).unwrap())
+            .collect::<Vec<Event>>();
+        assert_eq!(payload.len(), 100);
+        let results = expand_events(payload.into(), log_namespace).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results.len(), 1000);
+        for (i, element) in results.into_iter().enumerate() {
+            let observed: serde_json::Value = element.try_into().unwrap();
+            assert_eq!(expected_expanded_cw_event(i % 10), observed);
+        }
     }
 }

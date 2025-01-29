@@ -104,6 +104,11 @@ pub struct AwsKinesisFirehoseConfig {
     #[configurable(derived)]
     #[serde(default)]
     keepalive: KeepaliveConfig,
+
+    /// When enabled, batches of cloudwatch events recieved from one response will be expanded into multiple
+    /// events.
+    #[serde(default = "crate::serde::default_false")]
+    expand_cloudwatch_event_batch: bool,
 }
 
 const fn access_keys_example() -> [&'static str; 2] {
@@ -177,6 +182,7 @@ impl SourceConfig for AwsKinesisFirehoseConfig {
             acknowledgements,
             cx.out,
             log_namespace,
+            self.expand_cloudwatch_event_batch,
         );
 
         let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), true)?;
@@ -261,6 +267,7 @@ impl GenerateConfig for AwsKinesisFirehoseConfig {
             acknowledgements: Default::default(),
             log_namespace: None,
             keepalive: Default::default(),
+            expand_cloudwatch_event_batch: false,
         })
         .unwrap()
     }
@@ -353,6 +360,7 @@ mod tests {
                 decoding: default_decoding(),
                 acknowledgements: true.into(),
                 log_namespace: Some(log_namespace),
+                expand_cloudwatch_event_batch: false,
                 keepalive: Default::default(),
             }
             .build(cx)
