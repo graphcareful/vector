@@ -1,6 +1,6 @@
 use crate::template::Template;
 use crate::test_util::components::assert_transform_compliance;
-use crate::transforms::sample::config::SampleConfig;
+use crate::transforms::sample::config::{RateConfig, SampleConfig};
 use crate::transforms::test::create_topology;
 use crate::transforms::{FunctionTransform, OutputBuffer};
 use crate::{
@@ -22,7 +22,7 @@ use vrl::owned_value_path;
 async fn emits_internal_events() {
     assert_transform_compliance(async move {
         let config = SampleConfig {
-            rate: 1,
+            rate_config: RateConfig::SimpleRate { rate: 1 },
             key_field: None,
             group_by: None,
             exclude: None,

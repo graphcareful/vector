@@ -1,3 +1,4 @@
+use typetag::serde;
 use vector_lib::config::{LegacyKey, LogNamespace};
 use vector_lib::configurable::configurable_component;
 use vector_lib::lookup::{lookup_v2::OptionalValuePath, owned_value_path};
@@ -16,6 +17,28 @@ use crate::{
 
 use super::transform::Sample;
 
+#[configurable_component]
+#[configurable(description = "Configuration for sampling rate")]
+#[derive(Clone, Debug)]
+#[serde(untagged)]
+pub enum RateConfig {
+    /// The rate at which events are forwarded, expressed as `1/N`.
+    #[configurable(metadata(docs::examples = 1500))]
+    SimpleRate {
+        /// For example, `rate = 1500` means 1 out of every 1500 events are forwarded and the rest are
+        /// dropped.
+        rate: u64,
+    },
+
+    /// The rate at which events are forwarded, expressed as a percentage.
+    #[configurable(metadata(docs::examples = 22.1))]
+    Percentage {
+        /// For example, `percentage = 22.1` means for any given event it will have a 22.1% chance
+        /// probability of being forwarded and the rest are dropped.
+        percentage: f32,
+    },
+}
+
 /// Configuration for the `sample` transform.
 #[configurable_component(transform(
     "sample",
@@ -24,12 +47,8 @@ use super::transform::Sample;
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct SampleConfig {
-    /// The rate at which events are forwarded, expressed as `1/N`.
-    ///
-    /// For example, `rate = 1500` means 1 out of every 1500 events are forwarded and the rest are
-    /// dropped.
-    #[configurable(metadata(docs::examples = 1500))]
-    pub rate: u64,
+    /// Rate sampling configuration, choose between a percentage or a fixed rate expressed as `1/N`
+    pub rate_config: RateConfig,
 
     /// The name of the field whose value is hashed to determine if the event should be
     /// sampled.
@@ -67,7 +86,7 @@ pub struct SampleConfig {
 impl GenerateConfig for SampleConfig {
     fn generate_config() -> toml::Value {
         toml::Value::try_from(Self {
-            rate: 10,
+            rate_config: RateConfig::SimpleRate { rate: 10 },
             key_field: None,
             group_by: None,
             exclude: None::<AnyCondition>,
@@ -81,9 +100,14 @@ impl GenerateConfig for SampleConfig {
 #[typetag::serde(name = "sample")]
 impl TransformConfig for SampleConfig {
     async fn build(&self, context: &TransformContext) -> crate::Result<Transform> {
+        let rate = if let RateConfig::SimpleRate { rate } = self.rate_config {
+            rate
+        } else {
+            0
+        };
         Ok(Transform::function(Sample::new(
             Self::NAME.to_string(),
-            self.rate,
+            rate,
             self.key_field.clone(),
             self.group_by.clone(),
             self.exclude
