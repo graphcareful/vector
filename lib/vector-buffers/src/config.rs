@@ -86,16 +86,23 @@ impl BufferTypeVisitor {
         let when_full = when_full.unwrap_or_default();
         match kind {
             BufferTypeKind::Memory => {
-                if max_size.is_some() {
-                    return Err(de::Error::unknown_field(
-                        "max_size",
-                        &["type", "max_events", "when_full"],
-                    ));
-                }
-                Ok(BufferType::Memory {
-                    max_events: max_events.unwrap_or_else(memory_buffer_default_max_events),
-                    when_full,
-                })
+                let size = if let Some(max_bytes) = max_size {
+                    if let Some(bounded_max_bytes) = usize::try_from(max_bytes.get()).ok() {
+                        MemoryBufferSize::MaxSize {
+                            max_bytes: NonZeroUsize::new(bounded_max_bytes).unwrap(),
+                        }
+                    } else {
+                        return Err(de::Error::invalid_value(
+                            de::Unexpected::Unsigned(max_bytes.into()),
+                            &"For memory buffers max_bytes expects an integer within the range of 268435488 and your architecture dependent usize",
+                        ));
+                    }
+                } else {
+                    MemoryBufferSize::MaxEvents {
+                        max_size: max_events.unwrap_or_else(memory_buffer_default_max_events),
+                    }
+                };
+                Ok(BufferType::Memory { size, when_full })
             }
             BufferTypeKind::DiskV2 => {
                 if max_events.is_some() {
@@ -175,6 +182,35 @@ impl DiskUsage {
     }
 }
 
+/// Enumeration to define exactly what terms the bounds of the buffer is expressed in: length, or
+/// byte_size.
+#[configurable_component(no_deser)]
+#[serde(rename_all = "snake_case", tag = "type")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[configurable(metadata(
+    docs::enum_tag_description = "Size configuration parameter for the Buffer."
+))]
+pub enum MemoryBufferSize {
+    /// Express the maximum size of the buffer as number of elements.
+    MaxEvents {
+        /// The maximum number of events the buffer can hold.
+        #[serde(default = "memory_buffer_default_max_events")]
+        max_size: NonZeroUsize,
+    },
+
+    /// Express the maximum size of the buffer in terms of bytes allocated.
+    MaxSize {
+        /// The maximum size of data the buffer can hold.
+        ///
+        /// Must be at least ~256 megabytes (268435488 bytes).
+        #[configurable(
+            validation(range(min = 268435488)),
+            metadata(docs::type_unit = "bytes")
+        )]
+        max_bytes: NonZeroUsize,
+    },
+}
+
 /// A specific type of buffer stage.
 #[configurable_component(no_deser)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,9 +224,8 @@ pub enum BufferType {
     #[configurable(title = "Events are buffered in memory.")]
     #[serde(rename = "memory")]
     Memory {
-        /// The maximum number of events allowed in the buffer.
-        #[serde(default = "memory_buffer_default_max_events")]
-        max_events: NonZeroUsize,
+        /// The terms around how to express buffering limits, can be in size or bytes_size.
+        size: MemoryBufferSize,
 
         #[configurable(derived)]
         #[serde(default)]
@@ -277,11 +312,8 @@ impl BufferType {
         T: Bufferable + Clone + Finalizable,
     {
         match *self {
-            BufferType::Memory {
-                when_full,
-                max_events,
-            } => {
-                builder.stage(MemoryBuffer::new(max_events), when_full);
+            BufferType::Memory { size, when_full } => {
+                builder.stage(MemoryBuffer::new(size), when_full);
             }
             BufferType::DiskV2 {
                 when_full,
@@ -335,7 +367,9 @@ pub enum BufferConfig {
 impl Default for BufferConfig {
     fn default() -> Self {
         Self::Single(BufferType::Memory {
-            max_events: memory_buffer_default_max_events(),
+            size: MemoryBufferSize::MaxEvents {
+                max_size: memory_buffer_default_max_events(),
+            },
             when_full: WhenFull::default(),
         })
     }

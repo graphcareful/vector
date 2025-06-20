@@ -13,7 +13,7 @@ use crossbeam_queue::{ArrayQueue, SegQueue};
 use futures::Stream;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
-use crate::InMemoryBufferable;
+use crate::{config::MemoryBufferSize, InMemoryBufferable};
 
 /// Error returned by `LimitedSender::send` when the receiver has disconnected.
 #[derive(Debug, PartialEq, Eq)]
@@ -323,29 +323,22 @@ impl<T> Drop for LimitedReceiver<T> {
     }
 }
 
-pub enum LimitedBy {
-    NumberOfEvents,
-    #[allow(dead_code)]
-    AllocatedBytes,
-}
-
-pub fn limited_by<T: InMemoryBufferable + fmt::Debug>(
-    limit: usize,
-    method: LimitedBy,
+pub fn limited<T: InMemoryBufferable + fmt::Debug>(
+    limit: MemoryBufferSize,
 ) -> (LimitedSender<T>, LimitedReceiver<T>) {
-    let inner = match method {
-        LimitedBy::NumberOfEvents => Inner {
-            data: Arc::new(CBArrayQueue::new(limit)),
+    let inner = match limit {
+        MemoryBufferSize::MaxEvents { max_size } => Inner {
+            data: Arc::new(CBArrayQueue::new(max_size.get())),
             terms: SizeTerms::by_number_events(),
-            limit,
-            limiter: Arc::new(Semaphore::new(limit)),
+            limit: max_size.get(),
+            limiter: Arc::new(Semaphore::new(max_size.get())),
             read_waker: Arc::new(Notify::new()),
         },
-        LimitedBy::AllocatedBytes => Inner {
+        MemoryBufferSize::MaxSize { max_bytes } => Inner {
             data: Arc::new(CBSegQueue::new()),
             terms: SizeTerms::by_bytes_allocated(),
-            limit,
-            limiter: Arc::new(Semaphore::new(limit)),
+            limit: max_bytes.get() as usize,
+            limiter: Arc::new(Semaphore::new(max_bytes.get() as usize)),
             read_waker: Arc::new(Notify::new()),
         },
     };
@@ -357,12 +350,6 @@ pub fn limited_by<T: InMemoryBufferable + fmt::Debug>(
     let receiver = LimitedReceiver { inner };
 
     (sender, receiver)
-}
-
-pub fn limited<T: InMemoryBufferable + fmt::Debug>(
-    limit: usize,
-) -> (LimitedSender<T>, LimitedReceiver<T>) {
-    limited_by(limit, LimitedBy::NumberOfEvents)
 }
 
 #[cfg(test)]

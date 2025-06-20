@@ -7,6 +7,7 @@ use tracing::Span;
 use super::channel::{ReceiverAdapter, SenderAdapter};
 use crate::{
     buffer_usage_data::{BufferUsage, BufferUsageHandle},
+    config::MemoryBufferSize,
     topology::channel::{BufferReceiver, BufferSender},
     variants::MemoryBuffer,
     Bufferable, WhenFull,
@@ -193,7 +194,9 @@ impl<T: Bufferable> TopologyBuilder<T> {
     ) -> (BufferSender<T>, BufferReceiver<T>) {
         let usage_handle = BufferUsageHandle::noop();
 
-        let memory_buffer = Box::new(MemoryBuffer::new(max_events));
+        let memory_buffer = Box::new(MemoryBuffer::new(MemoryBufferSize::MaxEvents {
+            max_size: max_events,
+        }));
         let (sender, receiver) = memory_buffer
             .into_buffer_parts(usage_handle.clone())
             .await
