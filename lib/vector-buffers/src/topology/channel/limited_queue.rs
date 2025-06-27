@@ -354,17 +354,22 @@ pub fn limited<T: InMemoryBufferable + fmt::Debug>(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use tokio_test::{assert_pending, assert_ready, task::spawn};
 
     use super::limited;
     use crate::{
-        test::MultiEventRecord, topology::channel::limited_queue::SendError,
-        topology::test_util::Sample,
+        test::MultiEventRecord,
+        topology::{channel::limited_queue::SendError, test_util::Sample},
+        MemoryBufferSize,
     };
 
     #[tokio::test]
     async fn send_receive() {
-        let (mut tx, mut rx) = limited(2);
+        let (mut tx, mut rx) = limited(MemoryBufferSize::MaxEvents {
+            max_size: NonZeroUsize::new(2).unwrap(),
+        });
 
         assert_eq!(2, tx.available_capacity());
 
@@ -392,7 +397,9 @@ mod tests {
 
     #[test]
     fn sender_waits_for_more_capacity_when_none_available() {
-        let (mut tx, mut rx) = limited(1);
+        let (mut tx, mut rx) = limited(MemoryBufferSize::MaxEvents {
+            max_size: NonZeroUsize::new(1).unwrap(),
+        });
 
         assert_eq!(1, tx.available_capacity());
 
@@ -453,7 +460,9 @@ mod tests {
 
     #[test]
     fn sender_waits_for_more_capacity_when_partial_available() {
-        let (mut tx, mut rx) = limited(7);
+        let (mut tx, mut rx) = limited(MemoryBufferSize::MaxEvents {
+            max_size: NonZeroUsize::new(7).unwrap(),
+        });
 
         assert_eq!(7, tx.available_capacity());
 
@@ -541,7 +550,9 @@ mod tests {
 
     #[test]
     fn empty_receiver_returns_none_when_last_sender_drops() {
-        let (mut tx, mut rx) = limited(1);
+        let (mut tx, mut rx) = limited(MemoryBufferSize::MaxEvents {
+            max_size: NonZeroUsize::new(1).unwrap(),
+        });
 
         assert_eq!(1, tx.available_capacity());
 
@@ -583,7 +594,9 @@ mod tests {
 
     #[test]
     fn receiver_returns_none_once_empty_when_last_sender_drops() {
-        let (tx, mut rx) = limited::<Sample>(1);
+        let (tx, mut rx) = limited::<Sample>(MemoryBufferSize::MaxEvents {
+            max_size: NonZeroUsize::new(1).unwrap(),
+        });
 
         assert_eq!(1, tx.available_capacity());
 
@@ -612,7 +625,9 @@ mod tests {
 
     #[test]
     fn oversized_send_allowed_when_empty() {
-        let (mut tx, mut rx) = limited(1);
+        let (mut tx, mut rx) = limited(MemoryBufferSize::MaxEvents {
+            max_size: NonZeroUsize::new(1).unwrap(),
+        });
 
         assert_eq!(1, tx.available_capacity());
 
@@ -644,7 +659,9 @@ mod tests {
 
     #[test]
     fn oversized_send_allowed_when_partial_capacity() {
-        let (mut tx, mut rx) = limited(2);
+        let (mut tx, mut rx) = limited(MemoryBufferSize::MaxEvents {
+            max_size: NonZeroUsize::new(2).unwrap(),
+        });
 
         assert_eq!(2, tx.available_capacity());
 
@@ -696,3 +713,5 @@ mod tests {
         assert_eq!(2, tx.available_capacity());
     }
 }
+
+
