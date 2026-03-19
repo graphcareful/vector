@@ -753,6 +753,10 @@ where
         // we'll simply wait for the writer to signal to us that progress has been made, which
         // implies a data file existing.
         loop {
+            // Register interest before checking state so we don't miss a
+            // writer notification that fires between the check and the await.
+            let notified = self.ledger.writer_notified();
+
             let (reader_file_id, writer_file_id) = self.ledger.get_current_reader_writer_file_id();
             let data_file_path = self.ledger.get_current_reader_data_file_path();
             let data_file = match self
@@ -772,7 +776,10 @@ where
                                 data_file_path = data_file_path.to_string_lossy().as_ref(),
                                 "Data file does not yet exist. Waiting for writer to create."
                             );
-                            self.ledger.wait_for_writer().await;
+                            if self.ledger.is_writer_done() {
+                                return Ok(());
+                            }
+                            notified.await;
                         } else {
                             self.ledger.increment_acked_reader_file_id();
                         }
@@ -1077,7 +1084,11 @@ where
                     continue;
                 }
 
-                self.ledger.wait_for_writer().await;
+                let notified = self.ledger.writer_notified();
+                if self.ledger.is_writer_done() {
+                    return Ok(None);
+                }
+                notified.await;
             } else {
                 debug!(
                     bytes_read = self.bytes_read,

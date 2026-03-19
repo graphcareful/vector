@@ -68,7 +68,8 @@ async fn ack_wakes_reader() {
             let ledger = Arc::new(ledger);
             let finalizer = Arc::clone(&ledger).spawn_finalizer();
 
-            let mut wait_for_writer = spawn(ledger.wait_for_writer());
+            let notified = ledger.writer_notified();
+            let mut wait_for_writer = spawn(notified);
             assert_pending!(wait_for_writer.poll());
             assert!(!wait_for_writer.is_woken());
 

@@ -15,7 +15,11 @@ use fslock::LockFile;
 use futures::StreamExt;
 use rkyv::{Archive, Serialize, with::Atomic};
 use snafu::{ResultExt, Snafu};
-use tokio::{fs, io::AsyncWriteExt, sync::Notify};
+use tokio::{
+    fs,
+    io::AsyncWriteExt,
+    sync::{Notify, futures::Notified},
+};
 use vector_common::finalizer::OrderedFinalizer;
 
 use super::{
@@ -362,12 +366,13 @@ where
         self.reader_notify.notified().await;
     }
 
-    /// Waits for a signal from the writer that progress has been made.
+    /// Registers interest in writer progress, returning a future that resolves
+    /// when the writer signals.
     ///
-    /// This will occur when a record is written, or when a new data file is created.
+    /// This futures resolves record is written, or when a new data file is created.
     #[cfg_attr(test, instrument(skip(self), level = "trace"))]
-    pub async fn wait_for_writer(&self) {
-        self.writer_notify.notified().await;
+    pub fn writer_notified(&self) -> Notified<'_> {
+        self.writer_notify.notified()
     }
 
     /// Notifies all tasks waiting on progress by the reader.
