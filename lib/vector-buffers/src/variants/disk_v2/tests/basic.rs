@@ -239,3 +239,42 @@ async fn initial_size_correct_with_multievents() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn reader_does_not_stall_on_writer_shutdown() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (mut writer, mut reader, ledger) = create_default_buffer_v2(data_dir).await;
+            assert_buffer_is_empty!(ledger);
+
+            // Write one record, flush, and close the writer.
+            let expected = SizedRecord::new(64);
+            writer
+                .write_record(expected.clone())
+                .await
+                .expect("write should not fail");
+            writer.flush().await.expect("flush should not fail");
+            writer.close();
+
+            // Read the record but do NOT acknowledge it.  This keeps
+            // buffer_size > 0 while writer_done is already true.
+            let record = read_next_some(&mut reader).await;
+            assert_eq!(record, expected);
+
+            // Now call next() again.  Without the checks to check if the writer is done (in the
+            // reader) this blocks forever, because the single writer-close notification has
+            // already been consumed by the first pass through the reader loop.
+            let result = tokio::time::timeout(Duration::from_secs(5), reader.next())
+                .await
+                .expect("reader stalled on shutdown — did not return within 5 s");
+
+            assert_eq!(result.expect("read should not fail"), None);
+
+            // Acknowledge the record so finalizer resources are cleaned up.
+            acknowledge(record).await;
+        }
+    })
+    .await;
+}
