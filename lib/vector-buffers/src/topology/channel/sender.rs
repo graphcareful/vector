@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Instant};
 
 use async_recursion::async_recursion;
 use derivative::Derivative;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tracing::Span;
 use vector_common::internal_event::{InternalEventHandle, Registered, register};
 
@@ -14,6 +14,22 @@ use crate::{
     variants::disk_v2::{self, ProductionFilesystem},
 };
 
+/// Wraps a disk buffer writer together with a drop-notification channel.
+///
+/// When every clone of the enclosing `Arc<Mutex<DiskWriterHandle>>` is dropped
+/// (i.e. no sender holds the writer any more), the `oneshot::Sender` inside is
+/// dropped too, which completes the paired `oneshot::Receiver`.  This lets the
+/// topology wait for the disk buffer lock to be fully released before creating
+/// a replacement.
+#[derive(Debug)]
+pub struct DiskWriterHandle<T: Bufferable> {
+    writer: disk_v2::BufferWriter<T, ProductionFilesystem>,
+    _drop_tx: oneshot::Sender<()>,
+    /// The receiving end of the drop notification.  Only the first caller to
+    /// take it gets `Some`; subsequent calls return `None`.
+    drop_rx: Option<oneshot::Receiver<()>>,
+}
+
 /// Adapter for papering over various sender backends.
 #[derive(Clone, Debug)]
 pub enum SenderAdapter<T: Bufferable> {
@@ -21,7 +37,7 @@ pub enum SenderAdapter<T: Bufferable> {
     InMemory(LimitedSender<T>),
 
     /// The disk v2 buffer.
-    DiskV2(Arc<Mutex<disk_v2::BufferWriter<T, ProductionFilesystem>>>),
+    DiskV2(Arc<Mutex<DiskWriterHandle<T>>>),
 }
 
 impl<T: Bufferable> From<LimitedSender<T>> for SenderAdapter<T> {
@@ -32,7 +48,12 @@ impl<T: Bufferable> From<LimitedSender<T>> for SenderAdapter<T> {
 
 impl<T: Bufferable> From<disk_v2::BufferWriter<T, ProductionFilesystem>> for SenderAdapter<T> {
     fn from(v: disk_v2::BufferWriter<T, ProductionFilesystem>) -> Self {
-        Self::DiskV2(Arc::new(Mutex::new(v)))
+        let (drop_tx, drop_rx) = oneshot::channel();
+        Self::DiskV2(Arc::new(Mutex::new(DiskWriterHandle {
+            writer: v,
+            _drop_tx: drop_tx,
+            drop_rx: Some(drop_rx),
+        })))
     }
 }
 
@@ -43,19 +64,24 @@ where
     pub(crate) async fn send(&mut self, item: T) -> crate::Result<()> {
         match self {
             Self::InMemory(tx) => tx.send(item).await.map_err(Into::into),
-            Self::DiskV2(writer) => {
-                let mut writer = writer.lock().await;
+            Self::DiskV2(handle) => {
+                let mut handle = handle.lock().await;
 
-                writer.write_record(item).await.map(|_| ()).map_err(|e| {
-                    // TODO: Could some errors be handled and not be unrecoverable? Right now,
-                    // encoding should theoretically be recoverable -- encoded value was too big, or
-                    // error during encoding -- but the traits don't allow for recovering the
-                    // original event value because we have to consume it to do the encoding... but
-                    // that might not always be the case.
-                    error!("Disk buffer writer has encountered an unrecoverable error.");
+                handle
+                    .writer
+                    .write_record(item)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| {
+                        // TODO: Could some errors be handled and not be unrecoverable? Right now,
+                        // encoding should theoretically be recoverable -- encoded value was too big, or
+                        // error during encoding -- but the traits don't allow for recovering the
+                        // original event value because we have to consume it to do the encoding... but
+                        // that might not always be the case.
+                        error!("Disk buffer writer has encountered an unrecoverable error.");
 
-                    e.into()
-                })
+                        e.into()
+                    })
             }
         }
     }
@@ -66,10 +92,10 @@ where
                 .try_send(item)
                 .map(|()| None)
                 .or_else(|e| Ok(Some(e.into_inner()))),
-            Self::DiskV2(writer) => {
-                let mut writer = writer.lock().await;
+            Self::DiskV2(handle) => {
+                let mut handle = handle.lock().await;
 
-                writer.try_write_record(item).await.map_err(|e| {
+                handle.writer.try_write_record(item).await.map_err(|e| {
                     // TODO: Could some errors be handled and not be unrecoverable? Right now,
                     // encoding should theoretically be recoverable -- encoded value was too big, or
                     // error during encoding -- but the traits don't allow for recovering the
@@ -86,9 +112,9 @@ where
     pub(crate) async fn flush(&mut self) -> crate::Result<()> {
         match self {
             Self::InMemory(_) => Ok(()),
-            Self::DiskV2(writer) => {
-                let mut writer = writer.lock().await;
-                writer.flush().await.map_err(|e| {
+            Self::DiskV2(handle) => {
+                let mut handle = handle.lock().await;
+                handle.writer.flush().await.map_err(|e| {
                     // Errors on the I/O path, which is all that flushing touches, are never recoverable.
                     error!("Disk buffer writer has encountered an unrecoverable error.");
 
@@ -102,6 +128,18 @@ where
         match self {
             Self::InMemory(tx) => Some(tx.available_capacity()),
             Self::DiskV2(_) => None,
+        }
+    }
+
+    /// Takes the drop-notification receiver for a disk buffer writer.
+    ///
+    /// Returns `Some` for `DiskV2` senders on the first call, `None` thereafter
+    /// (or for `InMemory` senders).  The returned receiver completes when every
+    /// `Arc` clone of the underlying writer handle has been dropped.
+    pub async fn take_buffer_release_barrier(&self) -> Option<oneshot::Receiver<()>> {
+        match self {
+            Self::InMemory(_) => None,
+            Self::DiskV2(handle) => handle.lock().await.drop_rx.take(),
         }
     }
 }
@@ -194,6 +232,21 @@ impl<T: Bufferable> BufferSender<T> {
 }
 
 impl<T: Bufferable> BufferSender<T> {
+    /// Takes the drop-notification receivers for all disk buffer writers in this
+    /// sender chain (base + any overflow stages).
+    /// See [`SenderAdapter::take_buffer_release_barrier`].
+    #[async_recursion]
+    pub async fn take_buffer_release_barriers(&self) -> Vec<oneshot::Receiver<()>> {
+        let mut rxs = Vec::new();
+        if let Some(rx) = self.base.take_buffer_release_barrier().await {
+            rxs.push(rx);
+        }
+        if let Some(overflow) = self.overflow.as_ref() {
+            rxs.extend(overflow.take_buffer_release_barriers().await);
+        }
+        rxs
+    }
+
     #[cfg(test)]
     pub(crate) fn get_base_ref(&self) -> &SenderAdapter<T> {
         &self.base

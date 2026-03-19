@@ -588,10 +588,24 @@ impl RunningTopology {
             .collect::<HashSet<_>>();
 
         // For any existing sink that has a conflicting resource dependency with a changed/added
-        // sink, or for any sink that we want to reuse their buffer, we need to explicit wait for
-        // them to finish processing so we can reclaim ownership of those resources/buffers.
+        // sink, for any sink that we want to reuse their buffer, or for any sink with a disk
+        // buffer being rebuilt, we need to explicitly wait for them to finish processing so we
+        // can reclaim ownership of those resources/buffers.
+        //
+        // Changed sinks with disk buffers that are NOT being reused must also be
+        // waited on so we can ensure the disk buffer file lock is released before
+        // the replacement buffer is built.
+        let changed_disk_buffer_sinks = diff.sinks.to_change.iter().filter(|key| {
+            !reuse_buffers.contains(*key)
+                && self
+                    .config
+                    .sink(key)
+                    .map_or(false, |s| s.buffer.has_disk_stage())
+        });
+
         let wait_for_sinks = conflicting_sinks
             .chain(reuse_buffers.iter().cloned())
+            .chain(changed_disk_buffer_sinks.cloned())
             .collect::<HashSet<_>>();
 
         // First, we remove any inputs to removed sinks so they can naturally shut down.
@@ -631,15 +645,19 @@ impl RunningTopology {
             }))
             .collect::<Vec<_>>();
 
+        let mut buffer_release_barriers: HashMap<ComponentKey, Vec<_>> = HashMap::new();
         for key in &sinks_to_change {
             debug!(component_id = %key, "Changing sink.");
-            if reuse_buffers.contains(key) {
-                self.detach_triggers
-                    .remove(key)
-                    .unwrap()
-                    .into_inner()
-                    .cancel();
+            // Cancel the detach trigger for all changed sinks so the sink's input
+            // stream terminates and the sink task can complete. Without this, the
+            // old sink task never exits and the reload stalls at `previous.await`.
+            self.detach_triggers
+                .remove(key)
+                .unwrap()
+                .into_inner()
+                .cancel();
 
+            if reuse_buffers.contains(key) {
                 // We explicitly clone the input side of the buffer and store it so we don't lose
                 // it when we remove the inputs below.
                 //
@@ -651,6 +669,18 @@ impl RunningTopology {
                 // info about which sinks are having their buffers reused and treat them differently
                 // at other stages.
                 buffer_tx.insert((*key).clone(), self.inputs.get(key).unwrap().clone());
+            } else {
+                // For changed sinks with disk buffers that are NOT being reused, take
+                // the writer-drop notification receivers before we remove the input.
+                // We await these after the old sink tasks complete to guarantee all
+                // disk buffer locks are released before we build the replacement.
+                let rxs = match self.inputs.get(key) {
+                    Some(s) => s.take_buffer_release_barriers().await,
+                    None => Vec::new(),
+                };
+                if !rxs.is_empty() {
+                    buffer_release_barriers.insert((*key).clone(), rxs);
+                }
             }
             self.remove_inputs(key, diff, new_config).await;
         }
@@ -693,6 +723,14 @@ impl RunningTopology {
                     };
 
                     buffers.insert((*key).clone(), (tx, Arc::new(Mutex::new(Some(rx)))));
+                }
+
+                // Wait for all old disk buffer writers to be fully released (by
+                // the fanout) so file locks are dropped before we build a replacement.
+                if let Some(rxs) = buffer_release_barriers.remove(key) {
+                    for rx in rxs {
+                        let _ = rx.await;
+                    }
                 }
             }
         }
