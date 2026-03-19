@@ -772,6 +772,9 @@ where
                                 data_file_path = data_file_path.to_string_lossy().as_ref(),
                                 "Data file does not yet exist. Waiting for writer to create."
                             );
+                            if self.ledger.is_writer_done() {
+                                return Ok(());
+                            }
                             self.ledger.wait_for_writer().await;
                         } else {
                             self.ledger.increment_acked_reader_file_id();
@@ -1077,6 +1080,9 @@ where
                     continue;
                 }
 
+                if self.ledger.is_writer_done() {
+                    return Ok(None);
+                }
                 self.ledger.wait_for_writer().await;
             } else {
                 debug!(
