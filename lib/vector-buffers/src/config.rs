@@ -2,7 +2,6 @@ use std::{
     fmt,
     num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
-    slice,
 };
 
 use serde::{Deserialize, Deserializer, Serialize, de};
@@ -327,25 +326,11 @@ impl BufferType {
 
 /// Buffer configuration.
 ///
-/// Buffers are compromised of stages(*) that form a buffer _topology_, with input items being
-/// subject to configurable behavior when each stage reaches configured limits.  Buffers are
-/// configured for sinks, where backpressure from the sink can be handled by the buffer.  This
-/// allows absorbing temporary load, or potentially adding write-ahead-log behavior to a sink to
-/// increase the durability of a given Vector pipeline.
-///
-/// While we use the term "buffer topology" here, a buffer topology is referred to by the more
-/// common "buffer" or "buffers" shorthand.  This is related to buffers originally being a single
-/// component, where you could only choose which buffer type to use.  As we expand buffer
-/// functionality to allow chaining buffers together, you'll see "buffer topology" used in internal
-/// documentation to correctly reflect the internal structure.
-///
-// TODO: We need to limit chained buffers to only allowing a single copy of each buffer type to be
-// defined, otherwise, for example, two instances of the same disk buffer type in a single chained
-// buffer topology would try to both open the same buffer files on disk, which wouldn't work or
-// would go horribly wrong.
+/// Buffers are configured for sinks, where backpressure from the sink can be handled by the
+/// buffer.  This allows absorbing temporary load, or potentially adding write-ahead-log behavior
+/// to a sink to increase the durability of a given Vector pipeline.
 #[configurable_component]
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[serde(untagged)]
 #[configurable(
     title = "Configures the buffering behavior for this sink.",
     description = r#"More information about the individual buffer types, and buffer behavior, can be found in the
@@ -353,17 +338,11 @@ impl BufferType {
 
 [buffering_model]: /docs/architecture/buffering-model/"#
 )]
-pub enum BufferConfig {
-    /// A single stage buffer topology.
-    Single(BufferType),
-
-    /// A chained buffer topology.
-    Chained(Vec<BufferType>),
-}
+pub struct BufferConfig(pub BufferType);
 
 impl Default for BufferConfig {
     fn default() -> Self {
-        Self::Single(BufferType::Memory {
+        Self(BufferType::Memory {
             size: MemoryBufferSize::MaxEvents(memory_buffer_default_max_events()),
             when_full: WhenFull::default(),
         })
@@ -371,12 +350,9 @@ impl Default for BufferConfig {
 }
 
 impl BufferConfig {
-    /// Gets all of the configured stages for this buffer.
-    pub fn stages(&self) -> &[BufferType] {
-        match self {
-            Self::Single(stage) => slice::from_ref(stage),
-            Self::Chained(stages) => stages.as_slice(),
-        }
+    /// Gets the buffer type for this configuration.
+    pub fn buffer_type(&self) -> &BufferType {
+        &self.0
     }
 
     /// Builds the buffer components represented by this configuration.
@@ -385,9 +361,6 @@ impl BufferConfig {
     /// into the buffer, as well as pop items out of the buffer, respectively.
     ///
     /// # Errors
-    ///
-    /// If the buffer is configured with anything other than a single stage, an error variant will
-    /// be thrown.
     ///
     /// If a disk buffer stage is configured and the data directory provided is `None`, an error
     /// variant will be thrown.
@@ -403,9 +376,8 @@ impl BufferConfig {
     {
         let mut builder = TopologyBuilder::default();
 
-        for stage in self.stages() {
-            stage.add_to_builder(&mut builder, data_dir.clone(), buffer_id.clone())?;
-        }
+        self.0
+            .add_to_builder(&mut builder, data_dir, buffer_id.clone())?;
 
         builder
             .build(buffer_id, span)
@@ -422,43 +394,7 @@ mod test {
 
     fn check_single_stage(source: &str, expected: BufferType) {
         let config: BufferConfig = serde_yaml::from_str(source).unwrap();
-        assert_eq!(config.stages().len(), 1);
-        let actual = config.stages().first().unwrap();
-        assert_eq!(actual, &expected);
-    }
-
-    fn check_multiple_stages(source: &str, expected_stages: &[BufferType]) {
-        let config: BufferConfig = serde_yaml::from_str(source).unwrap();
-        assert_eq!(config.stages().len(), expected_stages.len());
-        for (actual, expected) in config.stages().iter().zip(expected_stages) {
-            assert_eq!(actual, expected);
-        }
-    }
-
-    const BUFFER_CONFIG_NO_MATCH_ERR: &str =
-        "data did not match any variant of untagged enum BufferConfig";
-
-    #[test]
-    fn parse_empty() {
-        let source = "";
-        let error = serde_yaml::from_str::<BufferConfig>(source).unwrap_err();
-        assert_eq!(error.to_string(), BUFFER_CONFIG_NO_MATCH_ERR);
-    }
-
-    #[test]
-    fn parse_only_invalid_keys() {
-        let source = "foo: 314";
-        let error = serde_yaml::from_str::<BufferConfig>(source).unwrap_err();
-        assert_eq!(error.to_string(), BUFFER_CONFIG_NO_MATCH_ERR);
-    }
-
-    #[test]
-    fn parse_partial_invalid_keys() {
-        let source = r"max_size: 100
-max_events: 42
-";
-        let error = serde_yaml::from_str::<BufferConfig>(source).unwrap_err();
-        assert_eq!(error.to_string(), BUFFER_CONFIG_NO_MATCH_ERR);
+        assert_eq!(config.buffer_type(), &expected);
     }
 
     #[test]
@@ -484,27 +420,6 @@ max_events: 42
                 size: MemoryBufferSize::MaxSize(NonZeroUsize::new(4096).unwrap()),
                 when_full: WhenFull::Block,
             },
-        );
-    }
-
-    #[test]
-    fn parse_multiple_stages() {
-        check_multiple_stages(
-            r"
-          - max_events: 42
-          - max_events: 100
-            when_full: drop_newest
-          ",
-            &[
-                BufferType::Memory {
-                    size: MemoryBufferSize::MaxEvents(NonZeroUsize::new(42).unwrap()),
-                    when_full: WhenFull::Block,
-                },
-                BufferType::Memory {
-                    size: MemoryBufferSize::MaxEvents(NonZeroUsize::new(100).unwrap()),
-                    when_full: WhenFull::DropNewest,
-                },
-            ],
         );
     }
 
@@ -539,17 +454,6 @@ max_events: 42
             BufferType::Memory {
                 size: MemoryBufferSize::MaxEvents(NonZeroUsize::new(500).unwrap()),
                 when_full: WhenFull::DropNewest,
-            },
-        );
-
-        check_single_stage(
-            r"
-          type: memory
-          when_full: overflow
-          ",
-            BufferType::Memory {
-                size: MemoryBufferSize::MaxEvents(NonZeroUsize::new(500).unwrap()),
-                when_full: WhenFull::Overflow,
             },
         );
 

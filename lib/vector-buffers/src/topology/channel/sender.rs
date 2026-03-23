@@ -1,6 +1,5 @@
 use std::{sync::Arc, time::Instant};
 
-use async_recursion::async_recursion;
 use derivative::Derivative;
 use tokio::sync::Mutex;
 use tracing::Span;
@@ -112,27 +111,18 @@ where
 /// events when the internal channel is full.
 ///
 /// When creating a buffer sender/receiver pair, callers can specify the "when full" behavior of the
-/// sender.  This controls how events are handled when the internal channel is full.  Three modes
+/// sender.  This controls how events are handled when the internal channel is full.  Two modes
 /// are possible:
 /// - block
 /// - drop newest
-/// - overflow
 ///
 /// In "block" mode, callers are simply forced to wait until the channel has enough capacity to
 /// accept the event.  In "drop newest" mode, any event being sent when the channel is full will be
-/// dropped and proceed no further. In "overflow" mode, events will be sent to another buffer
-/// sender.  Callers can specify the overflow sender to use when constructing their buffers initially.
-///
-/// TODO: We should eventually rework `BufferSender`/`BufferReceiver` so that they contain a vector
-/// of the fields we already have here, but instead of cascading via calling into `overflow`, we'd
-/// linearize the nesting instead, so that `BufferSender` would only ever be calling the underlying
-/// `SenderAdapter` instances instead... which would let us get rid of the boxing and
-/// `#[async_recursion]` stuff.
+/// dropped and proceed no further.
 #[derive(Clone, Derivative)]
 #[derivative(Debug)]
 pub struct BufferSender<T: Bufferable> {
     base: SenderAdapter<T>,
-    overflow: Option<Box<BufferSender<T>>>,
     when_full: WhenFull,
     usage_instrumentation: Option<BufferUsageHandle>,
     #[derivative(Debug = "ignore")]
@@ -146,34 +136,11 @@ impl<T: Bufferable> BufferSender<T> {
     pub fn new(base: SenderAdapter<T>, when_full: WhenFull) -> Self {
         Self {
             base,
-            overflow: None,
             when_full,
             usage_instrumentation: None,
             send_duration: None,
             custom_instrumentation: None,
         }
-    }
-
-    /// Creates a new [`BufferSender`] wrapping the given channel sender and overflow sender.
-    pub fn with_overflow(base: SenderAdapter<T>, overflow: BufferSender<T>) -> Self {
-        Self {
-            base,
-            overflow: Some(Box::new(overflow)),
-            when_full: WhenFull::Overflow,
-            usage_instrumentation: None,
-            send_duration: None,
-            custom_instrumentation: None,
-        }
-    }
-
-    /// Converts this sender into an overflowing sender using the given `BufferSender<T>`.
-    ///
-    /// Note: this resets the internal state of this sender, and so this should not be called except
-    /// when initially constructing `BufferSender<T>`.
-    #[cfg(test)]
-    pub fn switch_to_overflow(&mut self, overflow: BufferSender<T>) {
-        self.overflow = Some(Box::new(overflow));
-        self.when_full = WhenFull::Overflow;
     }
 
     /// Configures this sender to instrument the items passing through it.
@@ -199,12 +166,6 @@ impl<T: Bufferable> BufferSender<T> {
         &self.base
     }
 
-    #[cfg(test)]
-    pub(crate) fn get_overflow_ref(&self) -> Option<&BufferSender<T>> {
-        self.overflow.as_ref().map(AsRef::as_ref)
-    }
-
-    #[async_recursion]
     pub async fn send(
         &mut self,
         mut item: T,
@@ -233,16 +194,6 @@ impl<T: Bufferable> BufferSender<T> {
                     was_dropped = true;
                 }
             }
-            WhenFull::Overflow => {
-                if let Some(item) = self.base.try_send(item).await? {
-                    was_dropped = true;
-                    self.overflow
-                        .as_mut()
-                        .unwrap_or_else(|| unreachable!("overflow must exist"))
-                        .send(item, send_reference)
-                        .await?;
-                }
-            }
         }
 
         if let Some(instrumentation) = self.usage_instrumentation.as_ref()
@@ -264,12 +215,8 @@ impl<T: Bufferable> BufferSender<T> {
         Ok(())
     }
 
-    #[async_recursion]
     pub async fn flush(&mut self) -> crate::Result<()> {
         self.base.flush().await?;
-        if let Some(overflow) = self.overflow.as_mut() {
-            overflow.flush().await?;
-        }
 
         Ok(())
     }

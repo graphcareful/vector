@@ -860,17 +860,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-recursion"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b43422f69d8ff38f95f1b2bb76517c91589a924d1559a0e935d7c8ce0274c11"
-dependencies = [
- "proc-macro2 1.0.106",
- "quote 1.0.44",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "async-rs"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12633,7 +12622,6 @@ dependencies = [
 name = "vector-buffers"
 version = "0.1.0"
 dependencies = [
- "async-recursion",
  "async-stream",
  "async-trait",
  "bytecheck",

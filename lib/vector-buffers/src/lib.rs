@@ -57,25 +57,11 @@ pub enum WhenFull {
     /// highest priority, and it is preferable to temporarily lose events rather than cause a
     /// slowdown in the acceptance/consumption of events.
     DropNewest,
-
-    /// Overflows to the next stage in the buffer topology.
-    ///
-    /// If the current buffer stage is full, attempt to send this event to the next buffer stage.
-    /// That stage may also be configured overflow, and so on, but ultimately the last stage in a
-    /// buffer topology must use one of the other handling behaviors. This means that next stage may
-    /// potentially be able to buffer the event, but it may also block or drop the event.
-    ///
-    /// This mode can only be used when two or more buffer stages are configured.
-    #[configurable(metadata(docs::hidden))]
-    Overflow,
 }
 
 #[cfg(test)]
 impl Arbitrary for WhenFull {
     fn arbitrary(g: &mut Gen) -> Self {
-        // TODO: We explicitly avoid generating "overflow" as a possible value because nothing yet
-        // supports handling it, and will be defaulted to using "block" if they encounter
-        // "overflow".  Thus, there's no reason to emit it here... yet.
         if bool::arbitrary(g) {
             WhenFull::Block
         } else {

@@ -107,7 +107,7 @@ async fn buffer_drop_fan_out() {
         vec!["in".to_string()],
         backpressure_sink(events_to_sink / 2),
     );
-    sink_outer.buffer = BufferConfig::Single(BufferType::Memory {
+    sink_outer.buffer = BufferConfig(BufferType::Memory {
         size: MemoryBufferSize::MaxEvents(MEMORY_BUFFER_DEFAULT_MAX_EVENTS),
         when_full: WhenFull::DropNewest,
     });

@@ -39,13 +39,8 @@ pub trait IntoBuffer<T: Bufferable>: Send {
 pub enum TopologyError {
     #[snafu(display("buffer topology cannot be empty"))]
     EmptyTopology,
-    #[snafu(display(
-        "stage {} configured with block/drop newest behavior in front of subsequent stage",
-        stage_idx
-    ))]
-    NextStageNotUsed { stage_idx: usize },
-    #[snafu(display("last stage in buffer topology cannot be set to overflow mode"))]
-    OverflowWhenLast,
+    #[snafu(display("buffer topology must contain exactly one stage, but has {}", stage_count))]
+    TooManyStages { stage_count: usize },
     #[snafu(display("failed to build individual stage {}: {}", stage_idx, source))]
     FailedToBuildStage {
         stage_idx: usize,
@@ -70,23 +65,9 @@ pub struct TopologyBuilder<T: Bufferable> {
 impl<T: Bufferable> TopologyBuilder<T> {
     /// Adds a new stage to the buffer topology.
     ///
-    /// The "when full" behavior can be optionally configured here.  If no behavior is specified,
-    /// and an overflow buffer is _not_ added to the topology after this, then the "when full"
-    /// behavior will use a default value of "block".  If a "when full" behavior is specified, and
-    /// an overflow buffer is added to the topology after this, then the specified "when full"
-    /// behavior will be ignored and will be set to "overflow" mode.
-    ///
-    /// Callers can configure what to do when a buffer is full by setting `when_full`.  Three modes
-    /// are available -- block, drop newest, and overflow -- which are documented in more detail by
+    /// Callers can configure what to do when a buffer is full by setting `when_full`.  Two modes
+    /// are available -- block and drop newest -- which are documented in more detail by
     /// [`BufferSender`].
-    ///
-    /// Two notes about what modes are not valid in certain scenarios:
-    /// - the innermost stage (the last stage given to the builder) cannot be set to "overflow" mode,
-    ///   as there is no other stage to overflow to
-    /// - a stage cannot use the "block" or "drop newest" mode when there is a subsequent stage, and
-    ///   must user the "overflow" mode
-    ///
-    /// Any occurrence of either of these scenarios will result in an error during build.
     pub fn stage<S>(&mut self, stage: S, when_full: WhenFull) -> &mut Self
     where
         S: IntoBuffer<T> + 'static,
@@ -109,61 +90,35 @@ impl<T: Bufferable> TopologyBuilder<T> {
         buffer_id: String,
         span: Span,
     ) -> Result<(BufferSender<T>, BufferReceiver<T>), TopologyError> {
-        // We pop stages off in reverse order to build from the inside out.
-        let mut buffer_usage = BufferUsage::from_span(span.clone());
-        let mut current_stage = None;
-
-        for (stage_idx, stage) in self.stages.into_iter().enumerate().rev() {
-            // Make sure the stage is valid for our current builder state.
-            match stage.when_full {
-                // The innermost stage can't be set to overflow, there's nothing else to overflow _to_.
-                WhenFull::Overflow => {
-                    if current_stage.is_none() {
-                        return Err(TopologyError::OverflowWhenLast);
-                    }
-                }
-                // If there's already an inner stage, then blocking or dropping the newest events
-                // doesn't no sense.  Overflowing is the only valid transition to another stage.
-                WhenFull::Block | WhenFull::DropNewest => {
-                    if current_stage.is_some() {
-                        return Err(TopologyError::NextStageNotUsed { stage_idx });
-                    }
-                }
-            }
-
-            // Create the buffer usage handle for this stage and initialize it as we create the
-            // sender/receiver.  This is slightly awkward since we just end up actually giving
-            // the handle to the `BufferSender`/`BufferReceiver` wrappers, but that's the price we
-            // have to pay for letting each stage function in an opaque way when wrapped.
-            let usage_handle = buffer_usage.add_stage(stage_idx);
-            let provides_instrumentation = stage.untransformed.provides_instrumentation();
-            let (sender, receiver) = stage
-                .untransformed
-                .into_buffer_parts(usage_handle.clone())
-                .await
-                .context(FailedToBuildStageSnafu { stage_idx })?;
-
-            let (mut sender, mut receiver) = match current_stage.take() {
-                None => (
-                    BufferSender::new(sender, stage.when_full),
-                    BufferReceiver::new(receiver),
-                ),
-                Some((current_sender, current_receiver)) => (
-                    BufferSender::with_overflow(sender, current_sender),
-                    BufferReceiver::with_overflow(receiver, current_receiver),
-                ),
-            };
-
-            sender.with_send_duration_instrumentation(stage_idx, &span);
-            if !provides_instrumentation {
-                sender.with_usage_instrumentation(usage_handle.clone());
-                receiver.with_usage_instrumentation(usage_handle);
-            }
-
-            current_stage = Some((sender, receiver));
+        let stage_count = self.stages.len();
+        if stage_count == 0 {
+            return Err(TopologyError::EmptyTopology);
+        }
+        if stage_count > 1 {
+            return Err(TopologyError::TooManyStages { stage_count });
         }
 
-        let (sender, receiver) = current_stage.ok_or(TopologyError::EmptyTopology)?;
+        let mut buffer_usage = BufferUsage::from_span(span.clone());
+
+        let stage = self.stages.into_iter().next().unwrap();
+        let stage_idx = 0;
+
+        let usage_handle = buffer_usage.add_stage(stage_idx);
+        let provides_instrumentation = stage.untransformed.provides_instrumentation();
+        let (sender, receiver) = stage
+            .untransformed
+            .into_buffer_parts(usage_handle.clone())
+            .await
+            .context(FailedToBuildStageSnafu { stage_idx })?;
+
+        let mut sender = BufferSender::new(sender, stage.when_full);
+        let mut receiver = BufferReceiver::new(receiver);
+
+        sender.with_send_duration_instrumentation(stage_idx, &span);
+        if !provides_instrumentation {
+            sender.with_usage_instrumentation(usage_handle.clone());
+            receiver.with_usage_instrumentation(usage_handle);
+        }
 
         // Install the buffer usage handler since we successfully created the buffer topology.  This
         // spawns it in the background and periodically emits aggregated metrics about each of the
@@ -177,14 +132,9 @@ impl<T: Bufferable> TopologyBuilder<T> {
 impl<T: Bufferable> TopologyBuilder<T> {
     /// Creates a memory-only buffer topology.
     ///
-    /// The overflow mode (i.e. `WhenFull`) can be configured to either block or drop the newest
-    /// values, but cannot be configured to use overflow mode.  If overflow mode is selected, it
-    /// will be changed to blocking mode.
-    ///
     /// This is a convenience method for `vector` as it is used for inter-transform channels, and we
     /// can simplifying needing to require callers to do all the boilerplate to create the builder,
     /// create the stage, installing buffer usage metrics that aren't required, and so on.
-    ///
     #[allow(clippy::print_stderr)]
     pub fn standalone_memory(
         max_events: NonZeroUsize,
@@ -199,11 +149,7 @@ impl<T: Bufferable> TopologyBuilder<T> {
         let limit = MemoryBufferSize::MaxEvents(max_events);
         let (sender, receiver) = limited(limit, metadata, ewma_half_life_seconds);
 
-        let mode = match when_full {
-            WhenFull::Overflow => WhenFull::Block,
-            m => m,
-        };
-        let mut sender = BufferSender::new(sender.into(), mode);
+        let mut sender = BufferSender::new(sender.into(), when_full);
         sender.with_send_duration_instrumentation(0, receiver_span);
         let receiver = BufferReceiver::new(receiver.into());
 
@@ -215,10 +161,6 @@ impl<T: Bufferable> TopologyBuilder<T> {
     /// This is specifically required for the tests that occur under `buffers`, as we assert things
     /// like channel capacity left, which cannot be done on in-memory v1 buffers as they use the
     /// more abstract `Sink`-based adapters.
-    ///
-    /// The overflow mode (i.e. `WhenFull`) can be configured to either block or drop the newest
-    /// values, but cannot be configured to use overflow mode.  If overflow mode is selected, it
-    /// will be changed to blocking mode.
     ///
     /// This is a convenience method for `vector` as it is used for inter-transform channels, and we
     /// can simplifying needing to require callers to do all the boilerplate to create the builder,
@@ -235,11 +177,7 @@ impl<T: Bufferable> TopologyBuilder<T> {
         let limit = MemoryBufferSize::MaxEvents(max_events);
         let (sender, receiver) = limited(limit, metadata, None);
 
-        let mode = match when_full {
-            WhenFull::Overflow => WhenFull::Block,
-            m => m,
-        };
-        let mut sender = BufferSender::new(sender.into(), mode);
+        let mut sender = BufferSender::new(sender.into(), when_full);
         let mut receiver = BufferReceiver::new(receiver.into());
 
         sender.with_usage_instrumentation(usage_handle.clone());
@@ -264,10 +202,7 @@ mod tests {
     use super::TopologyBuilder;
     use crate::{
         WhenFull,
-        topology::{
-            builder::TopologyError,
-            test_util::{Sample, assert_current_send_capacity},
-        },
+        topology::test_util::{Sample, assert_current_send_capacity},
         variants::MemoryBuffer,
     };
 
@@ -282,7 +217,7 @@ mod tests {
         assert!(result.is_ok());
 
         let (mut sender, _) = result.unwrap();
-        assert_current_send_capacity(&mut sender, Some(1), None);
+        assert_current_send_capacity(&mut sender, Some(1));
     }
 
     #[tokio::test]
@@ -296,75 +231,7 @@ mod tests {
         assert!(result.is_ok());
 
         let (mut sender, _) = result.unwrap();
-        assert_current_send_capacity(&mut sender, Some(1), None);
+        assert_current_send_capacity(&mut sender, Some(1));
     }
 
-    #[tokio::test]
-    async fn single_stage_topology_overflow() {
-        let mut builder = TopologyBuilder::<Sample>::default();
-        builder.stage(
-            MemoryBuffer::with_max_events(NonZeroUsize::new(1).unwrap()),
-            WhenFull::Overflow,
-        );
-        let result = builder.build(String::from("test"), Span::none()).await;
-        match result {
-            Err(TopologyError::OverflowWhenLast) => {}
-            r => panic!("unexpected build result: {r:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn two_stage_topology_block() {
-        let mut builder = TopologyBuilder::<Sample>::default();
-        builder.stage(
-            MemoryBuffer::with_max_events(NonZeroUsize::new(1).unwrap()),
-            WhenFull::Block,
-        );
-        builder.stage(
-            MemoryBuffer::with_max_events(NonZeroUsize::new(1).unwrap()),
-            WhenFull::Block,
-        );
-        let result = builder.build(String::from("test"), Span::none()).await;
-        match result {
-            Err(TopologyError::NextStageNotUsed { stage_idx }) => assert_eq!(stage_idx, 0),
-            r => panic!("unexpected build result: {r:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn two_stage_topology_drop_newest() {
-        let mut builder = TopologyBuilder::<Sample>::default();
-        builder.stage(
-            MemoryBuffer::with_max_events(NonZeroUsize::new(1).unwrap()),
-            WhenFull::DropNewest,
-        );
-        builder.stage(
-            MemoryBuffer::with_max_events(NonZeroUsize::new(1).unwrap()),
-            WhenFull::Block,
-        );
-        let result = builder.build(String::from("test"), Span::none()).await;
-        match result {
-            Err(TopologyError::NextStageNotUsed { stage_idx }) => assert_eq!(stage_idx, 0),
-            r => panic!("unexpected build result: {r:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn two_stage_topology_overflow() {
-        let mut builder = TopologyBuilder::<Sample>::default();
-        builder.stage(
-            MemoryBuffer::with_max_events(NonZeroUsize::new(1).unwrap()),
-            WhenFull::Overflow,
-        );
-        builder.stage(
-            MemoryBuffer::with_max_events(NonZeroUsize::new(1).unwrap()),
-            WhenFull::Block,
-        );
-
-        let result = builder.build(String::from("test"), Span::none()).await;
-        assert!(result.is_ok());
-
-        let (mut sender, _) = result.unwrap();
-        assert_current_send_capacity(&mut sender, Some(1), Some(1));
-    }
 }

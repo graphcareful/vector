@@ -9,7 +9,6 @@ publish = false
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [dependencies]
-async-recursion = "1.1.1"
 async-stream = "0.3.6"
 async-trait.workspace = true
 bytecheck = { version = "0.6.9", default-features = false, features = ["std"] }

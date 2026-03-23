@@ -277,11 +277,10 @@ pub async fn check_buffer_preconditions(config: &Config) -> Result<(), Vec<Strin
     let global_data_dir = config.global.data_dir.clone();
     let configured_disk_buffers = config
         .sinks()
-        .flat_map(|(id, sink)| {
+        .filter_map(|(id, sink)| {
             sink.buffer
-                .stages()
-                .iter()
-                .filter_map(|stage| stage.disk_usage(global_data_dir.clone(), id))
+                .buffer_type()
+                .disk_usage(global_data_dir.clone(), id)
         })
         .collect::<Vec<_>>();
 
