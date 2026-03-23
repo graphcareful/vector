@@ -430,6 +430,11 @@ impl ReaderModel {
 
             // If we can't open our desired current data file, we wait.
             if !self.check_ready() {
+                // However, if the writer is already done, no further writer
+                // notifications will arrive to unblock us, so we're finished.
+                if self.ledger.is_writer_done() {
+                    return Progress::RecordRead(None);
+                }
                 return Progress::Blocked;
             }
 
