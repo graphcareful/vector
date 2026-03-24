@@ -152,18 +152,13 @@ pub(crate) fn build_buffer(
     (tx, rx, handle)
 }
 
-/// Gets the current capacity of the underlying base channel of the given sender.
-fn get_base_sender_capacity<T: Bufferable>(sender: &BufferSender<T>) -> Option<usize> {
-    sender.get_base_ref().capacity()
-}
-
-/// Asserts the given sender's base capacity matches the given value.
+/// Asserts the given sender's capacity matches the given value.
 #[allow(clippy::missing_panics_doc)]
 pub fn assert_current_send_capacity<T>(
     sender: &mut BufferSender<T>,
-    base_expected: Option<usize>,
+    expected: Option<usize>,
 ) where
     T: Bufferable,
 {
-    assert_eq!(get_base_sender_capacity(sender), base_expected);
+    assert_eq!(sender.capacity(), expected);
 }

@@ -15,51 +15,12 @@ use crate::{
     variants::disk_v2::{self, ProductionFilesystem},
 };
 
-/// Adapter for papering over various receiver backends.
+/// Internal backend dispatch for buffer receivers.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
-pub enum ReceiverAdapter<T: Bufferable> {
-    /// The in-memory channel buffer.
+enum ReceiverBackend<T: Bufferable> {
     InMemory(LimitedReceiver<T>),
-
-    /// The disk v2 buffer.
     DiskV2(disk_v2::BufferReader<T, ProductionFilesystem>),
-}
-
-impl<T: Bufferable> From<LimitedReceiver<T>> for ReceiverAdapter<T> {
-    fn from(v: LimitedReceiver<T>) -> Self {
-        Self::InMemory(v)
-    }
-}
-
-impl<T: Bufferable> From<disk_v2::BufferReader<T, ProductionFilesystem>> for ReceiverAdapter<T> {
-    fn from(v: disk_v2::BufferReader<T, ProductionFilesystem>) -> Self {
-        Self::DiskV2(v)
-    }
-}
-
-impl<T> ReceiverAdapter<T>
-where
-    T: Bufferable,
-{
-    pub(crate) async fn next(&mut self) -> Option<T> {
-        match self {
-            ReceiverAdapter::InMemory(rx) => rx.next().await,
-            ReceiverAdapter::DiskV2(reader) => loop {
-                match reader.next().await {
-                    Ok(result) => break result,
-                    Err(e) => match e.as_recoverable_error() {
-                        Some(re) => {
-                            // If we've hit a recoverable error, we'll emit an event to indicate as much but we'll still
-                            // keep trying to read the next available record.
-                            emit(re);
-                        }
-                        None => panic!("Reader encountered unrecoverable error: {e:?}"),
-                    },
-                }
-            },
-        }
-    }
 }
 
 /// A buffer receiver.
@@ -67,15 +28,23 @@ where
 /// The receiver handles retrieving events from the buffer, regardless of the overall buffer configuration.
 #[derive(Debug)]
 pub struct BufferReceiver<T: Bufferable> {
-    base: ReceiverAdapter<T>,
+    backend: ReceiverBackend<T>,
     instrumentation: Option<BufferUsageHandle>,
 }
 
 impl<T: Bufferable> BufferReceiver<T> {
-    /// Creates a new [`BufferReceiver`] wrapping the given channel receiver.
-    pub fn new(base: ReceiverAdapter<T>) -> Self {
+    /// Creates a new [`BufferReceiver`] backed by an in-memory channel.
+    pub fn memory(receiver: LimitedReceiver<T>) -> Self {
         Self {
-            base,
+            backend: ReceiverBackend::InMemory(receiver),
+            instrumentation: None,
+        }
+    }
+
+    /// Creates a new [`BufferReceiver`] backed by a disk v2 buffer.
+    pub fn disk_v2(reader: disk_v2::BufferReader<T, ProductionFilesystem>) -> Self {
+        Self {
+            backend: ReceiverBackend::DiskV2(reader),
             instrumentation: None,
         }
     }
@@ -86,7 +55,21 @@ impl<T: Bufferable> BufferReceiver<T> {
     }
 
     pub async fn next(&mut self) -> Option<T> {
-        let item = self.base.next().await?;
+        let item = match &mut self.backend {
+            ReceiverBackend::InMemory(rx) => rx.next().await?,
+            ReceiverBackend::DiskV2(reader) => loop {
+                match reader.next().await {
+                    Ok(Some(item)) => break item,
+                    Ok(None) => return None,
+                    Err(e) => match e.as_recoverable_error() {
+                        Some(re) => {
+                            emit(re);
+                        }
+                        None => panic!("Reader encountered unrecoverable error: {e:?}"),
+                    },
+                }
+            },
+        };
 
         if let Some(handle) = self.instrumentation.as_ref() {
             handle.increment_sent_event_count_and_byte_size(

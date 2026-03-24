@@ -13,96 +13,11 @@ use crate::{
     variants::disk_v2::{self, ProductionFilesystem},
 };
 
-/// Adapter for papering over various sender backends.
+/// Internal backend dispatch for buffer senders.
 #[derive(Clone, Debug)]
-pub enum SenderAdapter<T: Bufferable> {
-    /// The in-memory channel buffer.
+enum SenderBackend<T: Bufferable> {
     InMemory(LimitedSender<T>),
-
-    /// The disk v2 buffer.
     DiskV2(Arc<Mutex<disk_v2::BufferWriter<T, ProductionFilesystem>>>),
-}
-
-impl<T: Bufferable> From<LimitedSender<T>> for SenderAdapter<T> {
-    fn from(v: LimitedSender<T>) -> Self {
-        Self::InMemory(v)
-    }
-}
-
-impl<T: Bufferable> From<disk_v2::BufferWriter<T, ProductionFilesystem>> for SenderAdapter<T> {
-    fn from(v: disk_v2::BufferWriter<T, ProductionFilesystem>) -> Self {
-        Self::DiskV2(Arc::new(Mutex::new(v)))
-    }
-}
-
-impl<T> SenderAdapter<T>
-where
-    T: Bufferable,
-{
-    pub(crate) async fn send(&mut self, item: T) -> crate::Result<()> {
-        match self {
-            Self::InMemory(tx) => tx.send(item).await.map_err(Into::into),
-            Self::DiskV2(writer) => {
-                let mut writer = writer.lock().await;
-
-                writer.write_record(item).await.map(|_| ()).map_err(|e| {
-                    // TODO: Could some errors be handled and not be unrecoverable? Right now,
-                    // encoding should theoretically be recoverable -- encoded value was too big, or
-                    // error during encoding -- but the traits don't allow for recovering the
-                    // original event value because we have to consume it to do the encoding... but
-                    // that might not always be the case.
-                    error!("Disk buffer writer has encountered an unrecoverable error.");
-
-                    e.into()
-                })
-            }
-        }
-    }
-
-    pub(crate) async fn try_send(&mut self, item: T) -> crate::Result<Option<T>> {
-        match self {
-            Self::InMemory(tx) => tx
-                .try_send(item)
-                .map(|()| None)
-                .or_else(|e| Ok(Some(e.into_inner()))),
-            Self::DiskV2(writer) => {
-                let mut writer = writer.lock().await;
-
-                writer.try_write_record(item).await.map_err(|e| {
-                    // TODO: Could some errors be handled and not be unrecoverable? Right now,
-                    // encoding should theoretically be recoverable -- encoded value was too big, or
-                    // error during encoding -- but the traits don't allow for recovering the
-                    // original event value because we have to consume it to do the encoding... but
-                    // that might not always be the case.
-                    error!("Disk buffer writer has encountered an unrecoverable error.");
-
-                    e.into()
-                })
-            }
-        }
-    }
-
-    pub(crate) async fn flush(&mut self) -> crate::Result<()> {
-        match self {
-            Self::InMemory(_) => Ok(()),
-            Self::DiskV2(writer) => {
-                let mut writer = writer.lock().await;
-                writer.flush().await.map_err(|e| {
-                    // Errors on the I/O path, which is all that flushing touches, are never recoverable.
-                    error!("Disk buffer writer has encountered an unrecoverable error.");
-
-                    e.into()
-                })
-            }
-        }
-    }
-
-    pub fn capacity(&self) -> Option<usize> {
-        match self {
-            Self::InMemory(tx) => Some(tx.available_capacity()),
-            Self::DiskV2(_) => None,
-        }
-    }
 }
 
 /// A buffer sender.
@@ -122,7 +37,7 @@ where
 #[derive(Clone, Derivative)]
 #[derivative(Debug)]
 pub struct BufferSender<T: Bufferable> {
-    base: SenderAdapter<T>,
+    backend: SenderBackend<T>,
     when_full: WhenFull,
     usage_instrumentation: Option<BufferUsageHandle>,
     #[derivative(Debug = "ignore")]
@@ -132,15 +47,34 @@ pub struct BufferSender<T: Bufferable> {
 }
 
 impl<T: Bufferable> BufferSender<T> {
-    /// Creates a new [`BufferSender`] wrapping the given channel sender.
-    pub fn new(base: SenderAdapter<T>, when_full: WhenFull) -> Self {
+    /// Creates a new [`BufferSender`] backed by an in-memory channel.
+    pub fn memory(sender: LimitedSender<T>, when_full: WhenFull) -> Self {
         Self {
-            base,
+            backend: SenderBackend::InMemory(sender),
             when_full,
             usage_instrumentation: None,
             send_duration: None,
             custom_instrumentation: None,
         }
+    }
+
+    /// Creates a new [`BufferSender`] backed by a disk v2 buffer.
+    pub fn disk_v2(
+        writer: disk_v2::BufferWriter<T, ProductionFilesystem>,
+        when_full: WhenFull,
+    ) -> Self {
+        Self {
+            backend: SenderBackend::DiskV2(Arc::new(Mutex::new(writer))),
+            when_full,
+            usage_instrumentation: None,
+            send_duration: None,
+            custom_instrumentation: None,
+        }
+    }
+
+    /// Sets the "when full" behavior for this sender.
+    pub fn set_when_full(&mut self, when_full: WhenFull) {
+        self.when_full = when_full;
     }
 
     /// Configures this sender to instrument the items passing through it.
@@ -158,12 +92,57 @@ impl<T: Bufferable> BufferSender<T> {
     pub fn with_custom_instrumentation(&mut self, instrumentation: impl BufferInstrumentation<T>) {
         self.custom_instrumentation = Some(Arc::new(instrumentation));
     }
+
+    /// Returns the available capacity of the underlying channel, if applicable.
+    pub fn capacity(&self) -> Option<usize> {
+        match &self.backend {
+            SenderBackend::InMemory(tx) => Some(tx.available_capacity()),
+            SenderBackend::DiskV2(_) => None,
+        }
+    }
 }
 
 impl<T: Bufferable> BufferSender<T> {
-    #[cfg(test)]
-    pub(crate) fn get_base_ref(&self) -> &SenderAdapter<T> {
-        &self.base
+    async fn send_inner(&mut self, item: T) -> crate::Result<()> {
+        match &mut self.backend {
+            SenderBackend::InMemory(tx) => tx.send(item).await.map_err(Into::into),
+            SenderBackend::DiskV2(writer) => {
+                let mut writer = writer.lock().await;
+                writer.write_record(item).await.map(|_| ()).map_err(|e| {
+                    error!("Disk buffer writer has encountered an unrecoverable error.");
+                    e.into()
+                })
+            }
+        }
+    }
+
+    async fn try_send_inner(&mut self, item: T) -> crate::Result<Option<T>> {
+        match &mut self.backend {
+            SenderBackend::InMemory(tx) => tx
+                .try_send(item)
+                .map(|()| None)
+                .or_else(|e| Ok(Some(e.into_inner()))),
+            SenderBackend::DiskV2(writer) => {
+                let mut writer = writer.lock().await;
+                writer.try_write_record(item).await.map_err(|e| {
+                    error!("Disk buffer writer has encountered an unrecoverable error.");
+                    e.into()
+                })
+            }
+        }
+    }
+
+    async fn flush_inner(&mut self) -> crate::Result<()> {
+        match &mut self.backend {
+            SenderBackend::InMemory(_) => Ok(()),
+            SenderBackend::DiskV2(writer) => {
+                let mut writer = writer.lock().await;
+                writer.flush().await.map_err(|e| {
+                    error!("Disk buffer writer has encountered an unrecoverable error.");
+                    e.into()
+                })
+            }
+        }
     }
 
     pub async fn send(
@@ -188,9 +167,9 @@ impl<T: Bufferable> BufferSender<T> {
                 .increment_received_event_count_and_byte_size(item_count as u64, item_size as u64);
         }
         match self.when_full {
-            WhenFull::Block => self.base.send(item).await?,
+            WhenFull::Block => self.send_inner(item).await?,
             WhenFull::DropNewest => {
-                if self.base.try_send(item).await?.is_some() {
+                if self.try_send_inner(item).await?.is_some() {
                     was_dropped = true;
                 }
             }
@@ -216,8 +195,6 @@ impl<T: Bufferable> BufferSender<T> {
     }
 
     pub async fn flush(&mut self) -> crate::Result<()> {
-        self.base.flush().await?;
-
-        Ok(())
+        self.flush_inner().await
     }
 }

@@ -367,16 +367,14 @@ impl BufferConfig {
         };
 
         let provides_instrumentation = stage.provides_instrumentation();
-        let (sender, receiver) = stage
+        let (mut sender, mut receiver) = stage
             .into_buffer_parts(usage_handle.clone())
             .await
             .map_err(|source| BufferBuildError::FailedToBuildTopology {
                 source: TopologyError::FailedToBuildStage { source },
             })?;
 
-        let mut sender = BufferSender::new(sender, when_full);
-        let mut receiver = BufferReceiver::new(receiver);
-
+        sender.set_when_full(when_full);
         sender.with_send_duration_instrumentation(0, &span);
         if !provides_instrumentation {
             sender.with_usage_instrumentation(usage_handle.clone());

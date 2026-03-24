@@ -203,11 +203,11 @@ pub use self::{
     writer::{BufferWriter, WriterError},
 };
 use crate::{
-    Bufferable,
+    Bufferable, WhenFull,
     buffer_usage_data::BufferUsageHandle,
     topology::{
         builder::IntoBuffer,
-        channel::{ReceiverAdapter, SenderAdapter},
+        channel::{BufferReceiver, BufferSender},
     },
 };
 
@@ -325,7 +325,7 @@ where
     async fn into_buffer_parts(
         self: Box<Self>,
         usage_handle: BufferUsageHandle,
-    ) -> Result<(SenderAdapter<T>, ReceiverAdapter<T>), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(BufferSender<T>, BufferReceiver<T>), Box<dyn Error + Send + Sync>> {
         let (writer, reader) = build_disk_v2_buffer(
             usage_handle,
             &self.data_dir,
@@ -334,7 +334,10 @@ where
         )
         .await?;
 
-        Ok((writer.into(), reader.into()))
+        Ok((
+            BufferSender::disk_v2(writer, WhenFull::default()),
+            BufferReceiver::disk_v2(reader),
+        ))
     }
 }
 
