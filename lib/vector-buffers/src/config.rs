@@ -5,15 +5,16 @@ use std::{
 };
 
 use serde::{Deserialize, Deserializer, Serialize, de};
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 use tracing::Span;
 use vector_common::{config::ComponentKey, finalization::Finalizable};
 use vector_config::configurable_component;
 
 use crate::{
     Bufferable, WhenFull,
+    buffer_usage_data::BufferUsage,
     topology::{
-        builder::{TopologyBuilder, TopologyError},
+        builder::TopologyError,
         channel::{BufferReceiver, BufferSender},
     },
     variants::{DiskV2Buffer, MemoryBuffer},
@@ -292,36 +293,6 @@ impl BufferType {
         }
     }
 
-    /// Adds this buffer type as a stage to an existing [`TopologyBuilder`].
-    ///
-    /// # Errors
-    ///
-    /// If a required parameter is missing, or if there is an error building the topology itself, an
-    /// error variant will be returned describing the error
-    pub fn add_to_builder<T>(
-        &self,
-        builder: &mut TopologyBuilder<T>,
-        data_dir: Option<PathBuf>,
-        id: String,
-    ) -> Result<(), BufferBuildError>
-    where
-        T: Bufferable + Clone + Finalizable,
-    {
-        match *self {
-            BufferType::Memory { size, when_full } => {
-                builder.stage(MemoryBuffer::new(size), when_full);
-            }
-            BufferType::DiskV2 {
-                when_full,
-                max_size,
-            } => {
-                let data_dir = data_dir.ok_or(BufferBuildError::RequiresDataDir)?;
-                builder.stage(DiskV2Buffer::new(id, data_dir, max_size), when_full);
-            }
-        }
-
-        Ok(())
-    }
 }
 
 /// Buffer configuration.
@@ -374,15 +345,47 @@ impl BufferConfig {
     where
         T: Bufferable + Clone + Finalizable,
     {
-        let mut builder = TopologyBuilder::default();
+        use crate::topology::builder::IntoBuffer;
 
-        self.0
-            .add_to_builder(&mut builder, data_dir, buffer_id.clone())?;
+        let mut buffer_usage = BufferUsage::from_span(span.clone());
+        let usage_handle = buffer_usage.add_stage(0);
 
-        builder
-            .build(buffer_id, span)
+        let (stage, when_full): (Box<dyn IntoBuffer<T>>, WhenFull) = match self.0 {
+            BufferType::Memory { size, when_full } => {
+                (Box::new(MemoryBuffer::new(size)), when_full)
+            }
+            BufferType::DiskV2 {
+                when_full,
+                max_size,
+            } => {
+                let data_dir = data_dir.ok_or(BufferBuildError::RequiresDataDir)?;
+                (
+                    Box::new(DiskV2Buffer::new(buffer_id.clone(), data_dir, max_size)),
+                    when_full,
+                )
+            }
+        };
+
+        let provides_instrumentation = stage.provides_instrumentation();
+        let (sender, receiver) = stage
+            .into_buffer_parts(usage_handle.clone())
             .await
-            .context(FailedToBuildTopologySnafu)
+            .map_err(|source| BufferBuildError::FailedToBuildTopology {
+                source: TopologyError::FailedToBuildStage { source },
+            })?;
+
+        let mut sender = BufferSender::new(sender, when_full);
+        let mut receiver = BufferReceiver::new(receiver);
+
+        sender.with_send_duration_instrumentation(0, &span);
+        if !provides_instrumentation {
+            sender.with_usage_instrumentation(usage_handle.clone());
+            receiver.with_usage_instrumentation(usage_handle);
+        }
+
+        buffer_usage.install(buffer_id.as_str());
+
+        Ok((sender, receiver))
     }
 }
 

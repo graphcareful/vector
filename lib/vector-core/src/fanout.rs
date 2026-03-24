@@ -469,7 +469,7 @@ mod tests {
     use vector_buffers::{
         WhenFull,
         topology::{
-            builder::TopologyBuilder,
+            builder::standalone_memory,
             channel::{BufferReceiver, BufferSender},
         },
     };
@@ -485,7 +485,7 @@ mod tests {
     fn build_sender_pair(
         capacity: usize,
     ) -> (BufferSender<EventArray>, BufferReceiver<EventArray>) {
-        TopologyBuilder::standalone_memory(
+        standalone_memory(
             NonZeroUsize::new(capacity).expect("capacity must be nonzero"),
             WhenFull::Block,
             &Span::current(),

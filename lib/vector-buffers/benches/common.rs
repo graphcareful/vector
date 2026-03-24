@@ -6,12 +6,9 @@ use metrics_util::{debugging::DebuggingRecorder, layers::Layer};
 use tracing::Span;
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use vector_buffers::{
-    BufferType, EventCount,
+    BufferConfig, BufferType, EventCount,
     encoding::FixedEncodable,
-    topology::{
-        builder::TopologyBuilder,
-        channel::{BufferReceiver, BufferSender},
-    },
+    topology::channel::{BufferReceiver, BufferSender},
 };
 use vector_common::{
     byte_size_of::ByteSizeOf,
@@ -131,12 +128,9 @@ pub async fn setup<const N: usize>(
         messages.push(Message::new(i as u64));
     }
 
-    let mut builder = TopologyBuilder::default();
-    variant
-        .add_to_builder(&mut builder, data_dir, id)
-        .expect("should not fail to add variant to builder");
-    let (tx, rx) = builder
-        .build(String::from("benches"), Span::none())
+    let config = BufferConfig(variant.clone());
+    let (tx, rx) = config
+        .build(data_dir, id, Span::none())
         .await
         .expect("should not fail to build topology");
 

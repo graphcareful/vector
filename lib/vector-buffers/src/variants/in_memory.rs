@@ -21,12 +21,6 @@ impl MemoryBuffer {
         MemoryBuffer { capacity }
     }
 
-    #[cfg(test)]
-    pub fn with_max_events(n: std::num::NonZeroUsize) -> Self {
-        Self {
-            capacity: MemoryBufferSize::MaxEvents(n),
-        }
-    }
 }
 
 #[async_trait]

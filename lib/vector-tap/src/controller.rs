@@ -11,7 +11,7 @@ use tokio::sync::{
 };
 use tracing::{Instrument, Span};
 use uuid::Uuid;
-use vector_buffers::{WhenFull, topology::builder::TopologyBuilder};
+use vector_buffers::{WhenFull, topology::builder::standalone_memory};
 use vector_common::config::ComponentKey;
 use vector_core::{
     event::{EventArray, LogArray, MetricArray, TraceArray},
@@ -356,7 +356,7 @@ async fn tap_handler(
                             // target for the component, and spawn our transformer task which will
                             // wrap each event payload with the necessary metadata before forwarding
                             // it to our global tap receiver.
-                            let (tap_buffer_tx, mut tap_buffer_rx) = TopologyBuilder::standalone_memory(
+                            let (tap_buffer_tx, mut tap_buffer_rx) = standalone_memory(
                                 TAP_BUFFER_SIZE,
                                 WhenFull::DropNewest,
                                 &Span::current(),

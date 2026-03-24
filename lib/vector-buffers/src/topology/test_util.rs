@@ -6,7 +6,7 @@ use vector_common::{
     finalization::{AddBatchNotifier, BatchNotifier},
 };
 
-use super::builder::TopologyBuilder;
+use super::builder::standalone_memory_test;
 use crate::{
     Bufferable, EventCount, WhenFull,
     buffer_usage_data::BufferUsageHandle,
@@ -142,7 +142,7 @@ pub(crate) fn build_buffer(
     BufferUsageHandle,
 ) {
     let handle = BufferUsageHandle::noop();
-    let (tx, rx) = TopologyBuilder::standalone_memory_test(
+    let (tx, rx) = standalone_memory_test(
         NonZeroUsize::new(capacity).expect("capacity must be nonzero"),
         mode,
         handle.clone(),

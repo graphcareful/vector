@@ -21,7 +21,7 @@ use vector_lib::{
     buffers::{
         BufferType, WhenFull,
         topology::{
-            builder::TopologyBuilder,
+            builder::standalone_memory,
             channel::{BufferReceiver, BufferSender, ChannelMetricMetadata, LimitedReceiver},
         },
     },
@@ -506,7 +506,7 @@ impl<'a> Builder<'a> {
             };
 
             let metrics = ChannelMetricMetadata::new(TRANSFORM_CHANNEL_METRIC_PREFIX, None);
-            let (input_tx, input_rx) = TopologyBuilder::standalone_memory(
+            let (input_tx, input_rx) = standalone_memory(
                 TOPOLOGY_BUFFER_SIZE,
                 WhenFull::Block,
                 &span,

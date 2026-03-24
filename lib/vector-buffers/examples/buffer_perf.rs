@@ -16,12 +16,9 @@ use tokio::{select, sync::oneshot, task, time};
 use tracing::{Span, debug, info};
 use tracing_subscriber::EnvFilter;
 use vector_buffers::{
-    BufferType, Bufferable, EventCount, MemoryBufferSize, WhenFull,
+    BufferConfig, BufferType, Bufferable, EventCount, MemoryBufferSize, WhenFull,
     encoding::FixedEncodable,
-    topology::{
-        builder::TopologyBuilder,
-        channel::{BufferReceiver, BufferSender},
-    },
+    topology::channel::{BufferReceiver, BufferSender},
 };
 use vector_common::{
     byte_size_of::ByteSizeOf,
@@ -254,8 +251,6 @@ where
     let max_size_bytes = std::num::NonZeroU64::new(32 * 1024 * 1024 * 1024).unwrap();
     let when_full = WhenFull::Block;
 
-    let mut builder = TopologyBuilder::default();
-
     let variant = match buffer_type {
         "in-memory" => {
             info!(
@@ -282,12 +277,8 @@ where
         ),
     };
 
-    variant
-        .add_to_builder(&mut builder, Some(data_dir), id)
-        .expect("should not fail to add variant to builder");
-
-    builder
-        .build(String::from("buffer_perf"), Span::none())
+    BufferConfig(variant)
+        .build(Some(data_dir), id, Span::none())
         .await
         .expect("build should not fail")
 }

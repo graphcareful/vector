@@ -9,12 +9,8 @@ use tracing::Span;
 use vector_common::finalization::Finalizable;
 
 use crate::{
-    Bufferable, MemoryBufferSize, WhenFull,
-    topology::{
-        builder::TopologyBuilder,
-        channel::{BufferReceiver, BufferSender},
-    },
-    variants::{DiskV2Buffer, MemoryBuffer},
+    BufferConfig, BufferType, Bufferable, MemoryBufferSize, WhenFull,
+    topology::channel::{BufferReceiver, BufferSender},
 };
 
 #[cfg(test)]
@@ -47,32 +43,34 @@ impl Variant {
     where
         T: Bufferable + Clone + Finalizable,
     {
-        let mut builder = TopologyBuilder::default();
-        match self {
+        let (config, data_dir) = match self {
             Variant::Memory {
                 size, when_full, ..
-            } => {
-                builder.stage(MemoryBuffer::new(*size), *when_full);
-            }
+            } => (
+                BufferConfig(BufferType::Memory {
+                    size: *size,
+                    when_full: *when_full,
+                }),
+                None,
+            ),
             Variant::DiskV2 {
                 max_size,
                 when_full,
                 data_dir,
-                id,
-            } => {
-                builder.stage(
-                    DiskV2Buffer::new(id.clone(), data_dir.clone(), *max_size),
-                    *when_full,
-                );
-            }
-        }
+                ..
+            } => (
+                BufferConfig(BufferType::DiskV2 {
+                    max_size: *max_size,
+                    when_full: *when_full,
+                }),
+                Some(data_dir.clone()),
+            ),
+        };
 
-        let (sender, receiver) = builder
-            .build(String::from("benches"), Span::none())
+        config
+            .build(data_dir, String::from("benches"), Span::none())
             .await
-            .unwrap_or_else(|_| unreachable!("topology build should not fail"));
-
-        (sender, receiver)
+            .unwrap_or_else(|_| unreachable!("topology build should not fail"))
     }
 }
 
