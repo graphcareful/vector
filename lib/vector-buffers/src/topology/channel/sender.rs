@@ -16,18 +16,20 @@ use crate::{
 
 /// Wraps a disk buffer writer together with a drop-notification channel.
 ///
-/// When every clone of the enclosing `Arc<Mutex<DiskWriterHandle>>` is dropped
-/// (i.e. no sender holds the writer any more), the `oneshot::Sender` inside is
-/// dropped too, which completes the paired `oneshot::Receiver`.  This lets the
-/// topology wait for the disk buffer lock to be fully released before creating
-/// a replacement.
+/// When every `Arc<DiskWriterHandle>` clone is dropped (i.e. no sender holds
+/// the writer any more), the `oneshot::Sender` inside is dropped too, which
+/// completes the paired `oneshot::Receiver`.  This lets the topology wait for
+/// the disk buffer lock to be fully released before creating a replacement.
+///
+/// The writer and the drop-notification receiver live behind separate mutexes
+/// so that taking the barrier never contends with an in-flight `send`.
 #[derive(Debug)]
 pub struct DiskWriterHandle<T: Bufferable> {
-    writer: disk_v2::BufferWriter<T, ProductionFilesystem>,
+    writer: Mutex<disk_v2::BufferWriter<T, ProductionFilesystem>>,
     _drop_tx: oneshot::Sender<()>,
     /// The receiving end of the drop notification.  Only the first caller to
     /// take it gets `Some`; subsequent calls return `None`.
-    drop_rx: Option<oneshot::Receiver<()>>,
+    drop_rx: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
 /// Adapter for papering over various sender backends.
@@ -37,7 +39,7 @@ pub enum SenderAdapter<T: Bufferable> {
     InMemory(LimitedSender<T>),
 
     /// The disk v2 buffer.
-    DiskV2(Arc<Mutex<DiskWriterHandle<T>>>),
+    DiskV2(Arc<DiskWriterHandle<T>>),
 }
 
 impl<T: Bufferable> From<LimitedSender<T>> for SenderAdapter<T> {
@@ -49,11 +51,11 @@ impl<T: Bufferable> From<LimitedSender<T>> for SenderAdapter<T> {
 impl<T: Bufferable> From<disk_v2::BufferWriter<T, ProductionFilesystem>> for SenderAdapter<T> {
     fn from(v: disk_v2::BufferWriter<T, ProductionFilesystem>) -> Self {
         let (drop_tx, drop_rx) = oneshot::channel();
-        Self::DiskV2(Arc::new(Mutex::new(DiskWriterHandle {
-            writer: v,
+        Self::DiskV2(Arc::new(DiskWriterHandle {
+            writer: Mutex::new(v),
             _drop_tx: drop_tx,
-            drop_rx: Some(drop_rx),
-        })))
+            drop_rx: Mutex::new(Some(drop_rx)),
+        }))
     }
 }
 
@@ -65,10 +67,9 @@ where
         match self {
             Self::InMemory(tx) => tx.send(item).await.map_err(Into::into),
             Self::DiskV2(handle) => {
-                let mut handle = handle.lock().await;
+                let mut writer = handle.writer.lock().await;
 
-                handle
-                    .writer
+                writer
                     .write_record(item)
                     .await
                     .map(|_| ())
@@ -93,9 +94,9 @@ where
                 .map(|()| None)
                 .or_else(|e| Ok(Some(e.into_inner()))),
             Self::DiskV2(handle) => {
-                let mut handle = handle.lock().await;
+                let mut writer = handle.writer.lock().await;
 
-                handle.writer.try_write_record(item).await.map_err(|e| {
+                writer.try_write_record(item).await.map_err(|e| {
                     // TODO: Could some errors be handled and not be unrecoverable? Right now,
                     // encoding should theoretically be recoverable -- encoded value was too big, or
                     // error during encoding -- but the traits don't allow for recovering the
@@ -113,8 +114,8 @@ where
         match self {
             Self::InMemory(_) => Ok(()),
             Self::DiskV2(handle) => {
-                let mut handle = handle.lock().await;
-                handle.writer.flush().await.map_err(|e| {
+                let mut writer = handle.writer.lock().await;
+                writer.flush().await.map_err(|e| {
                     // Errors on the I/O path, which is all that flushing touches, are never recoverable.
                     error!("Disk buffer writer has encountered an unrecoverable error.");
 
@@ -139,7 +140,7 @@ where
     pub async fn take_buffer_release_barrier(&self) -> Option<oneshot::Receiver<()>> {
         match self {
             Self::InMemory(_) => None,
-            Self::DiskV2(handle) => handle.lock().await.drop_rx.take(),
+            Self::DiskV2(handle) => handle.drop_rx.lock().await.take(),
         }
     }
 }
