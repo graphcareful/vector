@@ -600,7 +600,7 @@ impl RunningTopology {
                 && self
                     .config
                     .sink(key)
-                    .map_or(false, |s| s.buffer.has_disk_stage())
+                    .is_some_and(|s| s.buffer.has_disk_stage())
         });
 
         let wait_for_sinks = conflicting_sinks

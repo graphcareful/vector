@@ -405,7 +405,7 @@ async fn topology_disk_buffer_config_change_chained_does_not_stall() {
 
     let sink_key = ComponentKey::from("out");
     old_config.sinks[&sink_key].buffer = BufferConfig::Chained(vec![
-        memory_stage.clone(),
+        memory_stage,
         BufferType::DiskV2 {
             max_size: NonZeroU64::new(268435488).unwrap(),
             when_full: WhenFull::Block,
