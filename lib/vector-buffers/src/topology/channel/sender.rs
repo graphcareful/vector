@@ -69,20 +69,16 @@ where
             Self::DiskV2(handle) => {
                 let mut writer = handle.writer.lock().await;
 
-                writer
-                    .write_record(item)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| {
-                        // TODO: Could some errors be handled and not be unrecoverable? Right now,
-                        // encoding should theoretically be recoverable -- encoded value was too big, or
-                        // error during encoding -- but the traits don't allow for recovering the
-                        // original event value because we have to consume it to do the encoding... but
-                        // that might not always be the case.
-                        error!("Disk buffer writer has encountered an unrecoverable error.");
+                writer.write_record(item).await.map(|_| ()).map_err(|e| {
+                    // TODO: Could some errors be handled and not be unrecoverable? Right now,
+                    // encoding should theoretically be recoverable -- encoded value was too big, or
+                    // error during encoding -- but the traits don't allow for recovering the
+                    // original event value because we have to consume it to do the encoding... but
+                    // that might not always be the case.
+                    error!("Disk buffer writer has encountered an unrecoverable error.");
 
-                        e.into()
-                    })
+                    e.into()
+                })
             }
         }
     }
