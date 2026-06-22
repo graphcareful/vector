@@ -4,7 +4,10 @@ use async_recursion::async_recursion;
 use derivative::Derivative;
 use tokio::sync::Mutex;
 use tracing::Span;
-use vector_common::internal_event::{InternalEventHandle, Registered, register};
+use vector_common::{
+    finalization::Finalizable,
+    internal_event::{InternalEventHandle, Registered, register},
+};
 
 use super::limited_queue::LimitedSender;
 use crate::{
@@ -38,7 +41,7 @@ impl<T: Bufferable> From<disk_v2::BufferWriter<T, ProductionFilesystem>> for Sen
 
 impl<T> SenderAdapter<T>
 where
-    T: Bufferable,
+    T: Bufferable + Finalizable,
 {
     pub(crate) async fn send(&mut self, item: T) -> crate::Result<()> {
         match self {
@@ -193,7 +196,7 @@ impl<T: Bufferable> BufferSender<T> {
     }
 }
 
-impl<T: Bufferable> BufferSender<T> {
+impl<T: Bufferable + Finalizable> BufferSender<T> {
     #[cfg(test)]
     pub(crate) fn get_base_ref(&self) -> &SenderAdapter<T> {
         &self.base

@@ -237,7 +237,7 @@ pub struct Buffer<T> {
 
 impl<T> Buffer<T>
 where
-    T: Bufferable,
+    T: Bufferable + Finalizable,
 {
     #[cfg_attr(test, instrument(skip(config, usage_handle), level = "trace"))]
     pub(crate) async fn from_config_inner<FS>(
@@ -351,7 +351,7 @@ async fn build_disk_v2_buffer<T>(
     Box<dyn Error + Send + Sync>,
 >
 where
-    T: Bufferable + Clone,
+    T: Bufferable + Clone + Finalizable,
 {
     usage_handle.set_buffer_limits(Some(max_size.get()), None);
 

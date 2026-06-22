@@ -14,7 +14,7 @@ use tracing::Instrument;
 use tracing_fluent_assertions::{Assertion, AssertionRegistry};
 use vector_common::{
     byte_size_of::ByteSizeOf,
-    finalization::{AddBatchNotifier, BatchNotifier},
+    finalization::{AddBatchNotifier, BatchNotifier, EventFinalizers, Finalizable},
 };
 
 use super::{create_buffer_v2_with_max_data_file_size, create_default_buffer_v2};
@@ -729,6 +729,12 @@ async fn reader_throws_error_when_record_is_undecodable_via_metadata() {
     impl AddBatchNotifier for ControllableRecord {
         fn add_batch_notifier(&mut self, batch: BatchNotifier) {
             drop(batch); // We never check acknowledgements for this type
+        }
+    }
+
+    impl Finalizable for ControllableRecord {
+        fn take_finalizers(&mut self) -> EventFinalizers {
+            EventFinalizers::DEFAULT
         }
     }
 

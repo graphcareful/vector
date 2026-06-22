@@ -8,6 +8,7 @@ use tokio::{
     fs::OpenOptions,
     io::{AsyncWriteExt, DuplexStream},
 };
+use vector_common::finalization::Finalizable;
 
 use super::{
     Buffer, BufferReader, BufferWriter, DiskBufferConfigBuilder, Filesystem, Ledger,
@@ -200,7 +201,7 @@ pub(crate) async fn create_default_buffer_v2<P, R>(
 )
 where
     P: AsRef<Path>,
-    R: Bufferable,
+    R: Bufferable + Finalizable,
 {
     let config = DiskBufferConfigBuilder::from_path(data_dir)
         .build()
@@ -222,7 +223,7 @@ pub(crate) async fn create_default_buffer_v2_with_usage<P, R>(
 )
 where
     P: AsRef<Path>,
-    R: Bufferable,
+    R: Bufferable + Finalizable,
 {
     let config = DiskBufferConfigBuilder::from_path(data_dir)
         .build()
@@ -250,7 +251,7 @@ pub(crate) async fn create_buffer_v2_with_data_file_count_limit<P, R>(
 )
 where
     P: AsRef<Path>,
-    R: Bufferable,
+    R: Bufferable + Finalizable,
 {
     // We do this here, despite the fact that configuration builder also implicitly does it, because our error message
     // can be more pointed given that we're running tests, whereas the user-visible error message is just about getting
@@ -294,7 +295,7 @@ pub(crate) async fn create_buffer_v2_with_max_record_size<P, R>(
 )
 where
     P: AsRef<Path>,
-    R: Bufferable,
+    R: Bufferable + Finalizable,
 {
     let config = DiskBufferConfigBuilder::from_path(data_dir)
         .max_record_size(max_record_size)
@@ -320,7 +321,7 @@ pub(crate) async fn create_buffer_v2_with_max_data_file_size<P, R>(
 )
 where
     P: AsRef<Path>,
-    R: Bufferable,
+    R: Bufferable + Finalizable,
 {
     let max_record_size = usize::try_from(max_data_file_size).unwrap();
 
@@ -347,7 +348,7 @@ pub(crate) async fn create_buffer_v2_with_write_buffer_size<P, R>(
 )
 where
     P: AsRef<Path>,
-    R: Bufferable,
+    R: Bufferable + Finalizable,
 {
     let config = DiskBufferConfigBuilder::from_path(data_dir)
         .write_buffer_size(write_buffer_size)

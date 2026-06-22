@@ -1,0 +1,3 @@
+Fixed a durability bug in the `disk_v2` buffer where upstream sources could receive an end-to-end acknowledgement for records that had only been written to the OS page cache, not yet `fsync`'d to disk. A crash or `SIGKILL` before the periodic 500 ms `fsync` window fired could permanently lose those records, since the source would not retransmit data it had already acknowledged. The writer now detaches the upstream `EventFinalizers` from each record before encoding, parks them until the next successful `sync_all()`, and only then fires them as `Delivered`. Pending finalizers are fired as `Errored` from `close()` so the source retransmits on reconnect if the writer shuts down before its data is durable.
+
+authors: graphcareful

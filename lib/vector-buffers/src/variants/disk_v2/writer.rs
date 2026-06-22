@@ -22,6 +22,7 @@ use rkyv::{
 };
 use snafu::{ResultExt, Snafu};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use vector_common::finalization::{EventFinalizers, EventStatus, Finalizable};
 
 use super::{
     common::{DiskBufferConfig, create_crc32c_hasher},
@@ -743,12 +744,18 @@ where
     data_file_full: bool,
     skip_to_next: bool,
     ready_to_write: bool,
+    /// Finalizers from records whose data has been written to the page cache but not yet
+    /// fsynced.  They fire `Delivered` only after `sync_all()` succeeds, so upstream sources
+    /// (e.g. Filebeat) never see an acknowledgement for data that is not yet durably committed.
+    /// On `close()` we instead fire them as `Errored` — the data was never durable, so the
+    /// source must retransmit on reconnect rather than silently lose records.
+    pending_finalizers: Vec<EventFinalizers>,
     _t: PhantomData<T>,
 }
 
 impl<T, FS> BufferWriter<T, FS>
 where
-    T: Bufferable,
+    T: Bufferable + Finalizable,
     FS: Filesystem + fmt::Debug + Clone,
     FS::File: Unpin,
 {
@@ -767,6 +774,7 @@ where
             ready_to_write: false,
             next_record_id,
             unflushed_events: 0,
+            pending_finalizers: Vec::new(),
             _t: PhantomData,
         }
     }
@@ -1236,6 +1244,14 @@ where
         // Grab the next record ID and attempt to write the record.
         let record_id = self.get_next_record_id();
 
+        // Detach the upstream finalizers from the record before archive_record consumes it.
+        // The finalizers are NOT serialized to disk; if we let the record drop with them
+        // attached, they fire `Delivered` the moment encoding finishes, which would let the
+        // source acknowledge data that is only in the write buffer.  We hold them here and
+        // fire `Delivered` only after sync_all() succeeds — on any failure path or close we
+        // fire `Errored` instead so the source retransmits.
+        let finalizers = record.take_finalizers();
+
         let token = loop {
             // Make sure we have an open data file to write to, which might also be us opening the
             // next data file because our first attempt at writing had to finalize a data file that
@@ -1269,7 +1285,10 @@ where
                             "Current data file reached maximum size. Rolling to the next data file."
                         );
                     }
-                    e => return Err(e),
+                    e => {
+                        finalizers.update_status(EventStatus::Errored);
+                        return Err(e);
+                    }
                 },
             }
         };
@@ -1288,12 +1307,23 @@ where
         let (bytes_written, flush_result) = if can_write_record {
             // We always return errors here because flushing the record won't return a recoverable error like
             // `DataFileFull`, as that gets checked during archiving.
-            writer.flush_record(token).await?
+            match writer.flush_record(token).await {
+                Ok(r) => r,
+                Err(e) => {
+                    finalizers.update_status(EventStatus::Errored);
+                    return Err(e);
+                }
+            }
         } else {
             // The record would not fit given the current size of the buffer, so we need to recover it from the
             // writer and hand it back. This looks a little weird because we want to surface deserialize/decoding
             // errors if we encounter them, but if we recover the record successfully, we're returning
             // `Ok(Err(record))` to signal that our attempt failed but the record is able to be retried again later.
+            //
+            // The recovered record has empty finalizers (encode/decode roundtrip drops them), so we mark the
+            // original finalizers as `Errored` to force the source to retransmit — better duplicates than a lost
+            // ack chain.
+            finalizers.update_status(EventStatus::Errored);
             return Ok(Err(writer.recover_archived_record(&token)?));
         };
 
@@ -1304,6 +1334,13 @@ where
         // setting the ledger state to a record ID that we may never have actually written, which
         // could lead to record ID gaps.
         self.track_write(record_events.get(), bytes_written as u64);
+
+        // Hold the finalizers in the pending queue.  They will be fired as `Delivered` after
+        // the next sync_all() in `flush_inner`, ensuring upstream sources only ack data that
+        // is durably on disk.
+        if !finalizers.is_empty() {
+            self.pending_finalizers.push(finalizers);
+        }
 
         // If we did flush some buffered writes during this write, however, we now compensate for
         // that after updating our internal state.  We'll also notify the reader, too, since the
@@ -1381,7 +1418,15 @@ where
                 writer.sync_all().await?;
             }
 
-            self.ledger.flush()
+            self.ledger.flush()?;
+
+            // Now that the data is durably on disk, fire the pending finalizers as `Delivered`.
+            // Upstream sources (e.g. Filebeat) only receive an ack after this point — a crash
+            // before fsync leaves finalizers pending, and they will be fired as `Errored` from
+            // `close()` so the source retransmits on reconnect instead of silently losing data.
+            self.fire_pending_finalizers(EventStatus::Delivered);
+
+            Ok(())
         } else {
             Ok(())
         }
@@ -1412,6 +1457,16 @@ where
     FS: Filesystem,
     FS::File: Unpin,
 {
+    /// Drains the pending finalizer queue, firing each as `status`.
+    ///
+    /// Called with `Delivered` after `sync_all()` succeeds (data is durably on disk) and with
+    /// `Errored` from `close()` (data never reached fsync; the source must retransmit).
+    fn fire_pending_finalizers(&mut self, status: EventStatus) {
+        for finalizers in self.pending_finalizers.drain(..) {
+            finalizers.update_status(status);
+        }
+    }
+
     /// Closes this [`Writer`], marking it as done.
     ///
     /// Closing the writer signals to the reader that no more records will be written until the
@@ -1423,6 +1478,11 @@ where
     /// to return `None`.
     #[instrument(skip(self), level = "trace")]
     pub fn close(&mut self) {
+        // Any finalizers still pending here belong to writes that were never fsynced.  Fire them
+        // as `Errored` so the upstream source retransmits on reconnect — better a duplicate than
+        // a silently-lost record.
+        self.fire_pending_finalizers(EventStatus::Errored);
+
         if self.ledger.mark_writer_done() {
             debug!("Writer marked as closed.");
             self.ledger.notify_writer_waiters();

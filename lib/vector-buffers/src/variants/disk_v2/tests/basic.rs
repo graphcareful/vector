@@ -4,7 +4,7 @@ use futures::{StreamExt, stream};
 use tokio::{select, time::sleep};
 use tokio_test::{assert_pending, task::spawn};
 use tracing::Instrument;
-use vector_common::finalization::Finalizable;
+use vector_common::finalization::{AddBatchNotifier, BatchNotifier, BatchStatus, Finalizable};
 
 use super::{
     create_default_buffer_v2, create_default_buffer_v2_with_usage, read_next, read_next_some,
@@ -13,7 +13,9 @@ use crate::{
     EventCount, assert_buffer_is_empty, assert_buffer_records,
     buffer_usage_data::BufferUsageHandle,
     test::{MultiEventRecord, SizedRecord, acknowledge, install_tracing_helpers, with_temp_dir},
-    variants::disk_v2::{BufferWriter, DiskBufferConfigBuilder, Ledger, writer::RecordWriter},
+    variants::disk_v2::{
+        Buffer, BufferWriter, DiskBufferConfigBuilder, Ledger, writer::RecordWriter,
+    },
 };
 
 #[tokio::test]
@@ -260,6 +262,135 @@ async fn initial_size_correct_with_multievents() {
 
             assert_eq!(expected_events, total_record_events);
             assert_eq!(expected_records, total_records_read);
+        }
+    })
+    .await;
+}
+
+/// Regression test for the e2e ack durability fix.
+///
+/// Before the fix, encoding a record consumed it (along with any upstream-attached
+/// `EventFinalizers`), causing those finalizers to fire `Delivered` the moment the encoded bytes
+/// reached the OS page cache — well before the periodic `sync_all()` (fsync, default 500 ms
+/// interval) made the data durable. With e2e acks enabled, an upstream source (e.g. Filebeat)
+/// would receive an acknowledgement, drop the records from its retry queue, and Vector could
+/// then crash before fsync — losing the data permanently with no chance of retransmission.
+///
+/// After the fix, `try_write_record_inner` detaches the finalizers from the record before
+/// encoding and parks them in `pending_finalizers`. They fire `Delivered` only after the next
+/// successful `sync_all()` in `flush_inner`. On `close()` (or `Drop` without a final fsync) any
+/// still-pending finalizers fire `Errored`, so the source retransmits on reconnect rather than
+/// silently losing data.
+#[tokio::test]
+async fn no_premature_e2e_ack_before_fsync() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+        async move {
+            // Use a very long flush interval so the page-cache flush in `flush_inner` never
+            // promotes to an fsync during the first phase of the test. We trigger the
+            // post-fsync phase later by rebuilding the buffer with a 0-duration interval.
+            let config = DiskBufferConfigBuilder::from_path(&data_dir)
+                .flush_interval(Duration::from_mins(1))
+                .build()
+                .expect("creating buffer config should not fail");
+            let usage_handle = BufferUsageHandle::noop();
+            let (mut writer, reader, ledger) =
+                Buffer::<SizedRecord>::from_config_inner(config, usage_handle)
+                    .await
+                    .expect("buffer should build");
+
+            // Attach a BatchNotifier to the record — this is what an upstream source uses to
+            // know when its data has been durably accepted by the buffer.
+            let mut record = SizedRecord::new(64);
+            let (batch, mut receiver) = BatchNotifier::new_with_receiver();
+            record.add_batch_notifier(batch);
+
+            // Write + flush. flush_inner drains the BufWriter to the OS page cache, but the
+            // long flush_interval keeps should_flush() returning false, so sync_all() is
+            // skipped and the data is not yet durable.
+            writer
+                .write_record(record)
+                .await
+                .expect("write should not fail");
+            writer.flush().await.expect("flush should not fail");
+
+            // The upstream source MUST NOT see an ack yet. Before the fix, the finalizer fired
+            // as soon as the encoded record dropped — try_recv() here would return the
+            // Delivered status immediately, which is the regression we're guarding against.
+            assert_eq!(
+                receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+                "BatchNotifier fired before fsync — premature e2e ack regression",
+            );
+
+            // Drop the writer/reader/ledger from this phase before reopening the buffer below.
+            // The reader is still parked on an empty file, so dropping it lets the background
+            // finalizer task exit and release the advisory ledger lock.
+            drop(writer);
+            drop(reader);
+            while Arc::strong_count(&ledger) > 1 {
+                tokio::task::yield_now().await;
+            }
+            drop(ledger);
+
+            // The dropped writer fired our pending finalizer as `Errored` (data was never
+            // fsynced).  Drain that signal so the next phase can verify the Delivered path
+            // cleanly.
+            assert_eq!(
+                receiver.await,
+                BatchStatus::Errored,
+                "closing the writer without fsync should fire Errored, not Delivered",
+            );
+
+            // Phase 2: write a fresh record with a 0-duration flush_interval so the next
+            // flush() always triggers sync_all(), and verify the finalizer fires `Delivered`.
+            let config = DiskBufferConfigBuilder::from_path(&data_dir)
+                .flush_interval(Duration::ZERO)
+                .build()
+                .expect("creating buffer config should not fail");
+            let usage_handle = BufferUsageHandle::noop();
+            let (mut writer, reader, ledger) =
+                Buffer::<SizedRecord>::from_config_inner(config, usage_handle)
+                    .await
+                    .expect("buffer should rebuild");
+
+            let mut record = SizedRecord::new(64);
+            let (batch, mut receiver) = BatchNotifier::new_with_receiver();
+            record.add_batch_notifier(batch);
+
+            writer
+                .write_record(record)
+                .await
+                .expect("write should not fail");
+
+            // The fix still applies pre-flush: finalizers were taken off the record at write
+            // time and parked, so try_recv() must still be Empty until flush() actually
+            // fsyncs.
+            assert_eq!(
+                receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+                "finalizer fired before flush — should only fire after sync_all()",
+            );
+
+            // sleep so any non-zero elapsed comparison inside should_flush() definitely
+            // returns true on the next check.
+            sleep(Duration::from_millis(1)).await;
+            writer.flush().await.expect("flush should not fail");
+
+            // After fsync, the held finalizer should have been fired as `Delivered`.
+            assert_eq!(
+                receiver.try_recv(),
+                Ok(BatchStatus::Delivered),
+                "finalizer should fire Delivered after sync_all() completes",
+            );
+
+            // Clean shutdown.
+            drop(writer);
+            drop(reader);
+            while Arc::strong_count(&ledger) > 1 {
+                tokio::task::yield_now().await;
+            }
+            drop(ledger);
         }
     })
     .await;

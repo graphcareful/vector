@@ -4,6 +4,7 @@ use std::{
 };
 
 use tokio::{pin, sync::Barrier, time::sleep};
+use vector_common::finalization::Finalizable;
 
 use crate::{
     Bufferable, WhenFull,
@@ -19,7 +20,7 @@ async fn assert_send_ok_with_capacities<T>(
     base_expected: Option<usize>,
     overflow_expected: Option<usize>,
 ) where
-    T: Bufferable,
+    T: Bufferable + Finalizable,
 {
     assert!(sender.send(value.into(), None).await.is_ok());
     assert_current_send_capacity(sender, base_expected, overflow_expected);
@@ -31,7 +32,7 @@ async fn blocking_send_and_drain_receiver<T, V>(
     send_value: V,
 ) -> Vec<V>
 where
-    T: Bufferable,
+    T: Bufferable + Finalizable,
     V: Into<T> + From<T> + Send + 'static,
 {
     // We can likely replace this with `tokio_test`-related helpers to avoid the sleeping.
