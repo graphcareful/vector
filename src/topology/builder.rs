@@ -929,6 +929,14 @@ impl<'a> Builder<'a> {
 
             match fanout.send_stream(stream).await {
                 Ok(()) => {
+                    // Graceful finish: durably flush downstream disk buffers before their writers
+                    // are dropped so the tail of records is acked `Delivered`, not `Errored`.
+                    if let Err(error) = fanout.flush_durable().await {
+                        error!(
+                            message = "Task transform failed to durably flush outputs on shutdown.",
+                            %error
+                        );
+                    }
                     debug!("Task transform finished normally.");
                     Ok(TaskOutput::Transform)
                 }
@@ -1000,6 +1008,14 @@ async fn run_source_output_pump(
                 }
             }
         }
+    }
+
+    // The source finished gracefully, so durably flush any downstream disk buffers before their
+    // writers are dropped. This acknowledges the tail of records written since the last fsync as
+    // `Delivered` rather than letting the writer's `Drop` fire them `Errored` (which would force
+    // the source to needlessly retransmit on restart).
+    if let Err(error) = fanout.flush_durable().await {
+        error!(message = "Source pump failed to durably flush outputs on shutdown.", %error);
     }
 
     debug!("Source pump finished normally.");
@@ -1266,6 +1282,14 @@ impl Runner {
         self.outputs.send(outputs_buf).await
     }
 
+    /// Durably flushes downstream disk buffers after the transform's input has drained gracefully,
+    /// so the tail of records is acked `Delivered` rather than `Errored` on writer drop.
+    async fn flush_outputs_durably(&mut self) {
+        if let Err(error) = self.outputs.flush_durable().await {
+            error!(message = "Transform failed to durably flush outputs on shutdown.", %error);
+        }
+    }
+
     async fn run_inline(mut self) -> TaskResult {
         // 128 is an arbitrary, smallish constant
         const INLINE_BATCH_SIZE: usize = 128;
@@ -1288,6 +1312,7 @@ impl Runner {
                 .map_err(TaskError::wrapped)?;
         }
 
+        self.flush_outputs_durably().await;
         Ok(TaskOutput::Transform)
     }
 
@@ -1360,6 +1385,7 @@ impl Runner {
             }
         }
 
+        self.flush_outputs_durably().await;
         Ok(TaskOutput::Transform)
     }
 }

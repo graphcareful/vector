@@ -123,6 +123,26 @@ impl TransformOutputs {
         Ok(())
     }
 
+    /// Durably flushes every output's fanout, firing finalizers awaiting an fsync as `Delivered`.
+    ///
+    /// Called when the transform finishes gracefully so the tail of records written to downstream
+    /// disk buffers is acknowledged as delivered rather than fired `Errored` on writer drop. See
+    /// [`Fanout::flush_durable`].
+    ///
+    /// # Errors
+    ///
+    /// If an error occurs while flushing any output, an error variant is returned detailing the
+    /// cause.
+    pub async fn flush_durable(&mut self) -> Result<(), Box<dyn error::Error + Send + Sync>> {
+        if let Some(primary) = self.primary_output.as_mut() {
+            primary.fanout.flush_durable().await?;
+        }
+        for output in self.named_outputs.values_mut() {
+            output.fanout.flush_durable().await?;
+        }
+        Ok(())
+    }
+
     async fn send_single_buffer(
         buf: &mut OutputBuffer,
         output: &mut TransformOutput,

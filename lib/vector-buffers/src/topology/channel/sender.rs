@@ -1,8 +1,11 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{Arc, Weak},
+    time::{Duration, Instant},
+};
 
 use async_recursion::async_recursion;
 use derivative::Derivative;
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::MissedTickBehavior};
 use tracing::Span;
 use vector_common::{
     finalization::Finalizable,
@@ -33,10 +36,51 @@ impl<T: Bufferable> From<LimitedSender<T>> for SenderAdapter<T> {
     }
 }
 
-impl<T: Bufferable> From<disk_v2::BufferWriter<T, ProductionFilesystem>> for SenderAdapter<T> {
+impl<T: Bufferable + Finalizable> From<disk_v2::BufferWriter<T, ProductionFilesystem>>
+    for SenderAdapter<T>
+{
     fn from(v: disk_v2::BufferWriter<T, ProductionFilesystem>) -> Self {
-        Self::DiskV2(Arc::new(Mutex::new(v)))
+        let flush_interval = v.flush_interval();
+        let writer = Arc::new(Mutex::new(v));
+        spawn_periodic_flush(Arc::downgrade(&writer), flush_interval);
+        Self::DiskV2(writer)
     }
+}
+
+/// Drives an idle disk buffer's parked finalizers to `Delivered`.
+///
+/// Flushes are otherwise write-driven, so the last batch written before traffic goes idle would
+/// never have its finalizers fired until more data arrives (or shutdown fires them `Errored`).
+/// This task ticks every flush interval and, when finalizers are awaiting durability, forces an
+/// fsync and fires them. It holds a [`Weak`] reference so it never keeps the writer alive: once the
+/// buffer's owner drops the writer, the next tick observes the failed upgrade and the task exits,
+/// allowing `close()` and the ledger lock release to proceed.
+fn spawn_periodic_flush<T>(
+    writer: Weak<Mutex<disk_v2::BufferWriter<T, ProductionFilesystem>>>,
+    interval: Duration,
+) where
+    T: Bufferable + Finalizable,
+{
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            ticker.tick().await;
+
+            let Some(writer) = writer.upgrade() else {
+                break;
+            };
+
+            if let Err(error) = writer.lock().await.flush_pending_finalizers().await {
+                error!(
+                    %error,
+                    "Disk buffer writer encountered an unrecoverable error during periodic flush."
+                );
+                break;
+            }
+        }
+    });
 }
 
 impl<T> SenderAdapter<T>
@@ -105,6 +149,32 @@ where
         match self {
             Self::InMemory(tx) => Some(tx.available_capacity()),
             Self::DiskV2(_) => None,
+        }
+    }
+
+    /// Durably flushes any finalizers awaiting an fsync, firing them as `Delivered`.
+    ///
+    /// This is called when an upstream component finishes gracefully, so that the tail of records
+    /// written since the last fsync is acknowledged as delivered rather than being fired `Errored`
+    /// by the writer's `Drop` (which would make the source needlessly retransmit on restart).
+    ///
+    /// Crucially, this does *not* mark the writer as done. A disk buffer's writer can be shared
+    /// (cloned) across multiple upstream components in a fan-in topology, so signalling
+    /// writer-done here would terminate the reader while other upstreams are still writing.
+    /// Marking the writer done stays in the writer's `Drop`, which runs only once the last clone
+    /// is released; by then this flush has already drained the pending queue, so that `Drop` fires
+    /// `Errored` over an empty set.
+    pub(crate) async fn flush_durable(&mut self) -> crate::Result<()> {
+        match self {
+            Self::InMemory(_) => Ok(()),
+            Self::DiskV2(writer) => {
+                let mut writer = writer.lock().await;
+                writer.flush_pending_finalizers().await.map_err(|e| {
+                    error!("Disk buffer writer has encountered an unrecoverable error.");
+
+                    e.into()
+                })
+            }
         }
     }
 }
@@ -272,6 +342,20 @@ impl<T: Bufferable + Finalizable> BufferSender<T> {
         self.base.flush().await?;
         if let Some(overflow) = self.overflow.as_mut() {
             overflow.flush().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Durably flushes any finalizers awaiting an fsync, firing them as `Delivered`.
+    ///
+    /// Called when an upstream component finishes gracefully. See
+    /// [`SenderAdapter::flush_durable`] for why this does not mark the writer as done.
+    #[async_recursion]
+    pub async fn flush_durable(&mut self) -> crate::Result<()> {
+        self.base.flush_durable().await?;
+        if let Some(overflow) = self.overflow.as_mut() {
+            overflow.flush_durable().await?;
         }
 
         Ok(())

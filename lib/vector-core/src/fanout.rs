@@ -64,6 +64,25 @@ impl Fanout {
         (fanout, control_tx)
     }
 
+    /// Durably flushes every connected output, firing finalizers awaiting an fsync as `Delivered`.
+    ///
+    /// Call this when the upstream component feeding this fanout finishes gracefully, so the tail
+    /// of records written to disk buffers since the last fsync is acknowledged as delivered rather
+    /// than being fired `Errored` when the buffer writer is dropped. For in-memory outputs this is
+    /// a no-op.
+    ///
+    /// # Errors
+    ///
+    /// If an error occurs while flushing any output, an error variant is returned detailing the
+    /// cause.
+    pub async fn flush_durable(&mut self) -> crate::Result<()> {
+        for sender in self.senders.values_mut().flatten() {
+            sender.inner.flush_durable().await?;
+        }
+
+        Ok(())
+    }
+
     /// Add a new sink as an output.
     ///
     /// # Panics

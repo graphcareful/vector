@@ -6,6 +6,7 @@ use std::{
     marker::PhantomData,
     num::NonZeroUsize,
     sync::Arc,
+    time::Duration,
 };
 
 use bytes::BufMut;
@@ -1447,6 +1448,29 @@ where
     #[instrument(skip(self), level = "trace")]
     pub async fn flush(&mut self) -> io::Result<()> {
         self.flush_inner(false).await?;
+        self.flush_write_state();
+        Ok(())
+    }
+
+    /// The configured flush interval, used to pace the periodic flush task.
+    pub(crate) fn flush_interval(&self) -> Duration {
+        self.config.flush_interval
+    }
+
+    /// Forces an fsync and fires any parked finalizers as `Delivered`, but only when finalizers
+    /// are actually awaiting durability.
+    ///
+    /// Flushes are otherwise write-driven, so the last batch written before traffic goes idle
+    /// would park its finalizers indefinitely — the data is durable on disk, but the upstream
+    /// source never receives its acknowledgement. The periodic flush task calls this to drain that
+    /// idle tail within one flush interval. When nothing is pending (or there is no open data file
+    /// to fsync), it is a no-op, so an idle buffer performs no additional I/O.
+    pub(crate) async fn flush_pending_finalizers(&mut self) -> io::Result<()> {
+        if self.pending_finalizers.is_empty() || self.writer.is_none() {
+            return Ok(());
+        }
+
+        self.flush_inner(true).await?;
         self.flush_write_state();
         Ok(())
     }
