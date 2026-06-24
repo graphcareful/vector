@@ -395,3 +395,151 @@ async fn no_premature_e2e_ack_before_fsync() {
     })
     .await;
 }
+
+/// Verifies the graceful-shutdown durable flush does not close the buffer.
+///
+/// On graceful shutdown, `flush_pending_finalizers` (driven through `BufferSender::flush_durable`)
+/// fsyncs and fires the pending tail as `Delivered`. Crucially, it must NOT mark the writer as
+/// done: a disk buffer's writer can be shared across multiple upstream components in a fan-in
+/// topology, so signalling writer-done here would terminate the reader while other upstreams are
+/// still writing. This test confirms that after a durable flush the buffer is still fully usable —
+/// the just-flushed record is readable and further writes succeed and are readable too.
+#[tokio::test]
+async fn durable_flush_does_not_close_buffer() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+        async move {
+            let (mut writer, mut reader, ledger) = create_default_buffer_v2(data_dir).await;
+
+            let write_task = tokio::spawn(async move {
+                // Write a record carrying an upstream finalizer, then perform a graceful durable
+                // flush mid-stream.
+                let mut first = SizedRecord::new(64);
+                let (batch, receiver) = BatchNotifier::new_with_receiver();
+                first.add_batch_notifier(batch);
+                writer
+                    .write_record(first)
+                    .await
+                    .expect("write should not fail");
+
+                writer
+                    .flush_pending_finalizers()
+                    .await
+                    .expect("durable flush should not fail");
+
+                // The durable flush fires the parked finalizer as Delivered...
+                assert_eq!(
+                    receiver.await,
+                    BatchStatus::Delivered,
+                    "durable flush should fire Delivered",
+                );
+
+                // ...but must NOT have marked the writer done. If it had, the reader would
+                // terminate after the first record and never observe this second write.
+                writer
+                    .write_record(SizedRecord::new(128))
+                    .await
+                    .expect("write after durable flush should not fail");
+                writer.flush().await.expect("flush should not fail");
+
+                // Only now do we actually close the writer.
+                writer.close();
+            });
+
+            let read_task = tokio::spawn(async move {
+                let mut items = Vec::new();
+                while let Some(mut record) = read_next(&mut reader).await {
+                    acknowledge(record.take_finalizers()).await;
+                    items.push(record.0);
+                }
+                items
+            });
+
+            write_task.await.expect("write task should not panic");
+            let items = read_task.await.expect("read task should not panic");
+
+            // Both records survived the mid-stream durable flush, proving it left the buffer open.
+            assert_eq!(items, vec![64, 128]);
+            assert_buffer_is_empty!(ledger);
+
+            while Arc::strong_count(&ledger) > 1 {
+                tokio::task::yield_now().await;
+            }
+            drop(ledger);
+        }
+    })
+    .await;
+}
+
+/// Regression test for the idle-tail ack stall.
+///
+/// The e2e ack fix defers a record's `Delivered` finalizer until the next `sync_all()` in
+/// `flush_inner`, which only fsyncs when `should_flush()` is true. Since flushes are write-driven,
+/// the last batch written before traffic goes idle parks its finalizers indefinitely — the data is
+/// durable on disk but the upstream source never receives its ack. `flush_pending_finalizers`,
+/// driven by the periodic flush task, drains that idle tail: it forces an fsync and fires the
+/// parked finalizers as `Delivered`, but only when finalizers are actually awaiting durability so
+/// an idle buffer performs no extra I/O.
+#[tokio::test]
+async fn periodic_flush_drains_idle_tail() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+        async move {
+            // A long flush interval guarantees the per-write `flush()` never promotes to an fsync,
+            // so the finalizer stays parked exactly as it would when traffic goes idle.
+            let config = DiskBufferConfigBuilder::from_path(&data_dir)
+                .flush_interval(Duration::from_mins(1))
+                .build()
+                .expect("creating buffer config should not fail");
+            let usage_handle = BufferUsageHandle::noop();
+            let (mut writer, reader, ledger) =
+                Buffer::<SizedRecord>::from_config_inner(config, usage_handle)
+                    .await
+                    .expect("buffer should build");
+
+            // With nothing written yet, the periodic flush must be a no-op (no pending finalizers).
+            writer
+                .flush_pending_finalizers()
+                .await
+                .expect("flush_pending_finalizers should not fail when idle");
+
+            let mut record = SizedRecord::new(64);
+            let (batch, mut receiver) = BatchNotifier::new_with_receiver();
+            record.add_batch_notifier(batch);
+
+            writer
+                .write_record(record)
+                .await
+                .expect("write should not fail");
+            writer.flush().await.expect("flush should not fail");
+
+            // The long flush interval kept `should_flush()` false, so the finalizer is parked.
+            assert_eq!(
+                receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+                "finalizer fired before the periodic flush — should still be parked",
+            );
+
+            // The periodic flush task forces an fsync and drains the parked finalizer, even though
+            // no further writes arrived and `should_flush()` would still return false.
+            writer
+                .flush_pending_finalizers()
+                .await
+                .expect("flush_pending_finalizers should not fail");
+
+            assert_eq!(
+                receiver.try_recv(),
+                Ok(BatchStatus::Delivered),
+                "periodic flush should fire Delivered for the idle tail",
+            );
+
+            drop(writer);
+            drop(reader);
+            while Arc::strong_count(&ledger) > 1 {
+                tokio::task::yield_now().await;
+            }
+            drop(ledger);
+        }
+    })
+    .await;
+}
