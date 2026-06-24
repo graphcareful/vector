@@ -1321,11 +1321,14 @@ where
             // errors if we encounter them, but if we recover the record successfully, we're returning
             // `Ok(Err(record))` to signal that our attempt failed but the record is able to be retried again later.
             //
-            // The recovered record has empty finalizers (encode/decode roundtrip drops them), so we mark the
-            // original finalizers as `Errored` to force the source to retransmit — better duplicates than a lost
-            // ack chain.
-            finalizers.update_status(EventStatus::Errored);
-            return Ok(Err(writer.recover_archived_record(&token)?));
+            // The recovered record has empty finalizers (the encode/decode roundtrip drops them), so we re-attach
+            // the ones we detached above. This way the finalizers travel with the record wherever it goes next --
+            // a retry on this buffer, an overflow to another buffer, or being dropped -- and the source is
+            // acknowledged exactly once, when the record is eventually written durably, rather than being told
+            // `Errored` for a write that merely hit backpressure and will succeed on retry.
+            let mut record = writer.recover_archived_record(&token)?;
+            record.add_finalizers(finalizers);
+            return Ok(Err(record));
         };
 
         // Track our write since things appear to have succeeded. This only updates our internal

@@ -100,6 +100,10 @@ impl Finalizable for Record {
     fn take_finalizers(&mut self) -> EventFinalizers {
         mem::take(&mut self.finalizers)
     }
+
+    fn add_finalizers(&mut self, finalizers: EventFinalizers) {
+        self.finalizers.merge(finalizers);
+    }
 }
 
 impl EventCount for Record {

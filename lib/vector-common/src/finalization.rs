@@ -378,6 +378,20 @@ pub trait Finalizable {
     /// Typically used for coalescing the finalizers of multiple items, such as when batching finalizable objects where
     /// all finalizations will be processed when the batch itself is processed.
     fn take_finalizers(&mut self) -> EventFinalizers;
+
+    /// Re-attaches finalizers to this object, merging them with any it already holds.
+    ///
+    /// This is the inverse of [`Finalizable::take_finalizers`]. It exists so that a component
+    /// which detaches finalizers before an operation that may need to be retried (for example,
+    /// the `disk_v2` buffer writer, which must detach finalizers before encoding a record) can
+    /// put them back onto the record it hands back for a retry, ensuring the record is
+    /// acknowledged exactly once when the operation eventually succeeds.
+    ///
+    /// The default implementation drops the finalizers. This is only correct for types that are
+    /// never handed back for a retry after their finalizers have been detached, which is true of
+    /// every type that does not flow through a buffer (e.g. sink request types). Types stored in
+    /// a buffer must override this.
+    fn add_finalizers(&mut self, _finalizers: EventFinalizers) {}
 }
 
 impl<T: Finalizable> Finalizable for Vec<T> {

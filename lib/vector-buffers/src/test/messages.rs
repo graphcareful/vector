@@ -43,6 +43,10 @@ macro_rules! message_wrapper {
             fn take_finalizers(&mut self) -> EventFinalizers {
                 std::mem::take(&mut self.1)
             }
+
+            fn add_finalizers(&mut self, finalizers: EventFinalizers) {
+                self.1.merge(finalizers);
+            }
         }
 
         impl PartialEq for $id {

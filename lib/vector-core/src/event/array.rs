@@ -314,6 +314,30 @@ impl Finalizable for EventArray {
             Self::Traces(a) => a.iter_mut().map(Finalizable::take_finalizers).collect(),
         }
     }
+
+    fn add_finalizers(&mut self, finalizers: EventFinalizers) {
+        // Re-attach to the first event. The whole array shares a single fate when buffered (it is
+        // written, retried, or dropped as a unit), so which event carries the finalizers does not
+        // matter for acknowledgement — they fire together when that event is finalized. If the
+        // array is empty there is nowhere to attach them and they are dropped.
+        match self {
+            Self::Logs(a) => {
+                if let Some(event) = a.first_mut() {
+                    event.metadata_mut().merge_finalizers(finalizers);
+                }
+            }
+            Self::Metrics(a) => {
+                if let Some(event) = a.first_mut() {
+                    event.metadata_mut().merge_finalizers(finalizers);
+                }
+            }
+            Self::Traces(a) => {
+                if let Some(event) = a.first_mut() {
+                    event.metadata_mut().merge_finalizers(finalizers);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
