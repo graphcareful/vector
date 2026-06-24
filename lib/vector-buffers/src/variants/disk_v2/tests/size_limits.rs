@@ -8,6 +8,8 @@ use super::{
     create_buffer_v2_with_data_file_count_limit, create_buffer_v2_with_max_data_file_size,
     create_buffer_v2_with_max_record_size, read_next, read_next_some,
 };
+use vector_common::finalization::{AddBatchNotifier, BatchNotifier, Finalizable};
+
 use crate::{
     assert_buffer_is_empty, assert_buffer_records, assert_buffer_size, assert_enough_bytes_written,
     assert_reader_writer_v2_file_positions,
@@ -381,6 +383,75 @@ async fn writer_rolls_data_files_when_the_limit_is_exceeded_after_reload() {
 
             assert_buffer_is_empty!(ledger);
             assert_reader_writer_v2_file_positions!(ledger, 1, 1);
+        }
+    })
+    .await;
+}
+
+/// Regression test for the backpressure ack-preservation fix.
+///
+/// When a record archives successfully but does not fit the buffer's size budget,
+/// `try_write_record` recovers it (via decode) and hands it back for the caller to retry or
+/// overflow. The recovered record has lost its finalizers in the encode/decode roundtrip, so the
+/// writer re-attaches the detached finalizers to it. Before the fix the writer instead fired them
+/// `Errored` and returned a finalizer-less record, forcing the source to retransmit (duplicate)
+/// data that merely hit backpressure and would succeed on retry.
+///
+/// The setup mirrors `writer_try_write_returns_when_buffer_is_full`: after the first write the
+/// buffer holds one data file's worth of data, below the two-data-file `max_buffer_size`, so
+/// `is_buffer_full()` is false and the second write reaches the archive + `can_write_record` budget
+/// check -- the recover-and-re-attach path being guarded here.
+#[tokio::test]
+async fn backpressured_try_write_preserves_finalizers() {
+    let _a = install_tracing_helpers();
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let write_size = 96;
+            let first_record = SizedRecord::new(write_size);
+            let mut second_record = SizedRecord::new(write_size);
+
+            // Attach an upstream batch notifier to the record that will hit backpressure.
+            let (batch, mut receiver) = BatchNotifier::new_with_receiver();
+            second_record.add_batch_notifier(batch);
+
+            let max_data_file_size = get_minimum_data_file_size_for_record_payload(&second_record);
+            let (mut writer, _reader, ledger) =
+                create_buffer_v2_with_data_file_count_limit(data_dir, max_data_file_size, 2).await;
+            assert_buffer_is_empty!(ledger);
+
+            // First write fills the data file; the buffer is now below max (not full).
+            let first_write_result = writer
+                .try_write_record(first_record)
+                .await
+                .expect("write should not fail");
+            assert_eq!(first_write_result, None);
+            writer.flush().await.expect("flush should not fail");
+
+            // Second write archives but does not fit the buffer budget, so it is recovered and
+            // returned for retry/overflow.
+            let mut recovered = writer
+                .try_write_record(second_record)
+                .await
+                .expect("write should not fail")
+                .expect("record should be returned due to backpressure");
+
+            // The fix: the notifier was NOT fired (no premature `Errored`)...
+            assert_eq!(
+                receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+                "backpressured record's finalizer was fired instead of riding with the record",
+            );
+            // ...and the finalizers were re-attached to the recovered record so they travel with
+            // it. Before the fix this set was empty.
+            assert!(
+                !recovered.take_finalizers().is_empty(),
+                "recovered record lost its finalizers on the backpressure path",
+            );
+
+            drop(writer);
+            drop(ledger);
         }
     })
     .await;

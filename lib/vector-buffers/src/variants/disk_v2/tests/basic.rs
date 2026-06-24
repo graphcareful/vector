@@ -13,6 +13,7 @@ use crate::{
     EventCount, assert_buffer_is_empty, assert_buffer_records,
     buffer_usage_data::BufferUsageHandle,
     test::{MultiEventRecord, SizedRecord, acknowledge, install_tracing_helpers, with_temp_dir},
+    topology::channel::SenderAdapter,
     variants::disk_v2::{
         Buffer, BufferWriter, DiskBufferConfigBuilder, Ledger, writer::RecordWriter,
     },
@@ -534,6 +535,90 @@ async fn periodic_flush_drains_idle_tail() {
             );
 
             drop(writer);
+            drop(reader);
+            while Arc::strong_count(&ledger) > 1 {
+                tokio::task::yield_now().await;
+            }
+            drop(ledger);
+        }
+    })
+    .await;
+}
+
+/// Verifies the actor-lite background task flushes the parked ack tail on shutdown, and only once
+/// every sender is gone (fan-in safety).
+///
+/// Wrapping a disk `BufferWriter` in a `SenderAdapter` spawns the background flush task. The task
+/// fires parked finalizers `Delivered` after an fsync on either a flush-interval tick or when the
+/// shutdown channel closes (all `SenderAdapter` clones dropped). With a long flush interval the
+/// only thing that can flush is shutdown, so this isolates that path. It also confirms that
+/// dropping one of two senders -- as in a fan-in topology where the writer is shared -- does NOT
+/// trigger shutdown, since the channel stays open while any sender remains.
+#[tokio::test]
+async fn shutdown_flushes_parked_acks_when_all_senders_drop() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+        async move {
+            // Long flush interval so the periodic tick never fires during the test; the shutdown
+            // branch is then the only thing that can flush.
+            let config = DiskBufferConfigBuilder::from_path(&data_dir)
+                .flush_interval(Duration::from_mins(1))
+                .build()
+                .expect("creating buffer config should not fail");
+            let usage_handle = BufferUsageHandle::noop();
+            let (writer, reader, ledger) =
+                Buffer::<SizedRecord>::from_config_inner(config, usage_handle)
+                    .await
+                    .expect("buffer should build");
+
+            // Wrapping the writer spawns the flush task; clone it to model a fan-in topology where
+            // two upstreams share one writer.
+            let mut adapter = SenderAdapter::from(writer);
+            let adapter2 = adapter.clone();
+
+            // Let the task consume its immediate first tick (a no-op while nothing is pending) so
+            // it parks on the long interval before we write anything.
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+
+            let mut record = SizedRecord::new(64);
+            let (batch, mut receiver) = BatchNotifier::new_with_receiver();
+            record.add_batch_notifier(batch);
+            adapter.send(record).await.expect("send should not fail");
+
+            // Written but not fsynced, and no tick will fire: the ack stays parked.
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+                "ack fired before shutdown",
+            );
+
+            // Drop ONE sender. The writer is shared (fan-in), so the channel is still open and the
+            // task must NOT treat this as shutdown.
+            drop(adapter);
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+                "dropping one of two senders falsely triggered the shutdown flush",
+            );
+
+            // Drop the last sender: every upstream is now gone, the channel closes, and the task
+            // performs its final durable flush, firing the parked ack as Delivered.
+            drop(adapter2);
+            assert_eq!(
+                receiver.await,
+                BatchStatus::Delivered,
+                "final shutdown flush should fire Delivered",
+            );
+
+            // The task closes the writer and releases its reference as it exits; wait for teardown.
             drop(reader);
             while Arc::strong_count(&ledger) > 1 {
                 tokio::task::yield_now().await;
