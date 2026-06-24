@@ -728,6 +728,42 @@ where
     }
 }
 
+/// Guards a record's detached [`EventFinalizers`] across a single write attempt.
+///
+/// Once finalizers are taken off a record (so encoding can't fire them prematurely), every exit
+/// path owes them a status. Dropping a finalizer without setting one silently reports `Delivered`
+/// — a false acknowledgement — so this guard fires `Errored` on drop *unless* [`PendingAck::commit`]
+/// is called first. The success path and the backpressure-recovery path call `commit` to take
+/// ownership; every error or early-return path simply drops the guard, which records `Errored` so
+/// the source retransmits rather than losing data it believes was delivered.
+struct PendingAck {
+    finalizers: Option<EventFinalizers>,
+}
+
+impl PendingAck {
+    fn new(finalizers: EventFinalizers) -> Self {
+        Self {
+            finalizers: Some(finalizers),
+        }
+    }
+
+    /// Takes ownership of the finalizers, disarming the `Errored`-on-drop behavior.
+    ///
+    /// The caller is now responsible for their eventual status: either parking them to fire
+    /// `Delivered` after `sync_all()`, or re-attaching them to a record that will be retried.
+    fn commit(mut self) -> EventFinalizers {
+        self.finalizers.take().unwrap_or_default()
+    }
+}
+
+impl Drop for PendingAck {
+    fn drop(&mut self) {
+        if let Some(finalizers) = self.finalizers.take() {
+            finalizers.update_status(EventStatus::Errored);
+        }
+    }
+}
+
 /// Writes records to the buffer.
 #[derive(Debug)]
 pub struct BufferWriter<T, FS>
@@ -1248,10 +1284,10 @@ where
         // Detach the upstream finalizers from the record before archive_record consumes it.
         // The finalizers are NOT serialized to disk; if we let the record drop with them
         // attached, they fire `Delivered` the moment encoding finishes, which would let the
-        // source acknowledge data that is only in the write buffer.  We hold them here and
-        // fire `Delivered` only after sync_all() succeeds — on any failure path or close we
-        // fire `Errored` instead so the source retransmits.
-        let finalizers = record.take_finalizers();
+        // source acknowledge data that is only in the write buffer.  The guard fires `Errored`
+        // if dropped, so every error/early-return path below resolves them correctly without an
+        // explicit call; the success and backpressure paths `commit` to take ownership.
+        let ack = PendingAck::new(record.take_finalizers());
 
         let token = loop {
             // Make sure we have an open data file to write to, which might also be us opening the
@@ -1287,7 +1323,7 @@ where
                         );
                     }
                     e => {
-                        finalizers.update_status(EventStatus::Errored);
+                        // `ack` drops here, firing the finalizers `Errored`.
                         return Err(e);
                     }
                 },
@@ -1310,10 +1346,8 @@ where
             // `DataFileFull`, as that gets checked during archiving.
             match writer.flush_record(token).await {
                 Ok(r) => r,
-                Err(e) => {
-                    finalizers.update_status(EventStatus::Errored);
-                    return Err(e);
-                }
+                // `ack` drops here, firing the finalizers `Errored`.
+                Err(e) => return Err(e),
             }
         } else {
             // The record would not fit given the current size of the buffer, so we need to recover it from the
@@ -1326,8 +1360,11 @@ where
             // a retry on this buffer, an overflow to another buffer, or being dropped -- and the source is
             // acknowledged exactly once, when the record is eventually written durably, rather than being told
             // `Errored` for a write that merely hit backpressure and will succeed on retry.
+            //
+            // Note: if `recover_archived_record` itself errors, `ack` drops and fires `Errored`, which is correct
+            // since the record is lost.
             let mut record = writer.recover_archived_record(&token)?;
-            record.add_finalizers(finalizers);
+            record.add_finalizers(ack.commit());
             return Ok(Err(record));
         };
 
@@ -1339,9 +1376,10 @@ where
         // could lead to record ID gaps.
         self.track_write(record_events.get(), bytes_written as u64);
 
-        // Hold the finalizers in the pending queue.  They will be fired as `Delivered` after
-        // the next sync_all() in `flush_inner`, ensuring upstream sources only ack data that
-        // is durably on disk.
+        // The write succeeded, so take ownership of the finalizers and hold them in the pending
+        // queue.  They will be fired as `Delivered` after the next sync_all() in `flush_inner`,
+        // ensuring upstream sources only ack data that is durably on disk.
+        let finalizers = ack.commit();
         if !finalizers.is_empty() {
             self.pending_finalizers.push(finalizers);
         }
