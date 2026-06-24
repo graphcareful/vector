@@ -28,6 +28,12 @@ pub const MINIMUM_MAX_RECORD_SIZE: usize = align16(RECORD_HEADER_LEN + 1);
 //
 // Practically, it's far more definitive than `disk_v1` which does not definitely `fsync` at all, at least with how we
 // have it configured.
+//
+// NOTE: the flush interval is the fsync cadence, and end-to-end acks are only fired after an fsync, so it is also the
+// worst-case ack latency and bounds how much un-acked data parks in `pending_finalizers`. It is currently fixed at this
+// default (not user-configurable). If/when it is exposed in the user config -- or when explicit time/size-based flush
+// tuning lands -- validate an upper bound (~5s) at the config layer, otherwise a large interval inflates ack latency
+// (risking source retransmits/duplicates when it exceeds the source's ack timeout) and `pending_finalizers` growth.
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
 // Using 256KB as it aligns nicely with the I/O size exposed by major cloud providers.  This may not

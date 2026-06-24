@@ -86,6 +86,11 @@ const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 ///   done via `close()`, and exits, releasing its strong reference so the writer can drop. Because
 ///   this runs in async context, the final flush can `await sync_all()` -- something the
 ///   synchronous `Drop` path cannot do, which is the whole reason this lives here.
+///
+/// INVARIANT: this task must hold the `Receiver` only, never a `Sender` clone. The shutdown signal
+/// is "all senders dropped"; if the task held a sender, the channel could never close, so the task
+/// would never exit, never release its strong reference, and the writer would never close -- a
+/// deadlock that stalls the reader and holds the ledger lock open against a restart.
 fn spawn_flush_task<T>(
     writer: Arc<Mutex<disk_v2::BufferWriter<T, ProductionFilesystem>>>,
     interval: Duration,

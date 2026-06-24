@@ -389,8 +389,13 @@ pub trait Finalizable {
     ///
     /// The default implementation drops the finalizers. This is only correct for types that are
     /// never handed back for a retry after their finalizers have been detached, which is true of
-    /// every type that does not flow through a buffer (e.g. sink request types). Types stored in
-    /// a buffer must override this.
+    /// every type that does not flow through a buffer (e.g. sink request types).
+    ///
+    /// FOOTGUN: any type stored in a disk buffer MUST override this. If it doesn't, finalizers
+    /// detached on the backpressure-recovery path are silently dropped instead of re-attached,
+    /// which reports `Delivered` to the source for data that was not actually written -- a silent
+    /// ack bug. Today only `EventArray` (and the buffer test record types) flow through a buffer
+    /// and override it; a new buffered payload type that forgets to is the regression to watch for.
     fn add_finalizers(&mut self, _finalizers: EventFinalizers) {}
 }
 
