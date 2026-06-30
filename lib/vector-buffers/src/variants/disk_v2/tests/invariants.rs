@@ -927,3 +927,87 @@ async fn reader_writer_positions_aligned_through_multiple_files_and_records() {
     let parent = trace_span!("reader_writer_positions_aligned_through_multiple_files_and_records");
     fut.instrument(parent.or_current()).await;
 }
+
+/// Regression test for the buffer-size underflow on restart.
+///
+/// Historically, reopening a buffer seeded `total_buffer_size` from the sum of the on-disk data
+/// file sizes and then had the reader "draw it down" record-by-record as it sought to its persisted
+/// read position. Those two inputs were captured at different moments (the directory's file sizes
+/// vs. the ledger's persisted position), so a crash between their respective flushes could make the
+/// draw-down subtract more than the seed held -- wrapping the unsigned counter to a near-maximum
+/// value, making the buffer look permanently full, and wedging the writer.
+///
+/// The reader now recomputes the unread total authoritatively at the end of `seek_to_next_record`,
+/// from a single consistent snapshot: `(total on-disk file size) - (bytes consumed reaching the
+/// resume position)`. This test exercises the case that actually stresses that arithmetic -- a
+/// single data file that is *partially* read and acknowledged, so the reader resumes mid-file with
+/// a non-empty already-read prefix -- and asserts the reopened buffer reports exactly the bytes of
+/// the still-unread records.
+#[tokio::test]
+async fn buffer_size_recalculated_correctly_after_partial_read_reload() {
+    let _a = install_tracing_helpers();
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            // Write several small records that all land in a single data file.
+            let total_records = 8;
+            let mut record_sizes = Vec::new();
+            let (mut writer, mut reader, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir.clone()).await;
+            for _ in 0..total_records {
+                let bytes_written = writer
+                    .write_record(SizedRecord::new(64))
+                    .await
+                    .expect("write should not fail");
+                record_sizes.push(bytes_written as u64);
+            }
+            writer.flush().await.expect("flush should not fail");
+
+            let total_bytes: u64 = record_sizes.iter().sum();
+            assert_buffer_size!(ledger, total_records, total_bytes);
+
+            // Read and acknowledge a strict prefix of the records.
+            let acked_records = 3usize;
+            for _ in 0..acked_records {
+                let record = read_next_some(&mut reader).await;
+                acknowledge(record).await;
+            }
+
+            // Let the spawned finalizer deliver the acknowledgements, then drive one more read so
+            // the reader consumes them, advancing its persisted record position past the prefix.
+            tokio::task::yield_now().await;
+            let _ = read_next(&mut reader).await;
+
+            let expected_unread: u64 = record_sizes[acked_records..].iter().sum();
+
+            // Checkpoint on the live buffer: the acknowledged prefix has been drawn down, so the
+            // running size already reflects only the unread records. (This also guards the test
+            // against the acknowledgements not having been processed before we reload.)
+            assert_eq!(
+                expected_unread,
+                ledger.get_total_buffer_size(),
+                "live buffer size should reflect only the unread records after acking the prefix",
+            );
+
+            // Persist the advanced read position so the reopened buffer resumes mid-file rather
+            // than replaying from the start.
+            ledger.flush().expect("ledger flush should not fail");
+
+            drop(writer);
+            drop(reader);
+            drop(ledger);
+
+            // Reopen. The authoritatively recomputed buffer size must equal exactly the bytes of
+            // the unread records -- not the full file, and never an underflowed/wrapped value.
+            let (_writer, _reader, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+            assert_eq!(
+                expected_unread,
+                ledger.get_total_buffer_size(),
+                "reopened buffer size should equal the unread records' on-disk bytes",
+            );
+        }
+    })
+    .await;
+}
