@@ -461,12 +461,19 @@ where
             self.data_file_start_record_id = Some(record_id);
         }
 
-        // Track the amount of data we read.  If we're still loading the buffer, then the only thing
-        // other we need to do is update the total buffer size.  Everything else below only matters
-        // when we're doing real record reads.
+        // Track the amount of data we read.  `bytes_read` accumulates the on-disk size of the
+        // records consumed within the current data file; at the end of initialization it is exactly
+        // the size of the already-read prefix of the file the reader resumes on, which
+        // `seek_to_next_record` uses to install the authoritative buffer size.
         self.bytes_read += record_bytes;
         if !self.ready_to_read {
-            self.ledger.decrement_total_buffer_size(record_bytes);
+            // During initialization we are only replaying already-read records to reposition the
+            // reader; we deliberately do NOT adjust `total_buffer_size` here. The authoritative
+            // unread total is installed once, at the end of `seek_to_next_record`, from a single
+            // consistent snapshot. Decrementing per-record during this replay was the historical
+            // approach, and -- because the seeded total and the replayed records came from
+            // snapshots taken at different times across a crash -- it is what allowed the
+            // buffer-size counter to underflow and wrap.
             return;
         }
 
@@ -534,7 +541,11 @@ where
         let metadata = data_file.metadata().await?;
 
         let decrease_amount = bytes_read.map_or_else(
-            || metadata.len(),
+            // `None` is only passed from `seek_to_next_record`'s fast path while it deletes
+            // fully-read straggler files during initialization. Initialization does not mutate
+            // `total_buffer_size` incrementally -- the authoritative value is installed once at the
+            // end of the seek -- so deleting a file here must not decrement it.
+            || 0,
             |bytes_read| {
                 // A file shorter than bytes_read makes the delta below underflow
                 // and feed a wrapped value into decrement_total_buffer_size.
@@ -966,6 +977,44 @@ where
         debug!(
             last_record_id_read = self.last_reader_record_id,
             "Synchronized with ledger. Reader ready."
+        );
+
+        // Install the authoritative buffer size now that the reader is positioned at the first
+        // unread record.
+        //
+        // At this point the seek has deleted every data file that was fully read (the fast path
+        // above), so the files still on disk are exactly: the file the reader resumed on, plus any
+        // later, entirely-unread files. `self.bytes_read` is the on-disk size of the already-read
+        // prefix of that resumed-on file. The unread total is therefore simply the total size of
+        // the remaining files minus that consumed prefix -- a single, internally-consistent
+        // snapshot, rather than a file-size seed drawn down against a separately-persisted read
+        // position. This is what makes the result immune to the crash-window underflow.
+        //
+        // `saturating_sub` is belt-and-suspenders: `bytes_read` is a prefix of the remaining files
+        // and so can never exceed their total, but clamping guarantees we can never wrap even if a
+        // corrupted/short file slips through.
+        let total_data_file_size = self.ledger.total_data_file_size().await.context(IoSnafu)?;
+
+        // A non-zero on-disk total means we reopened on top of records left behind by a previous
+        // run -- the recovery path most exposed to the historical buffer-size underflow.
+        #[cfg(feature = "antithesis-disk-asserts")]
+        {
+            #![allow(clippy::disallowed_types)] // once_cell::Lazy
+            antithesis_sdk::assert_sometimes!(
+                total_data_file_size > 0,
+                "the buffer reopens with pre-existing on-disk records",
+                &serde_json::json!({ "total_buffer_size": total_data_file_size })
+            );
+        }
+
+        let unread_buffer_size = total_data_file_size.saturating_sub(self.bytes_read);
+        self.ledger.set_total_buffer_size(unread_buffer_size);
+
+        debug!(
+            total_data_file_size,
+            consumed_prefix = self.bytes_read,
+            unread_buffer_size,
+            "Recalculated buffer size from on-disk data files."
         );
 
         self.ready_to_read = true;
