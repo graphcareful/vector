@@ -324,6 +324,42 @@ where
         );
     }
 
+    /// Overwrites the total number of bytes for all unread records in the buffer.
+    ///
+    /// Used during initialization to install an authoritatively recomputed buffer size once the
+    /// reader has established its resume position (see `BufferReader::seek_to_next_record`). Unlike
+    /// the incremental `increment`/`decrement` paths, this is an absolute store, so it is only
+    /// sound to call while no concurrent writes or acknowledgements can be mutating the counter --
+    /// i.e. during the synchronous buffer load, before the reader/writer are handed out.
+    pub fn set_total_buffer_size(&self, amount: u64) {
+        self.total_buffer_size.store(amount, Ordering::Release);
+    }
+
+    /// Sums the on-disk size of every data file currently present in the buffer's data directory.
+    ///
+    /// This is the total bytes physically on disk, across read and unread records alike; callers
+    /// that want the unread total must subtract whatever the reader has already consumed.
+    pub(super) async fn total_data_file_size(&self) -> io::Result<u64> {
+        let mut dat_reader = fs::read_dir(&self.config.data_dir).await?;
+
+        let mut total_data_file_size = 0;
+        while let Some(dir_entry) = dat_reader.next_entry().await? {
+            if let Some(file_name) = dir_entry.file_name().to_str() {
+                // I really _do_ want to only find files with a .dat extension, as that's what the
+                // code generates, and having them be .dAt or .Dat or whatever would indicate that
+                // the file is not related to our buffer.  If we had to cope with case-sensitivity
+                // of filenames from another program/OS, then it would be a different story.
+                #[allow(clippy::case_sensitive_file_extension_comparisons)]
+                if file_name.ends_with(".dat") {
+                    let metadata = dir_entry.metadata().await?;
+                    total_data_file_size += metadata.len();
+                }
+            }
+        }
+
+        Ok(total_data_file_size)
+    }
+
     /// Gets the current reader file ID.
     ///
     /// This is internally adjusted to compensate for the fact that the reader can read far past
@@ -659,7 +695,7 @@ where
         // Create the ledger object, and synchronize the buffer statistics with the buffer usage
         // handle.  This handles making sure we account for the starting size of the buffer, and
         // what not.
-        let mut ledger = Ledger {
+        let ledger = Ledger {
             config,
             lock,
             state: ledger_state,
@@ -672,69 +708,18 @@ where
             last_flush: AtomicCell::new(Instant::now()),
             usage_handle,
         };
-        ledger.update_buffer_size().await?;
+
+        // NOTE: We deliberately do not seed `total_buffer_size` here. Historically, the ledger
+        // summed the on-disk data file sizes at load and then had the reader "draw that total down"
+        // record-by-record as it sought to its persisted read position. That mixed two values
+        // captured at different moments -- the directory's file sizes versus the ledger's persisted
+        // read position, which are flushed independently -- so a crash between their flushes could
+        // let the draw-down subtract past zero, wrapping the counter to a near-max value and
+        // wedging the writer. The authoritative value (the size of the *unread* records only) is
+        // now computed in a single consistent snapshot by `BufferReader::seek_to_next_record` once
+        // it has established the resume position.
 
         Ok(ledger)
-    }
-
-    async fn update_buffer_size(&mut self) -> Result<(), LedgerLoadCreateError> {
-        // Under normal operation, the reader and writer maintain a consistent state within the
-        // ledger.  However, due to the nature of how we update the ledger, process crashes could
-        // lead to missed updates as we execute reads and writes as non-atomic units of execution:
-        // update a field, do the read/write, update some more fields depending on success or
-        // failure, etc.
-        //
-        // This is an issue because we depend on knowing the total buffer size (the total size of
-        // unread records, specifically) so that we can correctly limit writes when we've reached
-        // the configured maximum buffer size.
-        //
-        // While it's not terribly efficient, and I'd like to eventually formulate a better design,
-        // this approach is absolutely correct: get the file size of every data file on disk,
-        // and set the "total buffer size" to the sum of all of those file sizes.
-        //
-        // When the reader does any necessary seeking to get to the record it left off on, it will
-        // adjust the "total buffer size" downwards for each record it runs through, leaving "total
-        // buffer size" at the correct value.
-        let mut dat_reader = fs::read_dir(&self.config.data_dir).await.context(IoSnafu)?;
-
-        let mut total_buffer_size = 0;
-        while let Some(dir_entry) = dat_reader.next_entry().await.context(IoSnafu)? {
-            if let Some(file_name) = dir_entry.file_name().to_str() {
-                // I really _do_ want to only find files with a .dat extension, as that's what the
-                // code generates, and having them be .dAt or .Dat or whatever would indicate that
-                // the file is not related to our buffer.  If we had to cope with case-sensitivity
-                // of filenames from another program/OS, then it would be a different story.
-                #[allow(clippy::case_sensitive_file_extension_comparisons)]
-                if file_name.ends_with(".dat") {
-                    let metadata = dir_entry.metadata().await.context(IoSnafu)?;
-                    total_buffer_size += metadata.len();
-
-                    debug!(
-                        data_file = file_name,
-                        file_size = metadata.len(),
-                        total_buffer_size,
-                        "Found existing data file."
-                    );
-                }
-            }
-        }
-
-        // A non-zero sum means the buffer reopened on top of records left on disk by
-        // a previous run, the reseed path whose value the reader later draws down and
-        // the one most exposed to the buffer-size underflow.
-        #[cfg(feature = "antithesis-disk-asserts")]
-        {
-            #![allow(clippy::disallowed_types)] // once_cell::Lazy
-            antithesis_sdk::assert_sometimes!(
-                total_buffer_size > 0,
-                "the buffer reopens with pre-existing on-disk records",
-                &serde_json::json!({ "total_buffer_size": total_buffer_size })
-            );
-        }
-
-        self.increment_total_buffer_size(total_buffer_size);
-
-        Ok(())
     }
 
     #[must_use]
