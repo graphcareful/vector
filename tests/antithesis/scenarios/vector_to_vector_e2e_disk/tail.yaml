@@ -25,6 +25,17 @@ sinks:
       when_full: block
     acknowledgements:
       enabled: true
+    # Tuned for Antithesis fault testing. Vector's default 60s request timeout means a send stuck
+    # on a connection broken by a network partition is not abandoned -- and so not retried against
+    # the healed network -- for up to 60s. That is far longer than the eventually-phase
+    # conservation drain window (it gives up after ~15s of no delivery progress), so an event still
+    # legitimately in-flight gets reported as lost even though it is safe on disk. A short request
+    # timeout plus a short (but non-zero) retry backoff, keeping the default unbounded retry
+    # attempts, keeps delivery at-least-once (records are never dropped) while recovering from a
+    # fault within a few seconds -- faster than the harness's patience.
+    request:
+      timeout_secs: 5
+      retry_max_duration_secs: 1
 
   prom:
     type: prometheus_exporter
