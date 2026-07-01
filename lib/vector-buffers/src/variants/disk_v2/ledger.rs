@@ -16,7 +16,7 @@ use futures::StreamExt;
 use rkyv::{Archive, Serialize, with::Atomic};
 use snafu::{ResultExt, Snafu};
 use tokio::{fs, io::AsyncWriteExt, sync::Notify};
-use vector_common::finalizer::OrderedFinalizer;
+use vector_common::{finalization::BatchStatus, finalizer::OrderedFinalizer};
 
 use super::{
     Filesystem,
@@ -731,7 +731,32 @@ where
     pub(super) fn spawn_finalizer(self: Arc<Self>) -> OrderedFinalizer<u64> {
         let (finalizer, mut stream) = OrderedFinalizer::new(None);
         vector_common::spawn_in_current_span(async move {
-            while let Some((_status, amount)) = stream.next().await {
+            while let Some((status, amount)) = stream.next().await {
+                // We advance the acknowledgement frontier for every finalized record so the
+                // count-based ack accounting stays aligned with the records the reader has read,
+                // and so the buffer keeps making progress rather than wedging on a single record.
+                //
+                // Retriable failures never reach this point: the sink retries them indefinitely
+                // (its retry policy only gives up on a permanent/non-retriable failure) and only
+                // finalizes a record on success (`Delivered`) or a permanent failure. So a
+                // non-`Delivered` status means the sink permanently gave up on these events. They
+                // are being dropped from a durable buffer that already acknowledged them to its
+                // upstream source, so record that explicitly -- a metric and a log -- rather than
+                // letting it be a silent at-least-once violation. The byte size is not known here,
+                // so it is reported as zero (matching how skipped records are accounted).
+                if status != BatchStatus::Delivered {
+                    warn!(
+                        message = "Dropping events from the disk buffer after a non-retriable \
+                                   downstream delivery failure; the buffer had already acknowledged \
+                                   them to its upstream source.",
+                        event_count = amount,
+                        delivery_status = ?status,
+                        internal_log_rate_limit = true,
+                    );
+                    self.usage_handle
+                        .increment_dropped_event_count_and_byte_size(amount, 0, false);
+                }
+
                 self.increment_pending_acks(amount);
                 self.notify_writer_waiters();
             }

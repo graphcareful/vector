@@ -1,0 +1,3 @@
+The `disk_v2` buffer now records — rather than silently discards — events it drops after a non-retriable downstream delivery failure. When the sink downstream of a disk buffer permanently rejects a record (retriable failures are retried indefinitely and never reach this path), the buffer advances past the record so the pipeline keeps making progress. Previously it did so silently, even though the record had already been acknowledged to the buffer's upstream source; the buffer now bumps its dropped-events metric and emits a warning log for these drops, so the loss is observable instead of invisible. Successful delivery (`Delivered`) is unchanged.
+
+authors: graphcareful
