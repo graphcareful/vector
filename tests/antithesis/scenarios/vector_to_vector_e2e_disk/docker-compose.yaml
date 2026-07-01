@@ -23,6 +23,13 @@ services:
     entrypoint: ["/usr/bin/vector", "--config", "/etc/vector/head.yaml"]
     environment:
       NO_COLOR: "1"
+      # Debug logging so runs capture the sink/buffer delivery path for triage. The two most
+      # useful signals -- the Driver submitting/completing a service request, and the disk buffer's
+      # size/acknowledgement progress -- are emitted at `trace`, so those crates are raised to
+      # trace while the rest stays at debug. Together with the WARN-level retry/timeout logs this
+      # lets a single record be traced end-to-end (submitted -> retried/timed out -> delivered ->
+      # buffer drained).
+      VECTOR_LOG: "debug,vector_stream=trace,vector_buffers=trace"
       # Shrink head's disk-buffer data file from the 128MiB default so files fill
       # and rotate constantly, but floor it to hold the largest payload class:
       # 768KiB raw is ~1.5MiB once hex-encoded, and a record cannot span data
@@ -41,6 +48,13 @@ services:
     entrypoint: ["/usr/bin/vector", "--config", "/etc/vector/tail.yaml"]
     environment:
       NO_COLOR: "1"
+      # Debug logging so runs capture the sink/buffer delivery path for triage. The two most
+      # useful signals -- the Driver submitting/completing a service request, and the disk buffer's
+      # size/acknowledgement progress -- are emitted at `trace`, so those crates are raised to
+      # trace while the rest stays at debug. Together with the WARN-level retry/timeout logs this
+      # lets a single record be traced end-to-end (submitted -> retried/timed out -> delivered ->
+      # buffer drained).
+      VECTOR_LOG: "debug,vector_stream=trace,vector_buffers=trace"
       # Same as head: shrunk for constant rotation, floored at 2MiB to hold the
       # largest payload class (768KiB raw, ~1.5MiB hex-encoded).
       VECTOR_DISK_V2_MAX_DATA_FILE_SIZE: "2097152"
