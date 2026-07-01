@@ -1,6 +1,7 @@
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 use tokio_test::{assert_pending, assert_ready, task::spawn};
 use tracing::Instrument;
+use vector_common::finalization::{EventStatus, Finalizable};
 
 use super::{create_buffer_v2_with_max_data_file_size, read_next, read_next_some};
 use crate::{
@@ -1007,6 +1008,58 @@ async fn buffer_size_recalculated_correctly_after_partial_read_reload() {
                 ledger.get_total_buffer_size(),
                 "reopened buffer size should equal the unread records' on-disk bytes",
             );
+        }
+    })
+    .await;
+}
+
+/// Reproduction: the disk buffer must NOT drop a record whose downstream delivery failed.
+///
+/// `Ledger::spawn_finalizer` currently discards the `EventStatus` and acks unconditionally, so a
+/// record the reader emitted downstream is deleted from the durable buffer whether the sink
+/// reported `Delivered` OR `Errored`/`Rejected`. That means when a sink exhausts its retries
+/// against a failing endpoint, the record it gives up on is silently dropped from the buffer even
+/// though the buffer already acknowledged it to its upstream source -- a permanent, at-least-once
+/// violation (the mechanism behind the Antithesis "acked event permanently lost" failures).
+///
+/// This test reads one record and finalizes it as `Errored` (a transient/retriable failure, as
+/// after exhausted retries), then asserts the buffer still holds it. It FAILS on the current code
+/// (the record is acked and deleted) and should pass once the finalizer only advances on
+/// `Delivered` and retains the record on `Errored`.
+#[ignore = "reproduces a pre-existing disk_v2 data-loss bug: Ledger::spawn_finalizer ignores \
+            EventStatus and acks records whose downstream delivery Errored/Rejected, dropping \
+            already-source-acked data. Un-ignore once the finalizer only advances on Delivered."]
+#[tokio::test]
+async fn buffer_retains_record_when_downstream_delivery_errors() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (mut writer, mut reader, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+
+            let record_bytes = writer
+                .write_record(SizedRecord::new(64))
+                .await
+                .expect("write should not fail") as u64;
+            writer.flush().await.expect("flush should not fail");
+            assert_buffer_size!(ledger, 1, record_bytes);
+
+            // Read the record and finalize it as `Errored`, simulating a sink that exhausted its
+            // retries against a failing/unreachable endpoint and gave up on this record.
+            let mut record = read_next_some(&mut reader).await;
+            record.take_finalizers().update_status(EventStatus::Errored);
+            drop(record);
+
+            // Let the ledger's finalizer task observe the status, then drive one reader cycle so it
+            // processes any pending acknowledgements (it then blocks for more data and times out).
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), reader.next()).await;
+
+            // Delivery FAILED, so the durable buffer must retain the record -- not treat it as
+            // delivered and delete it. On the current code this fails: the record was acked and
+            // dropped despite the `Errored` status.
+            assert_buffer_size!(ledger, 1, record_bytes);
         }
     })
     .await;
