@@ -13,7 +13,8 @@ use crate::{
         common::{DEFAULT_FLUSH_INTERVAL, MAX_FILE_ID},
         tests::{
             create_buffer_v2_with_write_buffer_size, create_default_buffer_v2,
-            get_corrected_max_record_size, get_minimum_data_file_size_for_record_payload,
+            create_default_buffer_v2_with_usage, get_corrected_max_record_size,
+            get_minimum_data_file_size_for_record_payload,
         },
     },
 };
@@ -1013,53 +1014,54 @@ async fn buffer_size_recalculated_correctly_after_partial_read_reload() {
     .await;
 }
 
-/// Reproduction: the disk buffer must NOT drop a record whose downstream delivery failed.
+/// A record whose downstream delivery is rejected is dropped observably, not silently.
 ///
-/// `Ledger::spawn_finalizer` currently discards the `EventStatus` and acks unconditionally, so a
-/// record the reader emitted downstream is deleted from the durable buffer whether the sink
-/// reported `Delivered` OR `Errored`/`Rejected`. That means when a sink exhausts its retries
-/// against a failing endpoint, the record it gives up on is silently dropped from the buffer even
-/// though the buffer already acknowledged it to its upstream source -- a permanent, at-least-once
-/// violation (the mechanism behind the Antithesis "acked event permanently lost" failures).
+/// `Ledger::spawn_finalizer` advances the acknowledgement frontier for every finalized record so
+/// the count-based accounting stays aligned and the buffer keeps making progress. Retriable
+/// failures never finalize here (the sink retries them indefinitely), so a non-`Delivered` status
+/// means the sink permanently gave up on the events. Those events are being dropped from a durable
+/// buffer that already acknowledged them upstream, so the drop must be *recorded* (a dropped-event
+/// metric + a log) rather than a silent at-least-once violation.
 ///
-/// This test reads one record and finalizes it as `Errored` (a transient/retriable failure, as
-/// after exhausted retries), then asserts the buffer still holds it. It FAILS on the current code
-/// (the record is acked and deleted) and should pass once the finalizer only advances on
-/// `Delivered` and retains the record on `Errored`.
-#[ignore = "reproduces a pre-existing disk_v2 data-loss bug: Ledger::spawn_finalizer ignores \
-            EventStatus and acks records whose downstream delivery Errored/Rejected, dropping \
-            already-source-acked data. Un-ignore once the finalizer only advances on Delivered."]
+/// This test reads one record, finalizes it `Rejected`, and asserts the buffer both makes progress
+/// (does not wedge on the record) and reports the drop via its usage metrics.
 #[tokio::test]
-async fn buffer_retains_record_when_downstream_delivery_errors() {
+async fn buffer_records_dropped_event_when_downstream_delivery_rejected() {
     with_temp_dir(|dir| {
         let data_dir = dir.to_path_buf();
 
         async move {
-            let (mut writer, mut reader, ledger) =
-                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+            let (mut writer, mut reader, ledger, usage) =
+                create_default_buffer_v2_with_usage::<_, SizedRecord>(&data_dir).await;
 
-            let record_bytes = writer
+            writer
                 .write_record(SizedRecord::new(64))
                 .await
-                .expect("write should not fail") as u64;
+                .expect("write should not fail");
             writer.flush().await.expect("flush should not fail");
-            assert_buffer_size!(ledger, 1, record_bytes);
 
-            // Read the record and finalize it as `Errored`, simulating a sink that exhausted its
-            // retries against a failing/unreachable endpoint and gave up on this record.
+            // Read the record and finalize it `Rejected`: the sink permanently gave up on it (a
+            // non-retriable failure; retriable failures are retried indefinitely and never finalize
+            // here).
             let mut record = read_next_some(&mut reader).await;
-            record.take_finalizers().update_status(EventStatus::Errored);
+            record.take_finalizers().update_status(EventStatus::Rejected);
             drop(record);
 
             // Let the ledger's finalizer task observe the status, then drive one reader cycle so it
-            // processes any pending acknowledgements (it then blocks for more data and times out).
+            // processes the acknowledgement (it then blocks for more data and times out).
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let _ = tokio::time::timeout(std::time::Duration::from_millis(500), reader.next()).await;
 
-            // Delivery FAILED, so the durable buffer must retain the record -- not treat it as
-            // delivered and delete it. On the current code this fails: the record was acked and
-            // dropped despite the `Errored` status.
-            assert_buffer_size!(ledger, 1, record_bytes);
+            // The buffer must make progress rather than wedge on the rejected record...
+            assert_buffer_is_empty!(ledger);
+
+            // ...and the dropped record must be recorded, not silently discarded.
+            let snapshot = usage.snapshot();
+            assert!(
+                snapshot.dropped_event_count >= 1,
+                "a rejected downstream delivery must be recorded as a dropped buffer event, got {}",
+                snapshot.dropped_event_count,
+            );
         }
     })
     .await;
