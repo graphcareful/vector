@@ -82,6 +82,62 @@ async fn pending_read_returns_none_when_writer_closed_with_unflushed_write() {
 }
 
 #[tokio::test]
+async fn idle_flush_publishes_trailing_record_to_reader() {
+    // Reproduces the disk_v2 residual straggler observed in Antithesis: a record written just
+    // before the buffer goes idle is stranded -- the reader is never handed it until some
+    // *later* write happens to force a flush.
+    //
+    // In the topology, a disk buffer's writer flushes on two triggers: `flush()`, called while
+    // traffic is actively flowing, and the background idle-flush task, which calls
+    // `flush_pending_finalizers` every flush interval. When traffic stops, only the latter runs,
+    // so it alone is responsible for publishing the final record. But it early-returns when
+    // there are no pending finalizers, and a record with no finalizers -- the common case for a
+    // trailing record -- never registers one. The record is therefore left buffered and
+    // uncommitted: the ledger's writer position is not advanced and the reader is never woken,
+    // so a blocked reader waits forever even though the data is sitting in the buffer.
+    //
+    // The idle flush must publish any buffered write to the reader regardless of finalizer
+    // state. With the bug this read blocks and the timeout fires.
+    let _a = install_tracing_helpers();
+
+    let fut = with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (mut writer, mut reader, _ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+
+            // Write a record but deliberately do NOT call `writer.flush()`. This mirrors a record
+            // written just before traffic goes idle, when the only thing left to run is the
+            // background idle-flush task.
+            let bytes_written = writer
+                .write_record(SizedRecord::new(64))
+                .await
+                .expect("write should not fail");
+            assert_enough_bytes_written!(bytes_written, SizedRecord, 64);
+
+            // Drive exactly one tick of the background idle-flush task. This is the sole
+            // mechanism that will publish the trailing record now that no more writes are coming.
+            writer
+                .flush_pending_finalizers()
+                .await
+                .expect("flush_pending_finalizers should not fail");
+
+            // The record must now be readable without any further write. With the bug, the idle
+            // flush was a no-op (the record carried no finalizers), so the record stays
+            // uncommitted and this read blocks until the timeout fires.
+            let record = await_timeout!(reader.next(), 5)
+                .expect("read should not fail")
+                .expect("idle flush must publish the trailing record to the reader");
+            assert_eq!(record, SizedRecord::new(64));
+        }
+    });
+
+    let parent = trace_span!("idle_flush_publishes_trailing_record_to_reader");
+    fut.instrument(parent.or_current()).await;
+}
+
+#[tokio::test]
 async fn last_record_is_valid_during_load_when_buffer_correctly_flushed_and_stopped() {
     let assertion_registry = install_tracing_helpers();
 

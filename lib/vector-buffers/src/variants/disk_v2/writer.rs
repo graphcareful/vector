@@ -1508,16 +1508,22 @@ where
         self.config.flush_interval
     }
 
-    /// Forces an fsync and fires any parked finalizers as `Delivered`, but only when finalizers
-    /// are actually awaiting durability.
+    /// Flushes the idle tail of the buffer: publishes any buffered-but-unflushed writes to the
+    /// reader and fires any parked finalizers as `Delivered`.
     ///
-    /// Flushes are otherwise write-driven, so the last batch written before traffic goes idle
-    /// would park its finalizers indefinitely — the data is durable on disk, but the upstream
-    /// source never receives its acknowledgement. The periodic flush task calls this to drain that
-    /// idle tail within one flush interval. When nothing is pending (or there is no open data file
-    /// to fsync), it is a no-op, so an idle buffer performs no additional I/O.
+    /// Flushes are otherwise write-driven — the write path only flushes (and wakes the reader)
+    /// when a write overflows the internal buffer. So the last record written before traffic goes
+    /// idle would sit buffered indefinitely: its data is never published to the reader and, if it
+    /// carried finalizers, the upstream source never receives its acknowledgement. The periodic
+    /// flush task calls this to drain that idle tail within one flush interval.
+    ///
+    /// The trigger is unflushed *data*, not pending finalizers: a record with no finalizers still
+    /// has to be published to the reader, otherwise it strands until some later write happens to
+    /// force a flush. When there is nothing buffered and nothing pending (or there is no open data
+    /// file to fsync), it is a no-op, so a truly idle buffer performs no additional I/O.
     pub(crate) async fn flush_pending_finalizers(&mut self) -> io::Result<()> {
-        if self.pending_finalizers.is_empty() || self.writer.is_none() {
+        let nothing_to_flush = self.unflushed_events == 0 && self.pending_finalizers.is_empty();
+        if nothing_to_flush || self.writer.is_none() {
             return Ok(());
         }
 
