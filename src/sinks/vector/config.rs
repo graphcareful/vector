@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use http::Uri;
 use hyper::client::HttpConnector;
 use hyper_openssl::HttpsConnector;
@@ -223,7 +225,19 @@ fn new_client(
 ) -> crate::Result<hyper::Client<ProxyConnector<HttpsConnector<HttpConnector>>, BoxBody>> {
     let proxy = build_proxy_connector(tls_settings.clone(), proxy_config)?;
 
-    Ok(hyper::Client::builder().http2_only(true).build(proxy))
+    Ok(hyper::Client::builder()
+        .http2_only(true)
+        // Health-check pooled HTTP/2 connections with keepalive PING frames so a
+        // connection to a peer that has gone away -- crashed and restarted, or cut off
+        // by a network partition -- is detected and evicted from the pool rather than
+        // reused indefinitely. `while_idle` is required because a connection sits idle
+        // between retry attempts; without it PINGs are only sent while a request is in
+        // flight. Without this, a request retried onto a dead pooled connection times
+        // out repeatedly and delivery never recovers even after the peer comes back.
+        .http2_keep_alive_interval(Duration::from_secs(5))
+        .http2_keep_alive_timeout(Duration::from_secs(5))
+        .http2_keep_alive_while_idle(true)
+        .build(proxy))
 }
 
 #[derive(Debug, Clone)]

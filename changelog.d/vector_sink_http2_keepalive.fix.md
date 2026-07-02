@@ -1,0 +1,3 @@
+The `vector` sink now health-checks its pooled HTTP/2 (gRPC) connections with keepalive PING frames, so a connection to a downstream Vector instance that has gone away — crashed and restarted, or cut off by a network partition — is detected and evicted from the connection pool instead of being reused indefinitely. Previously, once the downstream peer disappeared, a request retried onto the dead pooled connection would time out repeatedly and delivery could stall permanently even after the peer came back; the events remained safe on disk but were never delivered. Idle-connection keepalive is enabled so connections are probed between retry attempts, not just while a request is in flight.
+
+authors: graphcareful
