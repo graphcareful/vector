@@ -1044,13 +1044,16 @@ async fn buffer_records_dropped_event_when_downstream_delivery_rejected() {
             // non-retriable failure; retriable failures are retried indefinitely and never finalize
             // here).
             let mut record = read_next_some(&mut reader).await;
-            record.take_finalizers().update_status(EventStatus::Rejected);
+            record
+                .take_finalizers()
+                .update_status(EventStatus::Rejected);
             drop(record);
 
             // Let the ledger's finalizer task observe the status, then drive one reader cycle so it
             // processes the acknowledgement (it then blocks for more data and times out).
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), reader.next()).await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(500), reader.next()).await;
 
             // The buffer must make progress rather than wedge on the rejected record...
             assert_buffer_is_empty!(ledger);
