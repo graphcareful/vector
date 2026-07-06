@@ -420,17 +420,33 @@ where
     ///
     /// This will only occur when a record is read, which may allow enough space (below the maximum
     /// configured buffer size) for a write to occur, or similarly, when a data file is deleted.
+    ///
+    /// The wait is bounded (see [`wait_for_writer`][Self::wait_for_writer] for the rationale): the
+    /// caller re-checks the actual ledger/buffer state on return, so a dropped notify can only
+    /// delay progress by up to a flush interval rather than wedge the writer indefinitely.
     #[cfg_attr(test, instrument(skip(self), level = "trace"))]
     pub async fn wait_for_reader(&self) {
-        self.reader_notify.notified().await;
+        let _ =
+            tokio::time::timeout(self.config.flush_interval, self.reader_notify.notified()).await;
     }
 
     /// Waits for a signal from the writer that progress has been made.
     ///
     /// This will occur when a record is written, or when a new data file is created.
+    ///
+    /// `notify_writer_waiters` is an edge-triggered [`Notify`]. Under adversarial task interleaving
+    /// that edge can be dropped (a lost wakeup), which would otherwise leave a committed record
+    /// sitting in the buffer with the reader parked here forever -- observed as a durable,
+    /// acknowledged event that is never delivered even with no faults. We therefore bound the wait
+    /// with a re-check: the reader always wakes within one flush interval and re-reads the buffer
+    /// state regardless of a missed notify, so a dropped wakeup can only delay a record by up to
+    /// the interval, never lose it. Because this future is polled inside the sink Driver's poll
+    /// chain, the timer's waker is the Driver's own task waker, so the re-check also re-drives a
+    /// Driver that had parked waiting on this reader.
     #[cfg_attr(test, instrument(skip(self), level = "trace"))]
     pub async fn wait_for_writer(&self) {
-        self.writer_notify.notified().await;
+        let _ =
+            tokio::time::timeout(self.config.flush_interval, self.writer_notify.notified()).await;
     }
 
     /// Notifies all tasks waiting on progress by the reader.
