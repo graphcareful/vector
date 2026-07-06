@@ -582,6 +582,18 @@ where
             .filesystem()
             .delete_file(&data_file_path)
             .await?;
+
+        // Unlinking doesn't durably remove the directory entry until the directory is fsynced (the
+        // mirror of creating a data file). Do it before flushing the ledger so the ledger can never
+        // outlive the physical delete: otherwise a crash could leave the file "deleted" in the
+        // ledger but resurrected on disk, inflating the recomputed buffer size on restart and
+        // leaking the file. A crash between this fsync and the ledger flush is safe -- the file is
+        // durably gone and the reader reconciles on reopen via `NotFound`.
+        self.ledger
+            .filesystem()
+            .sync_directory(self.ledger.data_dir())
+            .await?;
+
         self.ledger.increment_acked_reader_file_id();
         self.ledger.flush()?;
 
