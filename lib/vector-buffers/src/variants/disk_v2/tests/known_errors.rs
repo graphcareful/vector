@@ -626,6 +626,120 @@ async fn writer_detects_when_last_record_wasnt_flushed() {
 }
 
 #[tokio::test]
+async fn reader_recovers_when_reader_head_is_ahead_of_durable_data() {
+    // The reader can read records out of the OS page cache as soon as the writer flushes its
+    // internal buffer -- which happens BEFORE the periodic fsync (`sync_all`). If it acknowledges
+    // those reads, advancing and persisting `reader_last_record` in the ledger, and Vector then
+    // crashes before the fsync lands, the page-cache tail is lost from disk. On reopen the ledger's
+    // reader head points PAST the last durable record.
+    //
+    // The reader must reconcile to durable reality and keep making progress. If it instead waits
+    // for a record id that no longer exists -- and that the writer, having skipped ahead on its own
+    // reopen reconciliation, will never reproduce -- it hangs forever even though the buffer holds
+    // durable, deliverable data. This test manufactures that ledger/disk desync and asserts the
+    // reader still delivers a freshly written record within a bounded time.
+    let _a = install_tracing_helpers();
+
+    let fut = with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (mut writer, _, ledger) = create_default_buffer_v2(data_dir.clone()).await;
+
+            // Three durable records on disk: ids 0, 1, 2.
+            for _ in 0..3 {
+                writer
+                    .write_record(SizedRecord::new(64))
+                    .await
+                    .expect("write should not fail");
+            }
+            writer.flush().await.expect("flush should not fail");
+
+            // Simulate a crash that lost an un-fsynced tail the reader had already acknowledged: the
+            // ledger records reader_last=4 / writer_next=5, but only ids 0..=2 are durable on disk.
+            unsafe {
+                ledger.state().unsafe_set_reader_last_record_id(4);
+                ledger.state().unsafe_set_writer_next_record_id(5);
+            }
+            drop(writer);
+            drop(ledger);
+
+            // Reopen and have the writer produce a fresh record. Its own reopen reconciliation sees
+            // the on-disk data end short of the ledger and skips ahead, so this record lands at an
+            // id beyond the lost ones.
+            let (mut writer, mut reader, _ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+            writer
+                .write_record(SizedRecord::new(64))
+                .await
+                .expect("post-reopen write should not fail");
+            writer.flush().await.expect("flush should not fail");
+
+            // The reader must make progress rather than hang waiting for a lost id.
+            let record = await_timeout!(reader.next(), 5)
+                .expect("read should not fail")
+                .expect("reader must resume after a crash left its head ahead of durable data");
+            let _ = record;
+        }
+    });
+
+    let parent = trace_span!("reader_recovers_when_reader_head_is_ahead_of_durable_data");
+    fut.instrument(parent.or_current()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parked_reader_consumes_record_published_to_idle_buffer() {
+    // Zero-fault stuck-record reproduction. A reader parks on an empty buffer (nothing to read
+    // yet). A single record is then written and published exactly as the topology's background
+    // flush task does it -- via `flush_pending_finalizers`. With no further writes to re-trigger a
+    // wakeup, the parked reader MUST wake and yield the record.
+    //
+    // If the publish notifies the reader before the record is made visible (the notify in
+    // `flush_inner` runs before `flush_write_state`), or the wakeup is otherwise lost, the reader
+    // sleeps forever on a durable record -- which is what a zero-fault Antithesis run showed: a
+    // lone acked event sitting in the disk buffer that the sink never consumes. Runs on a
+    // multi-threaded runtime so the reader task and the publish genuinely race, as they do in
+    // production (unlike a single-task test that awaits the flush to completion first).
+    let _a = install_tracing_helpers();
+
+    let fut = with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (mut writer, mut reader, _ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+
+            // Park the reader on the empty buffer, on its own task, and let it reach
+            // `wait_for_writer`.
+            let read_task = tokio::spawn(async move { reader.next().await });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            // Write a single record and publish it as the idle-flush task would.
+            writer
+                .write_record(SizedRecord::new(64))
+                .await
+                .expect("write should not fail");
+            writer
+                .flush_pending_finalizers()
+                .await
+                .expect("flush should not fail");
+
+            // The parked reader must wake and deliver the record within a bounded time; a timeout
+            // here means it slept through the publish.
+            let read = timeout(Duration::from_secs(5), read_task)
+                .await
+                .expect("parked reader must wake when a record is published to an idle buffer")
+                .expect("read task panicked")
+                .expect("read should not fail");
+            assert!(read.is_some(), "reader must yield the published record");
+        }
+    });
+
+    let parent = trace_span!("parked_reader_consumes_record_published_to_idle_buffer");
+    fut.instrument(parent.or_current()).await;
+}
+
+#[tokio::test]
 async fn writer_detects_when_last_record_was_flushed_but_id_wasnt_incremented() {
     let assertion_registry = install_tracing_helpers();
     let fut = with_temp_dir(|dir| {
