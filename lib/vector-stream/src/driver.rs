@@ -455,4 +455,44 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(input_total, counter.load(Ordering::SeqCst));
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driver_delivers_lone_request_arriving_after_going_idle() {
+        // `driver_simple` feeds an always-ready `stream::iter`, so the Driver never actually parks
+        // on an empty input -- it can't exercise the case that matters for a low-traffic sink: the
+        // Driver goes idle, then a *single* request arrives. This drives exactly that.
+        //
+        // A lone request arriving after the Driver has parked must still be delivered. If the
+        // Driver drops the input stream's wakeup (e.g. in its `select!`), the request is stranded
+        // and the counter never advances -- which is the zero-fault "a durable event is never
+        // delivered" symptom seen with disk buffers, reproduced here at the Driver layer with a
+        // plain channel (so it depends only on the Driver, not on any buffer).
+        let counter = Counter::default();
+        let service = DelayService::new(10, Duration::from_millis(5), Duration::from_millis(150));
+
+        let (tx, rx) = futures::channel::mpsc::unbounded::<DelayRequest>();
+        let driver = Driver::new(rx, service);
+        let driver_task = tokio::spawn(driver.run());
+
+        // Let the Driver reach steady-state idle, parked on the empty input.
+        sleep(Duration::from_millis(500)).await;
+
+        // A single request arrives while the Driver is idle.
+        tx.unbounded_send(DelayRequest::new(1, &counter))
+            .expect("send should not fail");
+
+        // It must be delivered (its finalizer fires -> counter advances) within a bounded time.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while counter.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "a lone request arriving after the Driver went idle must be delivered"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), driver_task).await;
+    }
 }
