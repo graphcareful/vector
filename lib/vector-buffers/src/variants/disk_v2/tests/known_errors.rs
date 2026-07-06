@@ -626,6 +626,61 @@ async fn writer_detects_when_last_record_wasnt_flushed() {
 }
 
 #[tokio::test]
+async fn reader_recovers_when_reader_head_is_ahead_of_durable_data() {
+    // Manufactures a crash that lost an un-fsynced tail the reader had already acknowledged, so the
+    // ledger's reader head points PAST the last durable record on disk. On reopen the reader must
+    // reconcile to durable reality and keep making progress rather than hang waiting for a record
+    // id that no longer exists. Asserts the reader still delivers a freshly written record.
+    let _a = install_tracing_helpers();
+
+    let fut = with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (mut writer, _, ledger) = create_default_buffer_v2(data_dir.clone()).await;
+
+            // Three durable records on disk: ids 0, 1, 2.
+            for _ in 0..3 {
+                writer
+                    .write_record(SizedRecord::new(64))
+                    .await
+                    .expect("write should not fail");
+            }
+            writer.flush().await.expect("flush should not fail");
+
+            // Simulate a crash that lost an un-fsynced tail the reader had already acknowledged: the
+            // ledger records reader_last=4 / writer_next=5, but only ids 0..=2 are durable on disk.
+            unsafe {
+                ledger.state().unsafe_set_reader_last_record_id(4);
+                ledger.state().unsafe_set_writer_next_record_id(5);
+            }
+            drop(writer);
+            drop(ledger);
+
+            // Reopen and have the writer produce a fresh record. Its own reopen reconciliation sees
+            // the on-disk data end short of the ledger and skips ahead, so this record lands at an
+            // id beyond the lost ones.
+            let (mut writer, mut reader, _ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+            writer
+                .write_record(SizedRecord::new(64))
+                .await
+                .expect("post-reopen write should not fail");
+            writer.flush().await.expect("flush should not fail");
+
+            // The reader must make progress rather than hang waiting for a lost id.
+            let record = await_timeout!(reader.next(), 5)
+                .expect("read should not fail")
+                .expect("reader must resume after a crash left its head ahead of durable data");
+            let _ = record;
+        }
+    });
+
+    let parent = trace_span!("reader_recovers_when_reader_head_is_ahead_of_durable_data");
+    fut.instrument(parent.or_current()).await;
+}
+
+#[tokio::test]
 async fn writer_detects_when_last_record_was_flushed_but_id_wasnt_incremented() {
     let assertion_registry = install_tracing_helpers();
     let fut = with_temp_dir(|dir| {

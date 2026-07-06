@@ -1173,6 +1173,18 @@ where
                 // file ID now to signal that the writer has moved on.
                 if should_open_next {
                     self.ledger.state().increment_writer_file_id();
+
+                    // Persist the file-ID advance before any record is written into the new file.
+                    // `increment_writer_file_id` only touches the in-memory (mmap) ledger, so
+                    // without this flush a crash could leave the new file on disk while the durable
+                    // ledger still points at the previous writer file -- a desync that wedges the
+                    // buffer on restart (writer and reader each end up waiting on the other).
+                    // Ordering the flush before the first write preserves the invariant that no
+                    // non-empty data file ever exists ahead of the durable writer file ID: the only
+                    // state a crash can leave ahead of the ledger is an empty file, which the roll
+                    // logic already reclaims.
+                    self.ledger.flush()?;
+
                     self.ledger.notify_writer_waiters();
 
                     // The writer just rolled to a fresh data file, the boundary the
