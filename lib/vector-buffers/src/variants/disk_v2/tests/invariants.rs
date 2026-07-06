@@ -82,6 +82,38 @@ async fn pending_read_returns_none_when_writer_closed_with_unflushed_write() {
 }
 
 #[tokio::test]
+async fn wait_for_writer_is_bounded_when_no_notify_arrives() {
+    // The reader parks in `wait_for_writer` on an edge-triggered `Notify`. If the writer's notify
+    // is ever dropped (a lost wakeup under adversarial task interleaving), a committed record would
+    // be stranded with the reader asleep forever. The wait is therefore bounded: it must return on
+    // its own within ~one flush interval so the reader re-checks the buffer regardless of a missed
+    // notify. This asserts the wait returns even though `notify_writer_waiters` is never called;
+    // without the bound it blocks forever and the outer timeout trips.
+    let _a = install_tracing_helpers();
+
+    let fut = with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (_writer, _reader, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+
+            // No notify is ever fired. `wait_for_writer` must still return on its own within a few
+            // flush intervals.
+            let result =
+                tokio::time::timeout(DEFAULT_FLUSH_INTERVAL * 4, ledger.wait_for_writer()).await;
+            assert!(
+                result.is_ok(),
+                "wait_for_writer must self-bound and return without a notify (dropped-wakeup safety net)"
+            );
+        }
+    });
+
+    let parent = trace_span!("wait_for_writer_is_bounded_when_no_notify_arrives");
+    fut.instrument(parent.or_current()).await;
+}
+
+#[tokio::test]
 async fn idle_flush_publishes_trailing_record_to_reader() {
     // Reproduces the disk_v2 residual straggler observed in Antithesis: a record written just
     // before the buffer goes idle is stranded -- the reader is never handed it until some
