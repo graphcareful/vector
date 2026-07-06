@@ -1173,6 +1173,33 @@ where
                 // file ID now to signal that the writer has moved on.
                 if should_open_next {
                     self.ledger.state().increment_writer_file_id();
+
+                    // Durably persist the file-ID advance *before* any record is written into the
+                    // new file.
+                    //
+                    // `increment_writer_file_id` only mutates the in-memory (mmap) ledger; the new
+                    // file ID is not durable until the ledger is flushed. The new data file itself
+                    // was already created and fsync'd (along with its directory entry) just above,
+                    // so without this flush a crash here would leave the file present on disk while
+                    // the persisted ledger still points at the *previous* writer file. On restart
+                    // that desync is a wedge: the writer, resuming on the old file, would eventually
+                    // try to roll into this file, find it already exists and is non-empty, and block
+                    // forever waiting for the reader to delete it (see the `AlreadyExists` +
+                    // `!should_open_next` arm below), while the reader — seeing reader/writer file
+                    // IDs equal per the stale ledger — waits on the writer instead of rolling
+                    // forward. Neither side makes progress.
+                    //
+                    // Flushing here is sufficient because it is ordered *before* the first write
+                    // into the new file. That maintains the invariant that **no non-empty data file
+                    // ever exists ahead of the durable ledger's writer file ID**: the only state a
+                    // crash can leave ahead of the persisted ledger is a freshly-created *empty*
+                    // file, which the roll logic already reclaims via the `file_len == 0` arm below.
+                    // A crash in the window between the in-memory increment and this flush likewise
+                    // only exposes that empty-file case (no records have been written yet), so it is
+                    // benign. The extra flush costs one msync per data-file roll (i.e. once per
+                    // `max_data_file_size` of throughput), which is negligible.
+                    self.ledger.flush()?;
+
                     self.ledger.notify_writer_waiters();
 
                     // The writer just rolled to a fresh data file, the boundary the
