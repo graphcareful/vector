@@ -98,6 +98,40 @@ async fn all_healthy(client: &reqwest::Client, metrics_urls: &[String]) -> bool 
     true
 }
 
+/// Total number of events still sitting in the nodes' disk buffers, summed across every node.
+///
+/// This is the "in-flight" signal that distinguishes a delivery that is merely slow to recover
+/// from one that is genuinely lost. An acked id that has not reached the oracle is either still
+/// buffered somewhere (durable on disk, pending delivery — it will arrive) or gone from every
+/// buffer without being delivered (a real conservation violation). Returns `None` if any node's
+/// metrics could not be scraped or parsed, so callers can decide how to treat the unknown.
+async fn total_buffered_events(client: &reqwest::Client, metrics_urls: &[String]) -> Option<u64> {
+    let mut total = 0u64;
+    for url in metrics_urls {
+        let body = client
+            .get(url)
+            .timeout(time::Duration::from_secs(3))
+            .send()
+            .await
+            .ok()?
+            .text()
+            .await
+            .ok()?;
+        for line in body.lines() {
+            // Prometheus text format: `vector_buffer_events{..,buffer_type="disk",..} <value> [ts]`.
+            if line.starts_with("vector_buffer_events{") && line.contains(r#"buffer_type="disk""#) {
+                let value = line
+                    .rsplit('}')
+                    .next()
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|v| v.parse::<f64>().ok())?;
+                total += value.max(0.0) as u64;
+            }
+        }
+    }
+    Some(total)
+}
+
 async fn claim(client: &reqwest::Client, oracle_url: &str) -> Option<u64> {
     let resp = client
         .post(format!("{oracle_url}/claim"))
@@ -141,10 +175,16 @@ async fn main() {
         time::sleep(time::Duration::from_secs(3)).await;
     }
 
-    // Drain: wait until every acked id has come back, or until delivery stops
-    // advancing for several polls. With no load and no faults a healthy buffer
-    // flushes its backlog quickly; one that is still short here is wedged or lossy.
-    let drain_deadline = time::Instant::now() + time::Duration::from_secs(120);
+    // Drain: wait until every acked id has come back, or until we can prove the shortfall is
+    // real rather than merely slow. Multi-hop recovery after a partition heals is not instant --
+    // a stalled connection is abandoned and reconnected, ack chains re-run across both hops -- so
+    // "delivery hasn't advanced for a few polls" does NOT imply loss: the data can still be
+    // durably buffered mid-recovery and arrive later. We only conclude loss once delivery has
+    // stalled AND the nodes' disk buffers are empty: an acked id still in a buffer is in-flight,
+    // not lost, no matter how long progress has stalled. A generous hard deadline bounds the wait
+    // for the pathological case where a buffer never drains (a genuine wedge), which then fails
+    // the conservation assert below as it should.
+    let drain_deadline = time::Instant::now() + time::Duration::from_secs(180);
     let mut last_delivered = u64::MAX;
     let mut plateau = 0u32;
     while time::Instant::now() < drain_deadline {
@@ -157,7 +197,11 @@ async fn main() {
         }
         if r.delivered == last_delivered {
             plateau += 1;
-            if plateau >= 5 {
+            // Give up only when delivery has stalled for several polls AND nothing remains
+            // buffered anywhere -- otherwise the missing ids are still in-flight, so keep waiting.
+            // Treat an unreadable buffer metric (None) as "cannot confirm drained", i.e. keep
+            // waiting, so a transient scrape failure never masquerades as a drained buffer.
+            if plateau >= 5 && total_buffered_events(&client, &metrics_urls).await == Some(0) {
                 break;
             }
         } else {
