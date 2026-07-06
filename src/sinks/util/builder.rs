@@ -277,3 +277,166 @@ where
             .map(|maybe| maybe.map(|result| result.unwrap()))
     }
 }
+
+#[cfg(test)]
+mod disk_buffer_driver_repro_tests {
+    //! Full-pipeline reproducer for the zero-fault "a durable record is never delivered" symptom.
+    //!
+    //! Every isolated layer -- the raw disk reader, the `BufferReceiverStream` adapter,
+    //! `ready_chunks` over it, and the `Driver` fed by a channel -- has been shown to wake and
+    //! deliver a lone record arriving after going idle. This assembles the real sink shape a disk
+    //! buffer feeds: `receiver.into_stream() -> batched() -> map(request) -> into_driver(service)`,
+    //! backed by an actual `disk_v2` buffer, and drives exactly the failing scenario: let the sink
+    //! go idle, then write ONE record and require the service to receive it. If the wakeup is lost
+    //! in the integration, the service never sees it and the test times out.
+    use std::{
+        num::NonZeroU64,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+        time::{Duration, Instant},
+    };
+
+    use futures::{StreamExt, future::BoxFuture};
+    use tower::Service;
+    use tracing::Span;
+    use vector_lib::buffers::{BufferConfig, BufferType, WhenFull};
+    use vector_lib::{
+        internal_event::CountByteSize,
+        json_size::JsonSize,
+        request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata},
+        stream::DriverResponse,
+    };
+
+    use crate::{
+        event::{
+            Event, EventArray, EventContainer, EventFinalizers, EventStatus, Finalizable, LogEvent,
+        },
+        sinks::util::{BatchConfig, RealtimeEventBasedDefaultBatchSettings, SinkBuilderExt},
+    };
+
+    // Minimal request: a batch of event arrays plus request metadata, so it satisfies the
+    // `Driver`'s `Finalizable + MetaDescriptive` bounds (raw `Vec<EventArray>` isn't
+    // `MetaDescriptive`). Sink buffers carry `EventArray`, so that is the buffered item type.
+    struct BatchRequest {
+        arrays: Vec<EventArray>,
+        metadata: RequestMetadata,
+    }
+
+    impl Finalizable for BatchRequest {
+        fn take_finalizers(&mut self) -> EventFinalizers {
+            self.arrays.take_finalizers()
+        }
+    }
+
+    impl MetaDescriptive for BatchRequest {
+        fn get_metadata(&self) -> &RequestMetadata {
+            &self.metadata
+        }
+        fn metadata_mut(&mut self) -> &mut RequestMetadata {
+            &mut self.metadata
+        }
+    }
+
+    struct CountResponse {
+        sent: GroupedCountByteSize,
+    }
+
+    impl DriverResponse for CountResponse {
+        fn event_status(&self) -> EventStatus {
+            EventStatus::Delivered
+        }
+        fn events_sent(&self) -> &GroupedCountByteSize {
+            &self.sent
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingSink {
+        received: Arc<AtomicUsize>,
+    }
+
+    impl Service<BatchRequest> for CountingSink {
+        type Response = CountResponse;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<'static, Result<CountResponse, std::convert::Infallible>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: BatchRequest) -> Self::Future {
+            let n: usize = req.arrays.iter().map(EventContainer::len).sum();
+            self.received.fetch_add(n, Ordering::Relaxed);
+            Box::pin(async move {
+                Ok(CountResponse {
+                    sent: CountByteSize(n, JsonSize::new(n)).into(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disk_buffer_sink_delivers_lone_record_arriving_after_idle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Build a real disk_v2 buffer of `EventArray` via the public config path (which wires up
+        // the correct Event encoding). `max_size` must clear the disk buffer's minimum.
+        let config = BufferConfig::Single(BufferType::DiskV2 {
+            max_size: NonZeroU64::new(268_435_488).unwrap(),
+            when_full: WhenFull::Block,
+        });
+        let (mut sender, receiver) = config
+            .build::<EventArray>(
+                Some(dir.path().to_path_buf()),
+                "repro".to_string(),
+                Span::current(),
+            )
+            .await
+            .expect("build buffer");
+
+        let received = Arc::new(AtomicUsize::new(0));
+        let service = CountingSink {
+            received: Arc::clone(&received),
+        };
+
+        let batch_settings = BatchConfig::<RealtimeEventBasedDefaultBatchSettings>::default()
+            .into_batcher_settings()
+            .expect("batch settings");
+
+        let driver = receiver
+            .into_stream()
+            .batched(batch_settings.as_byte_size_config())
+            .map(|arrays: Vec<EventArray>| BatchRequest {
+                arrays,
+                metadata: RequestMetadata::default(),
+            })
+            .into_driver(service);
+        let driver_task = tokio::spawn(driver.run());
+
+        // Let the sink reach steady-state idle, parked on the empty buffer.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // A single record arrives while the sink is idle.
+        sender
+            .send(EventArray::from(Event::Log(LogEvent::from("lone"))), None)
+            .await
+            .expect("send should not fail");
+
+        // It must be delivered to the service within a bounded time.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while received.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            received.load(Ordering::Relaxed),
+            1,
+            "a lone record arriving after the disk-buffered sink went idle must be delivered"
+        );
+
+        drop(sender);
+        let _ = tokio::time::timeout(Duration::from_secs(2), driver_task).await;
+    }
+}

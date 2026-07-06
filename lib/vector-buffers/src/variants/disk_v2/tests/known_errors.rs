@@ -1,4 +1,5 @@
 use bytes::{Buf, BufMut};
+use futures::StreamExt;
 use memmap2::MmapMut;
 use std::{
     io::{self, SeekFrom},
@@ -23,6 +24,7 @@ use crate::{
     assert_file_exists_async, assert_reader_writer_v2_file_positions, await_timeout,
     encoding::{AsMetadata, Encodable},
     test::{SizedRecord, UndecodableRecord, acknowledge, install_tracing_helpers, with_temp_dir},
+    topology::channel::{BufferReceiver, ReceiverAdapter},
     variants::disk_v2::{ReaderError, backed_archive::BackedArchive, record::Record},
 };
 
@@ -684,6 +686,103 @@ async fn reader_recovers_when_reader_head_is_ahead_of_durable_data() {
     });
 
     let parent = trace_span!("reader_recovers_when_reader_head_is_ahead_of_durable_data");
+    fut.instrument(parent.or_current()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ready_chunks_over_buffer_stream_wakes_on_lone_idle_record() {
+    // The sink Driver polls its input as `input.ready_chunks(1024)`. This climbs one rung above
+    // `buffer_receiver_stream_wakes_on_lone_idle_record`: park a `ready_chunks` over the buffer
+    // stream, publish a lone record, and require it to wake and yield. `ready_chunks` polls the
+    // inner stream repeatedly and coalesces ready items, so it is a candidate for dropping the
+    // inner stream's wakeup when the inner stream is Pending with nothing buffered yet.
+    let _a = install_tracing_helpers();
+
+    let fut = with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (mut writer, reader, _ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+
+            let stream = BufferReceiver::new(ReceiverAdapter::from(reader)).into_stream();
+            let mut chunked = stream.ready_chunks(1024);
+
+            let read_task = tokio::spawn(async move { chunked.next().await });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            writer
+                .write_record(SizedRecord::new(64))
+                .await
+                .expect("write should not fail");
+            writer
+                .flush_pending_finalizers()
+                .await
+                .expect("flush should not fail");
+
+            let chunk = timeout(Duration::from_secs(5), read_task)
+                .await
+                .expect("ready_chunks over the buffer stream must wake on a lone idle record")
+                .expect("read task panicked");
+            assert!(
+                chunk.is_some_and(|c| !c.is_empty()),
+                "ready_chunks must yield the published record"
+            );
+        }
+    });
+
+    let parent = trace_span!("ready_chunks_over_buffer_stream_wakes_on_lone_idle_record");
+    fut.instrument(parent.or_current()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn buffer_receiver_stream_wakes_on_lone_idle_record() {
+    // The sink Driver does not poll the raw reader -- it polls the disk buffer through the
+    // `BufferReceiverStream` adapter (`into_stream()`), which drives `reader.next()` inside a
+    // `ReusableBoxFuture` across polls. The raw-reader wakeup is already proven to work
+    // (`parked_reader_consumes_record_published_to_idle_buffer`), so this exercises the layer the
+    // Driver actually sees: park the *stream* on an empty buffer, publish a lone record via the
+    // idle-flush path, and require the stream to wake and yield it.
+    //
+    // If the adapter drops the writer's wakeup, the stream sleeps forever on a durable record --
+    // the zero-fault stranded-record symptom -- and this times out.
+    let _a = install_tracing_helpers();
+
+    let fut = with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (mut writer, reader, _ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+
+            // Wrap the reader exactly as the topology does before handing it to a sink.
+            let mut stream = BufferReceiver::new(ReceiverAdapter::from(reader)).into_stream();
+
+            // Park the stream on the empty buffer, on its own task.
+            let read_task = tokio::spawn(async move { stream.next().await });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            // Publish a lone record as the background idle-flush task would.
+            writer
+                .write_record(SizedRecord::new(64))
+                .await
+                .expect("write should not fail");
+            writer
+                .flush_pending_finalizers()
+                .await
+                .expect("flush should not fail");
+
+            let item = timeout(Duration::from_secs(5), read_task)
+                .await
+                .expect(
+                    "BufferReceiverStream must wake and yield a record published to an idle buffer",
+                )
+                .expect("read task panicked");
+            assert!(item.is_some(), "stream must yield the published record");
+        }
+    });
+
+    let parent = trace_span!("buffer_receiver_stream_wakes_on_lone_idle_record");
     fut.instrument(parent.or_current()).await;
 }
 
