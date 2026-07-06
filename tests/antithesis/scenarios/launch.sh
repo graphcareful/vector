@@ -82,8 +82,8 @@ SOURCE="${SOURCE:-$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null
 # Fault profile: all fault types are currently disabled so runs exercise the
 # conservation property under normal operating conditions, without crash/recover
 # noise. Node termination, hang, and throttle are cleared (empty include lists
-# mean no containers are targeted). The SUT nodes are also excluded from network
-# faults via exclude_from_network_faults so partitions do not interfere. cpu_mod
+# mean no containers are targeted). All containers (SUT nodes and oracle) are excluded from network faults
+# via exclude_from_network_faults so partitions do not interfere. cpu_mod
 # and clock_jitter are disabled. The oracle is never included in the node-fault
 # lists regardless — its obligation ledger is in-memory, so killing or freezing
 # it would erase the source of truth.
@@ -91,7 +91,7 @@ FAULTS=(
   --param custom.include_for_node_termination=""
   --param custom.include_for_node_hang=""
   --param custom.include_for_node_throttle=""
-  --param custom.exclude_from_network_faults="$FAULT_NODES"
+  --param custom.exclude_from_network_faults="$FAULT_NODES oracle"
   --param custom.cpu_mod=false
   --param custom.clock_jitter=false
 )
