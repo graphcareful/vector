@@ -875,8 +875,15 @@ where
         //
         // Once the reader/writer file IDs are identical, we fall back to the slow path.
         while self.ledger.get_current_reader_file_id() != self.ledger.get_current_writer_file_id() {
-            let data_file_path = self.ledger.get_current_reader_data_file_path();
+            // Open (or advance to) the current reader data file BEFORE resolving its path.
+            // `ensure_ready_for_read` recovers from a data file that a prior crash left deleted while
+            // the ledger's reader position still referenced it: it skips the missing file and
+            // advances the reader file id. If we captured the path first, we would then mmap the
+            // now-deleted file and fail with an ENOENT that aborts the whole buffer build (Vector
+            // exits with a config error). Resolving the path afterwards means we always mmap the
+            // file the reader is actually positioned on, so the skip actually recovers.
             self.ensure_ready_for_read().await.context(IoSnafu)?;
+            let data_file_path = self.ledger.get_current_reader_data_file_path();
             let data_file_mmap = self
                 .ledger
                 .filesystem()
