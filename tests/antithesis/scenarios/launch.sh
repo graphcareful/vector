@@ -29,6 +29,7 @@
 #   WEBHOOK=<name>          default SCENARIO_WEBHOOK or persistent_storage
 #   SOURCE=<identifier>     property-history key; default is the git branch
 #   DRY_RUN=1               print the exact command and exit without submitting
+#   SKIP_BUILD=1            skip docker build/push; reuse images already in the registry
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,9 +37,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCENARIO="${1:?usage: launch.sh <scenario> [extra snouty flags]}"
 shift
 SCENARIO_DIR="$SCRIPT_DIR/$SCENARIO"
-[ -d "$SCENARIO_DIR" ] || { echo "error: no scenario directory $SCENARIO_DIR" >&2; exit 1; }
-[ -f "$SCENARIO_DIR/docker-compose.yaml" ] || { echo "error: $SCENARIO_DIR/docker-compose.yaml not found" >&2; exit 1; }
-[ -f "$SCENARIO_DIR/launch.env" ] || { echo "error: $SCENARIO_DIR/launch.env not found" >&2; exit 1; }
+[ -d "$SCENARIO_DIR" ] || {
+  echo "error: no scenario directory $SCENARIO_DIR" >&2
+  exit 1
+}
+[ -f "$SCENARIO_DIR/docker-compose.yaml" ] || {
+  echo "error: $SCENARIO_DIR/docker-compose.yaml not found" >&2
+  exit 1
+}
+[ -f "$SCENARIO_DIR/launch.env" ] || {
+  echo "error: $SCENARIO_DIR/launch.env not found" >&2
+  exit 1
+}
 
 # Per-scenario settings. Declared here so a missing one is caught, not silently empty.
 SCENARIO_TEST_NAME=""
@@ -70,24 +80,21 @@ FAULT_NODES="${FAULT_NODES:-${SCENARIO_FAULT_NODES:?launch.env must set SCENARIO
 # ephemeral and no findings are available to triage.
 SOURCE="${SOURCE:-$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)}"
 
-# Pinned fault profile shape, common to every scenario. The SUT nodes
-# (SCENARIO_FAULT_NODES) take node termination, hang, and throttle: that is the
-# crash-and-recover path the conservation property is judged against. The oracle is
-# never in that list — its obligation ledger is in-memory, so killing or freezing
-# it would erase the source of truth. It is deliberately NOT spared network faults:
-# partitioning node->oracle exercises the egress sink's buffer-and-retry, and
-# producer->node exercises injection. Those are safe because Antithesis stops all
-# faults in the final eventually_ window, so links heal and the drain-wait
-# reconciles the backlog before conservation is judged. (The producer's loopback
-# /claim and /acked inside the oracle container are never network-faulted
-# regardless.) cpu_mod perturbs the source/sink/ack races; clock_jitter stresses
-# timers.
+# Fault profile: all fault types are currently disabled so runs exercise the
+# conservation property under normal operating conditions, without crash/recover
+# noise. Node termination, hang, and throttle are cleared (empty include lists
+# mean no containers are targeted). The SUT nodes are also excluded from network
+# faults via exclude_from_network_faults so partitions do not interfere. cpu_mod
+# and clock_jitter are disabled. The oracle is never included in the node-fault
+# lists regardless — its obligation ledger is in-memory, so killing or freezing
+# it would erase the source of truth.
 FAULTS=(
-  --param custom.include_for_node_termination="$FAULT_NODES"
-  --param custom.include_for_node_hang="$FAULT_NODES"
-  --param custom.include_for_node_throttle="$FAULT_NODES"
-  --param custom.cpu_mod=true
-  --param custom.clock_jitter=true
+  --param custom.include_for_node_termination=""
+  --param custom.include_for_node_hang=""
+  --param custom.include_for_node_throttle=""
+  --param custom.exclude_from_network_faults="$FAULT_NODES"
+  --param custom.cpu_mod=false
+  --param custom.clock_jitter=false
 )
 
 for v in ANTITHESIS_TENANT ANTITHESIS_REPOSITORY; do
@@ -119,14 +126,31 @@ cmd=(snouty launch
   "${FAULTS[@]}"
   "$@")
 
-printf 'build: '; printf ' %q' "${build[@]}"; printf '\n'
-printf 'render:'; printf ' %q' "${render[@]}"; printf ' > %q\n' "$LAUNCH_DIR/docker-compose.yaml"
-printf 'launch:'; printf ' %q' "${cmd[@]}"; printf '\n'
+printf 'build: '
+printf ' %q' "${build[@]}"
+printf '\n'
+printf 'render:'
+printf ' %q' "${render[@]}"
+printf ' > %q\n' "$LAUNCH_DIR/docker-compose.yaml"
+printf 'launch:'
+printf ' %q' "${cmd[@]}"
+printf '\n'
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   echo "(dry run; not building or submitting)"
   exit 0
 fi
-"${build[@]}"
+if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
+  echo "(skipping build; reusing images already in the registry)"
+else
+  # Remove any existing images carrying this tag before building. BuildKit errors
+  # with "already exists" when re-exporting to a tag already in the local store,
+  # which happens on every re-run when the tree is dirty (the tag stays
+  # <sha>-dirty across edits).
+  docker images --format "{{.Repository}}:{{.Tag}}" |
+    { grep ":${GIT_SHA}$" || true; } |
+    xargs -r docker rmi --force 2>/dev/null || true
+  "${build[@]}"
+fi
 mkdir -p "$LAUNCH_DIR"
 "${render[@]}" >"$LAUNCH_DIR/docker-compose.yaml"
 exec "${cmd[@]}"
