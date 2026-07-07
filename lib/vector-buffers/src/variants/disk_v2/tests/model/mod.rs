@@ -25,10 +25,7 @@ use crate::{
 };
 
 mod action;
-use self::{
-    action::{Action, arb_actions},
-    record::EncodeError,
-};
+use self::action::{Action, arb_actions};
 
 mod common;
 use self::common::{Progress, arb_buffer_config};
@@ -694,9 +691,13 @@ impl WriterModel {
                 .expect("record used in model must provide this");
             let encoded_len_limit = self.ledger.config().max_record_size - RECORD_HEADER_LEN;
             if encoded_len > encoded_len_limit {
-                return Progress::WriteError(WriterError::FailedToEncode {
-                    source: EncodeError,
-                });
+                // The record exceeds the maximum record size, so it can never be written. Rather
+                // than erroring (which used to tear down the whole buffer), the writer drops it and
+                // reports success with zero bytes written, leaving the buffer untouched. A real
+                // write always writes at least a record header, so zero bytes unambiguously means
+                // "dropped".
+                self.state.transition_to_idle();
+                return Progress::RecordWritten(0);
             }
 
             // Write the record in the same way that the buffer would, which is the only way we can
