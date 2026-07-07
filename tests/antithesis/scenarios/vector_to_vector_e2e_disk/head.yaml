@@ -19,6 +19,17 @@ sinks:
     inputs: [in]
     address: "tail:6000"
     compression: none
+    # Cap the batch so a single pushed EventArray can never exceed tail's per-record limit. The
+    # scenario shrinks disk_v2's data-file size (VECTOR_DISK_V2_MAX_DATA_FILE_SIZE, forcing constant
+    # file rotation), which also pins max_record_size to that same value (2MiB). The vector sink's
+    # default batch is 1000 events with no byte cap, so a backlog flush of large payloads (the
+    # harness emits up to 768KiB) can produce an array whose encoded record exceeds 2MiB. Tail then
+    # hits an unrecoverable "failed to encode record: BufferTooSmall" on write and the whole process
+    # exits. Bounding the batch to 1MiB keeps every record storable while preserving tiny-file
+    # rotation. A lone event larger than this still ships (a batch always takes at least one item),
+    # but the largest single payload (768KiB) stays under the 2MiB record limit.
+    batch:
+      max_bytes: 1048576 # 1MiB
     buffer:
       type: disk
       max_size: 8388608 # 8MiB (4 data files), small enough that a stalled reader fills it and blocks
