@@ -29,6 +29,7 @@
 #   WEBHOOK=<name>          default SCENARIO_WEBHOOK or persistent_storage
 #   SOURCE=<identifier>     property-history key; default is the git branch
 #   DRY_RUN=1               print the exact command and exit without submitting
+#   SKIP_BUILD=1            skip docker build/push; reuse images already in the registry
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -135,14 +136,18 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   echo "(dry run; not building or submitting)"
   exit 0
 fi
-# Remove any existing images carrying this tag before building. BuildKit errors
-# with "already exists" when re-exporting to a tag already in the local store,
-# which happens on every re-run when the tree is dirty (the tag stays
-# <sha>-dirty across edits).
-docker images --format "{{.Repository}}:{{.Tag}}" |
-  { grep ":${GIT_SHA}$" || true; } |
-  xargs -r docker rmi --force 2>/dev/null || true
-"${build[@]}"
+if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
+  echo "(skipping build; reusing images already in the registry)"
+else
+  # Remove any existing images carrying this tag before building. BuildKit errors
+  # with "already exists" when re-exporting to a tag already in the local store,
+  # which happens on every re-run when the tree is dirty (the tag stays
+  # <sha>-dirty across edits).
+  docker images --format "{{.Repository}}:{{.Tag}}" |
+    { grep ":${GIT_SHA}$" || true; } |
+    xargs -r docker rmi --force 2>/dev/null || true
+  "${build[@]}"
+fi
 mkdir -p "$LAUNCH_DIR"
 "${render[@]}" >"$LAUNCH_DIR/docker-compose.yaml"
 exec "${cmd[@]}"
