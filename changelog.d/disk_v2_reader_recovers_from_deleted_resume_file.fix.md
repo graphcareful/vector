@@ -1,0 +1,3 @@
+Fixed a `disk_v2` buffer bug where Vector could fail to start (exiting with a configuration error) after a crash. On reopen, the buffer's reader seeks to the position it left off at. If a prior crash left the ledger's reader position pointing at a data file that had already been physically deleted, the seek's fast path resolved and memory-mapped that stale, now-missing path before advancing past it, producing a "No such file or directory" error that aborted the entire buffer build. The buffer now resolves the data file path only after advancing to the file the reader is actually positioned on, so it skips the deleted file and recovers instead of failing to load.
+
+authors: graphcareful

@@ -18,7 +18,10 @@ use vector_common::{
     finalization::{AddBatchNotifier, BatchNotifier, EventFinalizers, Finalizable},
 };
 
-use super::{create_buffer_v2_with_max_data_file_size, create_default_buffer_v2};
+use super::{
+    create_buffer_v2_with_max_data_file_size, create_default_buffer_v2,
+    get_minimum_data_file_size_for_record_payload,
+};
 use crate::{
     EventCount, assert_buffer_size, assert_enough_bytes_written, assert_file_does_not_exist_async,
     assert_file_exists_async, assert_reader_writer_v2_file_positions, await_timeout,
@@ -686,6 +689,83 @@ async fn reader_recovers_when_reader_head_is_ahead_of_durable_data() {
     });
 
     let parent = trace_span!("reader_recovers_when_reader_head_is_ahead_of_durable_data");
+    fut.instrument(parent.or_current()).await;
+}
+
+#[tokio::test]
+async fn reader_recovers_when_its_resume_file_was_already_deleted() {
+    // A crash can leave the ledger's reader position pointing at a data file that has already been
+    // physically deleted: the unlink is made durable before the ledger flush that advances the
+    // acked reader file id, so a crash in that window loses the advance but keeps the deletion.
+    //
+    // On reopen, `seek_to_next_record`'s fast path must skip the missing file and resume on the
+    // next one -- `ensure_ready_for_read` already knows how to do this. The bug was that the fast
+    // path captured the data file path BEFORE calling `ensure_ready_for_read`, so once that skipped
+    // past the deleted file, the subsequent mmap re-opened the STALE (deleted) path and failed with
+    // an ENOENT. That error aborted the entire buffer build, so the topology reported a config error
+    // and Vector exited (code 78) without ever recovering. This reproduces that on-disk state and
+    // asserts the buffer reopens and keeps delivering the records that survived.
+    let _a = install_tracing_helpers();
+
+    let fut = with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            // Tiny data files so each record lands in its own file and the writer keeps rolling
+            // forward, leaving the (unused) reader well behind on file id 0.
+            let max_data_file_size =
+                get_minimum_data_file_size_for_record_payload(&SizedRecord::new(64));
+            let (mut writer, _, ledger) =
+                create_buffer_v2_with_max_data_file_size::<_, SizedRecord>(
+                    data_dir.clone(),
+                    max_data_file_size,
+                )
+                .await;
+
+            for _ in 0..4 {
+                writer
+                    .write_record(SizedRecord::new(64))
+                    .await
+                    .expect("write should not fail");
+                writer.flush().await.expect("flush should not fail");
+            }
+
+            // The reader was never used, so it still resumes on file id 0 -- behind the writer, and
+            // not equal to the writer's current or next file id, which is the case that drives
+            // `ensure_ready_for_read` down its skip-the-missing-file branch on reopen.
+            let reader_resume_file = ledger.get_current_reader_data_file_path();
+            assert_ne!(
+                ledger.get_current_reader_file_id(),
+                ledger.get_current_writer_file_id(),
+                "reader must be behind the writer for this scenario",
+            );
+
+            drop(writer);
+            drop(ledger);
+
+            // Simulate the crash-left state: the reader's resume file is physically gone, but the
+            // ledger still points the reader at it.
+            std::fs::remove_file(&reader_resume_file)
+                .expect("reader resume data file should exist to be deleted");
+
+            // Reopen. The buffer builder `.expect()`s success, so if the seek aborts on the deleted
+            // file (the bug) this panics. It must instead skip the file and build cleanly.
+            let (_writer, mut reader, _ledger) = create_buffer_v2_with_max_data_file_size::<
+                _,
+                SizedRecord,
+            >(data_dir, max_data_file_size)
+            .await;
+
+            // And the reader must keep making progress, delivering a record that survived on a
+            // later data file rather than hanging or erroring.
+            let record = await_timeout!(reader.next(), 5)
+                .expect("read should not fail")
+                .expect("reader must resume after its persisted resume file was deleted");
+            let _ = record;
+        }
+    });
+
+    let parent = trace_span!("reader_recovers_when_its_resume_file_was_already_deleted");
     fut.instrument(parent.or_current()).await;
 }
 
