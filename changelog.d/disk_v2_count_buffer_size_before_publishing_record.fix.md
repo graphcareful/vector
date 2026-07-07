@@ -1,0 +1,3 @@
+Fixed a `disk_v2` buffer accounting race that could underflow the unread-bytes counter (`total_buffer_size`) under concurrent load. When flushing, the buffer made a record readable and woke the reader before incrementing the counter, so the reader could read, deliver, and acknowledge the record — decrementing the counter — before the increment landed. The unsigned counter then wrapped to a near-maximum value, making the buffer appear permanently full and wedging the writer. The buffer now increments the counter before publishing a record to the reader, so a record's size is always accounted before it can be consumed.
+
+authors: graphcareful
