@@ -1428,8 +1428,15 @@ where
     /// variant will be returned describing the error.
     #[instrument(skip(self), level = "trace")]
     pub async fn flush(&mut self) -> io::Result<()> {
-        self.flush_inner(false).await?;
+        // Account for the newly-buffered bytes BEFORE `flush_inner` makes them readable and wakes
+        // the reader. `flush_inner` flushes the writer to the page cache, notifies the reader, and
+        // then `await`s an fsync/ledger flush -- yield points during which the woken reader can read
+        // the record, deliver it, and have its acknowledgement decrement `total_buffer_size`. If the
+        // increment ran after `flush_inner` (as it used to), that decrement could land while the
+        // bytes were still uncounted, underflowing the counter to a near-maximum value and wedging
+        // the writer. Incrementing first keeps a record's size counted before it can ever be read.
         self.flush_write_state();
+        self.flush_inner(false).await?;
         Ok(())
     }
 }
