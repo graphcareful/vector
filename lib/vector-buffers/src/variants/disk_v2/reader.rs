@@ -685,6 +685,25 @@ where
 
             // If any events were skipped, do our logging/metrics for that.
             if events_skipped > 0 {
+                // A gap means the acknowledgement frontier advanced over record IDs the reader
+                // never produced a marker for -- i.e. records it never delivered are being dropped.
+                // This is the point at which a durable-but-unreachable record (e.g. a large record
+                // the recovered reader resumed past) is permanently lost. Emit the surrounding state
+                // at WARN so it survives log sampling and pins which IDs were dropped and whether
+                // this happened during recovery (`!ready_to_read`) or steady-state.
+                let frontier = self.ledger.state().get_last_reader_record_id();
+                warn!(
+                    events_skipped,
+                    events_acknowledged,
+                    records_acknowledged,
+                    last_reader_record_id = frontier,
+                    approx_skipped_id_range_start = frontier.saturating_sub(events_skipped),
+                    reader_file_id = self.ledger.get_current_reader_file_id(),
+                    writer_file_id = self.ledger.get_current_writer_file_id(),
+                    total_buffer_size = self.ledger.get_total_buffer_size(),
+                    during_recovery = !self.ready_to_read,
+                    "Reader skipped unread records as a gap during acknowledgement; they are dropped."
+                );
                 self.ledger.track_dropped_events(events_skipped);
             }
         }
@@ -1033,7 +1052,11 @@ where
             total_data_file_size,
             consumed_prefix = self.bytes_read,
             unread_buffer_size,
-            "Recalculated buffer size from on-disk data files."
+            last_reader_record_id = self.ledger.state().get_last_reader_record_id(),
+            resume_reader_file_id = self.ledger.get_current_reader_file_id(),
+            writer_file_id = self.ledger.get_current_writer_file_id(),
+            last_replayed_record_id = self.last_reader_record_id,
+            "Recalculated buffer size from on-disk data files after seek."
         );
 
         self.ready_to_read = true;
@@ -1133,6 +1156,17 @@ where
                         // The reader hit a corrupted, torn, or partially-written
                         // record and is abandoning the rest of this file, the
                         // recovery path that drives the skip-accounting hazards.
+                        // Log at WARN (survives sampling) with the error kind and position so we can
+                        // tell whether a durable record was lost via this path vs the ack-gap path.
+                        warn!(
+                            error = %e,
+                            error_code = e.as_error_code(),
+                            last_reader_record_id = self.last_reader_record_id,
+                            reader_file_id = self.ledger.get_current_reader_file_id(),
+                            writer_file_id = self.ledger.get_current_writer_file_id(),
+                            during_recovery = !self.ready_to_read,
+                            "Reader hit a bad read; skipping the rest of the data file."
+                        );
                         #[cfg(feature = "antithesis-disk-asserts")]
                         {
                             #![allow(clippy::disallowed_types)] // once_cell::Lazy
@@ -1141,6 +1175,8 @@ where
                                 "the reader skips a torn or corrupted record and rolls the file",
                                 &serde_json::json!({
                                     "last_reader_record_id": self.last_reader_record_id,
+                                    "error_code": e.as_error_code(),
+                                    "reader_file_id": self.ledger.get_current_reader_file_id(),
                                 })
                             );
                         }
