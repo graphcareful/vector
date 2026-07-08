@@ -602,8 +602,14 @@ where
         // any write into the buffer can be acknowledged.
 
         // Record the deepest ancestor that already exists, so we only fsync the chain we create.
+        // Walk up only on `NotFound`; any other stat error (permissions, transient I/O) is treated
+        // as "exists" so we don't misclassify an existing buffer as freshly created and re-fsync
+        // its pre-existing ancestors.
         let mut deepest_existing = config.data_dir.as_path();
-        while fs::metadata(deepest_existing).await.is_err() {
+        while matches!(
+            fs::metadata(deepest_existing).await,
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound
+        ) {
             match deepest_existing.parent() {
                 Some(parent) => deepest_existing = parent,
                 None => break,
@@ -618,11 +624,15 @@ where
         if !buffer_dir_already_existed {
             let mut ancestor = config.data_dir.parent();
             while let Some(dir) = ancestor {
-                config
-                    .filesystem
-                    .sync_directory(dir)
-                    .await
-                    .context(IoSnafu)?;
+                // `parent()` yields an empty path for the final component of a relative `data_dir`;
+                // there is no directory to open and sync there, so skip it.
+                if !dir.as_os_str().is_empty() {
+                    config
+                        .filesystem
+                        .sync_directory(dir)
+                        .await
+                        .context(IoSnafu)?;
+                }
                 if dir == deepest_existing {
                     break;
                 }

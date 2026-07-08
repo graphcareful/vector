@@ -184,7 +184,35 @@ impl Filesystem for ProductionFilesystem {
         #[cfg(unix)]
         {
             let directory = tokio::fs::File::open(path).await?;
-            directory.sync_all().await
+            match directory.sync_all().await {
+                Ok(()) => Ok(()),
+                // Some filesystems (certain FUSE, overlay, or network mounts) do not support fsync
+                // against a directory descriptor and return `Unsupported`/`InvalidInput`. That
+                // leaves a newly created data file's directory entry non-durable across a crash,
+                // but it is not a reason to fail an otherwise-working buffer, so warn once and
+                // continue rather than propagating the error to the write/init path.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+                    ) =>
+                {
+                    use std::sync::Once;
+
+                    static WARN_ONCE: Once = Once::new();
+                    WARN_ONCE.call_once(|| {
+                        tracing::warn!(
+                            error = %e,
+                            "This filesystem does not support synchronizing a directory; the disk \
+                             buffer cannot make new data-file directory entries durable, so a crash \
+                             may lose a newly created data file and any records already acknowledged \
+                             from it."
+                        );
+                    });
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         }
         // On non-Unix platforms there is no portable way to durably persist a directory's entries
         // (e.g. on Windows a directory cannot simply be opened and flushed like a regular file), so

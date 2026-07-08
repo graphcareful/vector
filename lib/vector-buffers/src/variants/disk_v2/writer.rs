@@ -1107,9 +1107,12 @@ where
                 .filesystem()
                 .open_file_writable_atomic(&data_file_path)
                 .await;
+            // The third tuple element records whether we just atomically created this file (and
+            // therefore a new directory entry), so we only fsync the directory when there is a new
+            // entry to persist -- not when we reopen an existing (possibly empty) file.
             let file = match maybe_data_file {
                 // We were able to create the file, so we're good to proceed.
-                Ok(data_file) => Some((data_file, 0)),
+                Ok(data_file) => Some((data_file, 0, true)),
                 // We got back an error trying to open the file: might be that it already exists,
                 // might be something else.
                 Err(e) => match e.kind() {
@@ -1135,7 +1138,7 @@ where
                             // or it's not empty but we're not skipping to the next file, which can
                             // only mean that we're still initializing, and so this would be the
                             // data file we left off writing to.
-                            Some((data_file, file_len))
+                            Some((data_file, file_len, false))
                         } else {
                             // The file isn't empty, and we're not in initialization anymore, which
                             // means this data file is one that the reader still hasn't finished
@@ -1149,7 +1152,7 @@ where
                 },
             };
 
-            if let Some((data_file, data_file_size)) = file {
+            if let Some((data_file, data_file_size, just_created)) = file {
                 // We successfully opened the file and it can be written to.
                 debug!(
                     data_file_path = data_file_path.to_string_lossy().as_ref(),
@@ -1162,8 +1165,9 @@ where
 
                 // Syncing the file's contents above does not make its directory entry durable.
                 // Sync the data directory so a newly created file is present on disk before
-                // acknowledging anything written into it.
-                if data_file_size == 0 {
+                // acknowledging anything written into it. Only needed when we actually created a
+                // new entry -- reopening an existing (even empty) file needs no directory sync.
+                if just_created {
                     self.ledger
                         .filesystem()
                         .sync_directory(self.ledger.data_dir())
