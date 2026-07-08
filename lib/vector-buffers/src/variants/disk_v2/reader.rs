@@ -863,6 +863,37 @@ where
         }
     }
 
+    /// Reads the id of the first record in the reader's current data file without consuming from
+    /// the streaming reader.
+    ///
+    /// Returns `None` if the file is missing, too short to hold a record, or its first record fails
+    /// validation; callers treat that as "unknown" and fall back to replaying.
+    async fn peek_current_first_record_id(&self) -> Option<u64> {
+        let data_file_path = self.ledger.get_current_reader_data_file_path();
+        let mmap = self
+            .ledger
+            .filesystem()
+            .open_mmap_readable(&data_file_path)
+            .await
+            .ok()?;
+
+        let buf = mmap.as_ref();
+        if buf.len() < 8 {
+            return None;
+        }
+
+        // On-disk layout: an 8-byte big-endian length delimiter followed by the archived record.
+        let archive_len = usize::try_from(u64::from_be_bytes(buf[0..8].try_into().ok()?)).ok()?;
+        let end = 8usize
+            .checked_add(archive_len)
+            .filter(|end| *end <= buf.len())?;
+
+        match validate_record_archive(&buf[8..end], &Hasher::new()) {
+            RecordStatus::Valid { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+
     /// Seeks to where this reader previously left off.
     ///
     /// In cases where Vector has restarted, but the reader hasn't yet finished a file, we would
@@ -877,6 +908,7 @@ where
     /// If an error occurs during seeking to the next record, an error variant will be returned
     /// describing the error.
     #[cfg_attr(test, instrument(skip(self), level = "debug"))]
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn seek_to_next_record(&mut self) -> Result<(), ReaderError<T>> {
         // We don't try seeking again once we're all caught up.
         if self.ready_to_read {
@@ -989,7 +1021,31 @@ where
         // also rely on it to reset the data file before trying to read, and we _also_ rely on it to
         // update `self.last_reader_record_id`, so basically... just keep reading records until
         // we're past the last record we had acknowledged.
+        //
+        // Record IDs are contiguous within a data file, so once we reach the frontier record this
+        // loop stops without overshooting *within* a file. The hazard is at a data-file *boundary*:
+        // when the frontier sits at the end of a prior file that has since been deleted (the common
+        // case for a large record, which gets its own data file), the file the reader now starts on
+        // begins with the first UNREAD record (id == frontier + 1). Replaying it would consume that
+        // record -- counting its bytes as the already-read prefix and advancing the reader past it
+        // -- so it would never be delivered (a durable-but-unreachable loss). Before reading the
+        // first record of any data file, peek its first record id; if the file already begins past
+        // the frontier there is nothing to replay there, so stop and let `next` deliver from the
+        // start of the file. Re-check only when the reader crosses into a new data file.
+        let mut peeked_file_id: Option<u16> = None;
         while self.last_reader_record_id < ledger_last {
+            let reader_file_id = self.ledger.get_current_reader_file_id();
+            if peeked_file_id != Some(reader_file_id) {
+                peeked_file_id = Some(reader_file_id);
+                if self
+                    .peek_current_first_record_id()
+                    .await
+                    .is_some_and(|first_record_id| first_record_id > ledger_last)
+                {
+                    break;
+                }
+            }
+
             match self.next().await {
                 Ok(maybe_record) => {
                     if maybe_record.is_none() {

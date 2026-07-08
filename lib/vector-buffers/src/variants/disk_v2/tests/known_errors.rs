@@ -1345,18 +1345,126 @@ async fn reader_reclaims_orphaned_data_file_behind_position_on_reopen() {
             let (_writer, _reader, ledger) = create_buffer_v2_with_max_data_file_size::<
                 _,
                 SizedRecord,
-            >(data_dir, max_data_file_size)
+            >(data_dir.clone(), max_data_file_size)
             .await;
 
             assert_file_does_not_exist_async!(&orphan_path);
+
+            // The orphan is reclaimed, so it must not be counted in the recomputed buffer size. The
+            // record that was read but never acknowledged before reopen is legitimately unread and
+            // must be counted (at-least-once), so the size equals the total on-disk data-file bytes
+            // once the 256-byte orphan is gone -- not zero, which would mean that surviving record
+            // was over-read and stranded by the recovery replay.
+            let surviving_bytes: u64 = std::fs::read_dir(&data_dir)
+                .expect("data dir should be readable")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("dat"))
+                })
+                .map(|entry| entry.metadata().expect("metadata should be readable").len())
+                .sum();
             assert_eq!(
                 ledger.get_total_buffer_size(),
-                0,
-                "the reclaimed orphan must not inflate the recomputed buffer size"
+                surviving_bytes,
+                "the reclaimed orphan must not inflate the recomputed buffer size, and the \
+                 surviving unacknowledged record must still be counted as unread"
             );
         }
     });
 
     let parent = trace_span!("reader_reclaims_orphaned_data_file_behind_position_on_reopen");
+    fut.instrument(parent.or_current()).await;
+}
+
+#[tokio::test]
+async fn reader_delivers_record_alone_in_resume_file_after_reopen() {
+    // Regression for the crash-recovery loss where a record durably on disk is skipped forever.
+    //
+    // When a data file is deleted and the durable reader frontier sits exactly at that file's
+    // boundary, the next surviving data file begins with the first UNREAD record. The recovery
+    // seek's replay must not consume that record: with one record per data file the frontier is
+    // always at a file boundary, so nothing in the surviving files has been read and the recomputed
+    // buffer size must equal the total on-disk data-file bytes. The bug replays (consumes) the first
+    // record of the resume file, undercounting the buffer size and stranding that record -- which is
+    // exactly how the large records (each in their own data file) were lost across a crash.
+    let _a = install_tracing_helpers();
+
+    let fut = with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            // One record per data file, so every write rolls to a fresh file and the frontier always
+            // lands on a file boundary.
+            let max_data_file_size =
+                get_minimum_data_file_size_for_record_payload(&SizedRecord::new(64));
+            let (mut writer, mut reader, ledger) =
+                create_buffer_v2_with_max_data_file_size::<_, SizedRecord>(
+                    data_dir.clone(),
+                    max_data_file_size,
+                )
+                .await;
+
+            for _ in 0..4 {
+                writer
+                    .write_record(SizedRecord::new(64))
+                    .await
+                    .expect("write should not fail");
+                writer.flush().await.expect("flush should not fail");
+            }
+
+            // Read + acknowledge the first three records so their files are deleted and the durable
+            // frontier advances to a boundary before the surviving, still-unread record(s).
+            for _ in 0..3 {
+                let mut record = await_timeout!(reader.next(), 5)
+                    .expect("read should not fail")
+                    .expect("a record should be available");
+                acknowledge(record.take_finalizers()).await;
+            }
+            let _ = await_timeout!(reader.next(), 5);
+
+            drop(writer);
+            drop(reader);
+            while std::sync::Arc::strong_count(&ledger) > 1 {
+                tokio::task::yield_now().await;
+            }
+            drop(ledger);
+
+            // Reopen: the recovered reader must count every surviving record as unread. Sum the
+            // on-disk data files directly so the assertion is independent of internal accounting.
+            let (_writer, _reader, ledger) = create_buffer_v2_with_max_data_file_size::<
+                _,
+                SizedRecord,
+            >(data_dir.clone(), max_data_file_size)
+            .await;
+
+            let on_disk_bytes: u64 = std::fs::read_dir(&data_dir)
+                .expect("data dir should be readable")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("dat"))
+                })
+                .map(|entry| entry.metadata().expect("metadata should be readable").len())
+                .sum();
+
+            assert!(
+                on_disk_bytes > 0,
+                "a surviving unread record must still be on disk after reopen"
+            );
+            assert_eq!(
+                ledger.get_total_buffer_size(),
+                on_disk_bytes,
+                "the reopened buffer must count every surviving record as unread; a smaller value \
+                 means the recovery replay over-read (and stranded) the resume file's first record"
+            );
+        }
+    });
+
+    let parent = trace_span!("reader_delivers_record_alone_in_resume_file_after_reopen");
     fut.instrument(parent.or_current()).await;
 }
