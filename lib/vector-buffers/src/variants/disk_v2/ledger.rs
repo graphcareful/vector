@@ -589,10 +589,46 @@ where
         config: DiskBufferConfig<FS>,
         usage_handle: BufferUsageHandle,
     ) -> Result<Ledger<FS>, LedgerLoadCreateError> {
-        // Create our containing directory if it doesn't already exist.
+        // Create our containing directory (and any missing ancestors) if it doesn't already exist.
+        //
+        // `create_dir_all` creates the directories but does not make their *entries* durable in
+        // their parents: fsyncing a directory persists the files and subdirectories it contains,
+        // not the directory's own entry in its parent. The buffer's data directory is a freshly
+        // created chain (`<base>/buffer/v2/<id>`), so without fsyncing those ancestors a power loss
+        // after first startup could drop the `<id>`, `v2`, or `buffer` directory -- taking an
+        // already-acknowledged data file inside it down with it -- even though each data file's own
+        // directory is fsynced when the file is created. To close that gap, fsync every directory we
+        // create, from the buffer directory's parent up to the first pre-existing ancestor, before
+        // any write into the buffer can be acknowledged.
+
+        // Record the deepest ancestor that already exists, so we only fsync the chain we create.
+        let mut deepest_existing = config.data_dir.as_path();
+        while fs::metadata(deepest_existing).await.is_err() {
+            match deepest_existing.parent() {
+                Some(parent) => deepest_existing = parent,
+                None => break,
+            }
+        }
+        let buffer_dir_already_existed = deepest_existing == config.data_dir.as_path();
+
         fs::create_dir_all(&config.data_dir)
             .await
             .context(IoSnafu)?;
+
+        if !buffer_dir_already_existed {
+            let mut ancestor = config.data_dir.parent();
+            while let Some(dir) = ancestor {
+                config
+                    .filesystem
+                    .sync_directory(dir)
+                    .await
+                    .context(IoSnafu)?;
+                if dir == deepest_existing {
+                    break;
+                }
+                ancestor = dir.parent();
+            }
+        }
 
         // Acquire an exclusive lock on our lock file, which prevents another Vector process from
         // loading this buffer and clashing with us.  Specifically, though: this does _not_ prevent

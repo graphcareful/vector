@@ -1,0 +1,3 @@
+Fixed a durability gap in `disk_v2` buffer creation. On first startup the buffer creates its data directory chain (`<base>/buffer/v2/<id>`) with `create_dir_all`, but that does not make the new directory entries durable in their parents (fsyncing a directory persists its contents, not its own entry). A power loss shortly after startup could therefore drop the freshly created buffer directories -- and an already-acknowledged data file inside them -- even though each data file's own directory is fsynced when the file is created. The buffer now fsyncs every directory it creates, from the buffer directory's parent up to the first pre-existing ancestor, before any write can be acknowledged.
+
+authors: graphcareful
