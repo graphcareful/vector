@@ -360,6 +360,74 @@ where
         Ok(total_data_file_size)
     }
 
+    /// Reclaims orphaned data files left behind the durable reader position.
+    ///
+    /// `Reader::delete_completed_data_file` advances and flushes the reader position *before* it
+    /// unlinks a fully-acknowledged data file. A crash in the window between that flush and the
+    /// unlink leaves the file on disk even though the durable position has already moved past it —
+    /// an orphan. On restart it would otherwise be summed into the recomputed buffer size and
+    /// inflate it, so it must be reclaimed before `total_data_file_size` is used to recompute.
+    ///
+    /// A data file is an orphan when its id is **outside** the live `reader..=writer` range
+    /// (wrap-aware) **and** it is non-empty. The writer's freshly-created next data file is empty,
+    /// so it is never mistaken for an orphan, and a live file is by definition in range — which
+    /// keeps this deletion-safe even under the small test `MAX_FILE_ID`.
+    ///
+    /// NOTE: this reclaims orphans discovered at reopen. Reclaiming an orphan that the writer
+    /// collides with mid-run on file-id *wraparound* is a separate, writer-side concern (tracked
+    /// separately); with the production `MAX_FILE_ID` a run never writes enough files to wrap.
+    pub(super) async fn reclaim_orphaned_data_files(
+        &self,
+        reader_file_id: u16,
+        writer_file_id: u16,
+    ) -> io::Result<()> {
+        let is_live = |id: u16| {
+            if reader_file_id <= writer_file_id {
+                reader_file_id <= id && id <= writer_file_id
+            } else {
+                // The live range wraps past `MAX_FILE_ID`.
+                id >= reader_file_id || id <= writer_file_id
+            }
+        };
+
+        let mut dat_reader = fs::read_dir(&self.config.data_dir).await?;
+        while let Some(dir_entry) = dat_reader.next_entry().await? {
+            let Some(file_id) = dir_entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix("buffer-data-"))
+                .and_then(|rest| rest.strip_suffix(".dat"))
+                .and_then(|id| id.parse::<u16>().ok())
+            else {
+                continue;
+            };
+
+            if is_live(file_id) {
+                continue;
+            }
+
+            // A non-live file. Only reclaim it if it is non-empty: the writer's freshly-created
+            // next data file is empty and must not be removed here.
+            let size = dir_entry.metadata().await?.len();
+            if size == 0 {
+                continue;
+            }
+
+            let path = self.get_data_file_path(file_id);
+            debug!(
+                data_file_path = path.to_string_lossy().as_ref(),
+                file_id,
+                reader_file_id,
+                writer_file_id,
+                size,
+                "Reclaiming orphaned data file behind the durable reader position on restart."
+            );
+            self.filesystem().delete_file(&path).await?;
+        }
+
+        Ok(())
+    }
+
     /// Gets the current reader file ID.
     ///
     /// This is internally adjusted to compensate for the fact that the reader can read far past

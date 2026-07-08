@@ -577,27 +577,29 @@ where
 
         drop(data_file);
 
-        // Delete the current data file, and increment our actual reader file ID.
+        // Advance the durable reader position and flush it BEFORE unlinking the file, so the ledger
+        // can never record a position that is *behind* a file we then delete. Crash windows:
+        //   - before the flush: position not advanced, file present -> the reader re-reads it
+        //     (at-least-once; a duplicate delivery at worst)
+        //   - after the flush, before the unlink: position advanced durably, and the file is a
+        //     harmless orphan *behind* the position -- reclaimed on restart (prefix-truncate in
+        //     `seek_to_next_record`) or when the writer's file id wraps back onto it
+        //   - after the unlink: position advanced, file gone -- consistent
+        // Because no crash window leaves the durable position behind a live-but-deleted file, the
+        // reader's "required data file is missing" case is unambiguous on reopen: it can only mean
+        // the writer has not created that file yet, so waiting is always correct.
+        self.ledger.increment_acked_reader_file_id();
+        self.ledger.flush()?;
+
+        // Now remove the file. This is lazy cleanup: its durability no longer affects correctness
+        // (a crash before the unlink lands just leaves an orphan behind the already-advanced
+        // position, which recovery reclaims), so no directory fsync is required here.
         self.ledger
             .filesystem()
             .delete_file(&data_file_path)
             .await?;
 
-        // Unlinking doesn't durably remove the directory entry until the directory is fsynced (the
-        // mirror of creating a data file). Do it before flushing the ledger so the ledger can never
-        // outlive the physical delete: otherwise a crash could leave the file "deleted" in the
-        // ledger but resurrected on disk, inflating the recomputed buffer size on restart and
-        // leaking the file. A crash between this fsync and the ledger flush is safe -- the file is
-        // durably gone and the reader reconciles on reopen via `NotFound`.
-        self.ledger
-            .filesystem()
-            .sync_directory(self.ledger.data_dir())
-            .await?;
-
-        self.ledger.increment_acked_reader_file_id();
-        self.ledger.flush()?;
-
-        debug!("Flushed after deleting data file, notifying writers and continuing.");
+        debug!("Advanced reader position and unlinked completed data file; notifying writers.");
 
         // Notify any waiting writers that we've deleted a data file, which they may be waiting on
         // because they're looking to reuse the file ID of the file we just finished reading.
@@ -881,6 +883,17 @@ where
             warn!("Reader already initialized.");
             return Ok(());
         }
+
+        // Reclaim any orphaned data files left behind the durable reader position by a crash
+        // between the ledger flush and the unlink in `delete_completed_data_file`. This runs before
+        // the buffer-size recompute at the end of this method so orphans are not summed into it.
+        // The reader has just been constructed, so its unacknowledged file-id offset is zero and
+        // the current reader file id is exactly the durable (acknowledged) position.
+        let (reader_file_id, writer_file_id) = self.ledger.get_current_reader_writer_file_id();
+        self.ledger
+            .reclaim_orphaned_data_files(reader_file_id, writer_file_id)
+            .await
+            .context(IoSnafu)?;
 
         // We rely on `next` to close out the data file if we've actually reached the end, and we
         // also rely on it to reset the data file before trying to read, and we _also_ rely on it to
