@@ -1275,3 +1275,88 @@ async fn writer_and_reader_handle_when_last_record_has_scrambled_archive_data() 
     let parent = trace_span!("writer_detects_when_last_record_has_scrambled_archive_data");
     fut.instrument(parent.or_current()).await;
 }
+
+#[tokio::test]
+async fn reader_reclaims_orphaned_data_file_behind_position_on_reopen() {
+    // `delete_completed_data_file` advances and flushes the durable reader position BEFORE it
+    // unlinks a fully-acknowledged data file. A crash in that window leaves the file on disk even
+    // though the durable position has already moved past it -- an orphan. On reopen the reader must
+    // reclaim it, otherwise it is summed into the recomputed buffer size (inflating it) and leaks.
+    //
+    // This plants such an orphan (a non-empty data file behind the reader's advanced position) and
+    // asserts it is gone after reopen, and that the buffer still recomputes an empty size.
+    let _a = install_tracing_helpers();
+
+    let fut = with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            // One record per data file, so writing advances the writer through files 0, 1, 2, ...
+            let max_data_file_size =
+                get_minimum_data_file_size_for_record_payload(&SizedRecord::new(64));
+            let (mut writer, mut reader, ledger) =
+                create_buffer_v2_with_max_data_file_size::<_, SizedRecord>(
+                    data_dir.clone(),
+                    max_data_file_size,
+                )
+                .await;
+
+            for _ in 0..4 {
+                writer
+                    .write_record(SizedRecord::new(64))
+                    .await
+                    .expect("write should not fail");
+                writer.flush().await.expect("flush should not fail");
+            }
+
+            // Read + acknowledge the first three records so the reader drains and its durable
+            // position advances past the early files (which get deleted along the way).
+            for _ in 0..3 {
+                let mut record = await_timeout!(reader.next(), 5)
+                    .expect("read should not fail")
+                    .expect("a record should be available");
+                acknowledge(record.take_finalizers()).await;
+            }
+            // One more read drives the acknowledgement processing that advances the position.
+            let _ = await_timeout!(reader.next(), 5);
+
+            let (reader_file_id, _writer_file_id) = ledger.get_current_reader_writer_file_id();
+            assert!(
+                reader_file_id > 0,
+                "reader should have advanced past file 0, but is at {reader_file_id}"
+            );
+
+            drop(writer);
+            drop(reader);
+            while std::sync::Arc::strong_count(&ledger) > 1 {
+                tokio::task::yield_now().await;
+            }
+
+            // Plant the orphan: a non-empty data file at id 0, behind the reader's durable position,
+            // exactly as a crash between the ledger flush and the unlink would leave.
+            let orphan_path = ledger.get_data_file_path(0);
+            drop(ledger);
+            tokio::fs::write(&orphan_path, vec![0x42u8; 256])
+                .await
+                .expect("should plant orphan data file");
+            assert_file_exists_async!(&orphan_path);
+
+            // Reopen: `seek_to_next_record` must reclaim the orphan before recomputing the size.
+            let (_writer, _reader, ledger) = create_buffer_v2_with_max_data_file_size::<
+                _,
+                SizedRecord,
+            >(data_dir, max_data_file_size)
+            .await;
+
+            assert_file_does_not_exist_async!(&orphan_path);
+            assert_eq!(
+                ledger.get_total_buffer_size(),
+                0,
+                "the reclaimed orphan must not inflate the recomputed buffer size"
+            );
+        }
+    });
+
+    let parent = trace_span!("reader_reclaims_orphaned_data_file_behind_position_on_reopen");
+    fut.instrument(parent.or_current()).await;
+}
