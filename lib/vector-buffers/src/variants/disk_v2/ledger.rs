@@ -426,8 +426,7 @@ where
     /// delay progress by up to a flush interval rather than wedge the writer indefinitely.
     #[cfg_attr(test, instrument(skip(self), level = "trace"))]
     pub async fn wait_for_reader(&self) {
-        let _ =
-            tokio::time::timeout(self.config.flush_interval, self.reader_notify.notified()).await;
+        drop(tokio::time::timeout(self.config.flush_interval, self.reader_notify.notified()).await);
     }
 
     /// Waits for a signal from the writer that progress has been made.
@@ -445,8 +444,7 @@ where
     /// Driver that had parked waiting on this reader.
     #[cfg_attr(test, instrument(skip(self), level = "trace"))]
     pub async fn wait_for_writer(&self) {
-        let _ =
-            tokio::time::timeout(self.config.flush_interval, self.writer_notify.notified()).await;
+        drop(tokio::time::timeout(self.config.flush_interval, self.writer_notify.notified()).await);
     }
 
     /// Notifies all tasks waiting on progress by the reader.

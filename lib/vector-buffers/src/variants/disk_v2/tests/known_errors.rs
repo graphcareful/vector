@@ -796,7 +796,7 @@ async fn ready_chunks_over_buffer_stream_wakes_on_lone_idle_record() {
                 .await
                 .expect("write should not fail");
             writer
-                .flush_pending_finalizers()
+                .flush()
                 .await
                 .expect("flush should not fail");
 
@@ -848,7 +848,7 @@ async fn buffer_receiver_stream_wakes_on_lone_idle_record() {
                 .await
                 .expect("write should not fail");
             writer
-                .flush_pending_finalizers()
+                .flush()
                 .await
                 .expect("flush should not fail");
 
@@ -869,8 +869,7 @@ async fn buffer_receiver_stream_wakes_on_lone_idle_record() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parked_reader_consumes_record_published_to_idle_buffer() {
     // Zero-fault stuck-record reproduction. A reader parks on an empty buffer (nothing to read
-    // yet). A single record is then written and published exactly as the topology's background
-    // flush task does it -- via `flush_pending_finalizers`. With no further writes to re-trigger a
+    // yet). A single record is then written and flushed. With no further writes to re-trigger a
     // wakeup, the parked reader MUST wake and yield the record.
     //
     // If the publish notifies the reader before the record is made visible (the notify in
@@ -899,7 +898,7 @@ async fn parked_reader_consumes_record_published_to_idle_buffer() {
                 .await
                 .expect("write should not fail");
             writer
-                .flush_pending_finalizers()
+                .flush()
                 .await
                 .expect("flush should not fail");
 
