@@ -93,7 +93,16 @@ pub(crate) fn antithesis_trace_event_ids(hop: &'static str, events: &[vector_lib
         if let vector_lib::event::Event::Log(log) = event
             && let Some(id) = log.get("id")
         {
-            tracing::info!(target: "antithesis_id_trace", hop, id = %id, "event id crossed checkpoint");
+            // `internal_log_rate_limit = false` is essential: the default rate limiter groups by
+            // callsite and would suppress all but a handful of ids, defeating the trace. Every id
+            // must be logged so a specific one can be located.
+            tracing::info!(
+                target: "antithesis_id_trace",
+                hop,
+                id = %id,
+                internal_log_rate_limit = false,
+                "event id crossed checkpoint"
+            );
         }
     }
 }
