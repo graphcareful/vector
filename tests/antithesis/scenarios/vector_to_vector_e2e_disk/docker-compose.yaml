@@ -30,6 +30,9 @@ services:
       # lets a single record be traced end-to-end (submitted -> retried/timed out -> delivered ->
       # buffer drained).
       VECTOR_LOG: "debug,vector_stream=trace,vector_buffers=trace"
+      # DEBUG: trace the harness `id` at each source ingress (head http_server, tail vector)
+      # to localize the hop where an acked-but-undelivered id is dropped.
+      VECTOR_ANTITHESIS_ID_TRACE: "1"
       # Shrink head's disk-buffer data file from the 128MiB default so files fill
       # and rotate constantly, but floor it to hold the largest payload class:
       # 768KiB raw is ~1.5MiB once hex-encoded, and a record cannot span data
@@ -54,6 +57,9 @@ services:
       # lets a single record be traced end-to-end (submitted -> retried/timed out -> delivered ->
       # buffer drained).
       VECTOR_LOG: "debug,vector_stream=trace,vector_buffers=trace"
+      # DEBUG: trace the harness `id` at each source ingress (head http_server, tail vector)
+      # to localize the hop where an acked-but-undelivered id is dropped.
+      VECTOR_ANTITHESIS_ID_TRACE: "1"
       # Same as head: shrunk for constant rotation, floored at 2MiB to hold the
       # largest payload class (768KiB raw, ~1.5MiB hex-encoded).
       VECTOR_DISK_V2_MAX_DATA_FILE_SIZE: "2097152"

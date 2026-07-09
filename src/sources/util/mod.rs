@@ -76,6 +76,28 @@ pub use self::http::decompress_body;
 ))]
 pub use self::message_decoding::decode_message;
 
+/// DEBUG-ONLY hop tracing for the Antithesis conservation scenario.
+///
+/// When the `VECTOR_ANTITHESIS_ID_TRACE` environment variable is set, this logs the harness `id`
+/// field of every event as it crosses a source ingress checkpoint, so a specific
+/// acked-but-undelivered id can be followed hop-by-hop across nodes (producer -> head -> tail ->
+/// oracle) to localize where it is dropped. The enablement is a single cached atomic load, so this
+/// is inert on normal builds/runs where the variable is unset. Not intended for production use.
+pub(crate) fn antithesis_trace_event_ids(hop: &'static str, events: &[vector_lib::event::Event]) {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("VECTOR_ANTITHESIS_ID_TRACE").is_ok());
+    if !*ENABLED {
+        return;
+    }
+    for event in events {
+        if let vector_lib::event::Event::Log(log) = event
+            && let Some(id) = log.get("id")
+        {
+            tracing::info!(target: "antithesis_id_trace", hop, id = %id, "event id crossed checkpoint");
+        }
+    }
+}
+
 /// Extract a tag and it's value from input string delimited by a colon character.
 ///
 /// Note: the behavior of StatsD if more than one colon is found (which would presumably
