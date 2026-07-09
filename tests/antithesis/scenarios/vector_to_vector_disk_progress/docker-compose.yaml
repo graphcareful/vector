@@ -1,0 +1,83 @@
+name: vector-to-vector-disk-progress
+
+x-vector-build: &vector-build
+  context: ../../../..
+  dockerfile: tests/antithesis/scenarios/vector_to_vector_disk_progress/Dockerfile
+  target: vector
+
+x-node-health: &node-health
+  test: ["CMD", "curl", "-fsS", "http://localhost:9598/metrics"]
+  interval: 5s
+  timeout: 3s
+  retries: 30
+  start_period: 10s
+
+services:
+  head:
+    container_name: head
+    hostname: head
+    platform: linux/amd64
+    init: true
+    build: *vector-build
+    image: vdp-vector:${ANTITHESIS_IMAGE_TAG:-dev}
+    entrypoint: ["/usr/bin/vector", "--config", "/etc/vector/head.yaml"]
+    environment:
+      NO_COLOR: "1"
+      # Debug logging so runs capture the sink/buffer delivery path for triage. Kept at `debug`
+      # (not `trace`): the per-record trace volume from vector_stream/vector_buffers under a crash
+      # storm is large enough that Antithesis can drop logs, which would take the info-level
+      # id-trace and the WARN-level buffer signals down with it. Debug still retains everything
+      # triage relies on -- the id-trace (info), gap/bad-read WARNs, and the buffer-size recompute
+      # and data-file delete lines (debug).
+      VECTOR_LOG: "debug"
+      # Trace the harness `id` at each source ingress to localize where records are dropped.
+      VECTOR_ANTITHESIS_ID_TRACE: "1"
+      # Shrink head's disk-buffer data file from the 128MiB default so files fill
+      # and rotate constantly, but floor it to hold the largest payload class:
+      # 768KiB raw is ~1.5MiB once hex-encoded, and a record cannot span data
+      # files. 2MiB leaves headroom for record framing.
+      VECTOR_DISK_V2_MAX_DATA_FILE_SIZE: "2097152"
+    volumes: ["vdp-buffer-head:/var/lib/vector"]
+    healthcheck: *node-health
+
+  tail:
+    container_name: tail
+    hostname: tail
+    platform: linux/amd64
+    init: true
+    image: vdp-vector:${ANTITHESIS_IMAGE_TAG:-dev}
+    entrypoint: ["/usr/bin/vector", "--config", "/etc/vector/tail.yaml"]
+    environment:
+      NO_COLOR: "1"
+      VECTOR_LOG: "debug"
+      VECTOR_ANTITHESIS_ID_TRACE: "1"
+      # Same as head: shrunk for constant rotation, floored at 2MiB.
+      VECTOR_DISK_V2_MAX_DATA_FILE_SIZE: "2097152"
+    volumes: ["vdp-buffer-tail:/var/lib/vector"]
+    healthcheck: *node-health
+
+  oracle:
+    container_name: oracle
+    hostname: oracle
+    platform: linux/amd64
+    init: true
+    build:
+      context: ../../../..
+      dockerfile: tests/antithesis/scenarios/vector_to_vector_disk_progress/Dockerfile
+      target: workload
+    image: vdp-oracle:${ANTITHESIS_IMAGE_TAG:-dev}
+    environment:
+      NO_COLOR: "1"
+      SCENARIO_NAME: "vector_to_vector_disk_progress"
+      VECTOR_SOURCE_URL: "http://head:8080/"
+      VECTOR_METRICS_URL: "http://head:9598/metrics"
+      VECTOR_METRICS_URLS: "http://head:9598/metrics,http://tail:9598/metrics"
+      # Test commands run in this container, so they reach the oracle locally.
+      ORACLE_URL: "http://127.0.0.1:8686"
+    depends_on:
+      head: { condition: service_healthy }
+      tail: { condition: service_healthy }
+
+volumes:
+  vdp-buffer-head:
+  vdp-buffer-tail:

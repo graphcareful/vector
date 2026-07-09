@@ -30,6 +30,7 @@
 #   SOURCE=<identifier>     property-history key; default is the git branch
 #   DRY_RUN=1               print the exact command and exit without submitting
 #   SKIP_BUILD=1            skip docker build/push; reuse images already in the registry
+#   GIT_SHA=<tag>           override the image tag (use with SKIP_BUILD=1 to pin to a prior build)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,9 +63,12 @@ SCENARIO_WEBHOOK=""
 # tree has uncommitted changes so the tag never claims to be a clean commit it is
 # not. Images are tagged by this, never :latest, so a shot can never reuse a stale
 # mutable tag and every pushed image traces back to the source it was built from.
-GIT_SHA="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)" ]]; then
-  GIT_SHA="${GIT_SHA}-dirty"
+# GIT_SHA can be overridden (e.g. with SKIP_BUILD=1) to reuse images from a prior build.
+if [[ -z "${GIT_SHA:-}" ]]; then
+  GIT_SHA="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)" ]]; then
+    GIT_SHA="${GIT_SHA}-dirty"
+  fi
 fi
 export ANTITHESIS_IMAGE_TAG="$GIT_SHA"
 
