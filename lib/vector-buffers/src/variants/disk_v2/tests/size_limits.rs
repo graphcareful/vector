@@ -36,8 +36,9 @@ async fn writer_drops_record_that_is_over_the_limit() {
                 .try_into()
                 .unwrap();
             let mut second_record = SizedRecord::new(second_write_size);
-            // Attach a finalizer so we can assert the oversized record is `Rejected` (permanently
-            // refused, not retried) rather than `Errored`.
+            // Attach a finalizer so we can assert the oversized record resolves as `Delivered`
+            // (the source acks/checkpoints and moves on) rather than `Rejected` (which nacks
+            // acking sources like Pulsar, causing a poison-record retry loop).
             let (batch, mut receiver) = BatchNotifier::new_with_receiver();
             second_record.add_batch_notifier(batch);
 
@@ -72,13 +73,14 @@ async fn writer_drops_record_that_is_over_the_limit() {
                 "an over-limit record should write no bytes",
             );
 
-            // The dropped record's finalizer must resolve to `Rejected` (terminal — the source does
-            // not retry a record that can never be written), not `Errored` (which signals a retry).
+            // The dropped record's finalizer must resolve to `Delivered` so that acking sources
+            // (e.g. Pulsar, file) ack/checkpoint rather than nacking and redelivering a record
+            // that can never be written.
             tokio::task::yield_now().await;
             assert_eq!(
                 receiver.try_recv(),
-                Ok(BatchStatus::Rejected),
-                "over-limit record should be rejected, not errored",
+                Ok(BatchStatus::Delivered),
+                "over-limit record should resolve as Delivered so acking sources do not redeliver it",
             );
 
             // The buffer is unchanged: the oversized record never entered it.

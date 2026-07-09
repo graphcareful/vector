@@ -189,6 +189,22 @@ impl BufferUsageHandle {
         }
     }
 
+    /// Records a drop of events that exceeded the maximum encodable size and were discarded
+    /// before entering the buffer.
+    ///
+    /// These records never contribute to `received`, so this counter is metric-only. It must not
+    /// feed `total_left`, otherwise a pre-entry discard creates underflow debt and later valid
+    /// writes are underreported.
+    pub fn increment_pre_entry_dropped_event_count_and_byte_size(
+        &self,
+        count: u64,
+        byte_size: u64,
+    ) {
+        if count > 0 || byte_size > 0 {
+            self.state.pre_entry_dropped.increment(count, byte_size);
+        }
+    }
+
     /// Increment the number of dropped events (and their total size) for this buffer component.
     pub fn increment_dropped_event_count_and_byte_size(
         &self,
@@ -213,6 +229,10 @@ struct BufferUsageData {
     sent: CategoryMetrics,
     dropped: CategoryMetrics,
     dropped_intentional: CategoryMetrics,
+    /// Records that were dropped before they ever entered the buffer (e.g. oversized records that
+    /// can never be encoded). These drops are reported as discard metrics, but do not affect
+    /// occupancy because they were never counted as received.
+    pre_entry_dropped: CategoryMetrics,
     max_size: CategoryMetrics,
 }
 
@@ -229,6 +249,7 @@ impl BufferUsageData {
         let sent = self.sent.get();
         let dropped = self.dropped.get();
         let dropped_intentional = self.dropped_intentional.get();
+        let pre_entry_dropped = self.pre_entry_dropped.get();
         let max_size = self.max_size.get();
 
         BufferUsageSnapshot {
@@ -240,6 +261,8 @@ impl BufferUsageData {
             dropped_event_byte_size: dropped.event_byte_size,
             dropped_event_count_intentional: dropped_intentional.event_count,
             dropped_event_byte_size_intentional: dropped_intentional.event_byte_size,
+            dropped_event_count_pre_entry: pre_entry_dropped.event_count,
+            dropped_event_byte_size_pre_entry: pre_entry_dropped.event_byte_size,
             max_size_bytes: max_size.event_byte_size,
             max_size_events: max_size
                 .event_count
@@ -275,6 +298,10 @@ impl BufferUsageData {
 
         let dropped_intentional = self.dropped_intentional.consume();
         current_metrics.add_left(dropped_intentional);
+
+        // Pre-entry drops are metric-only. They never entered the buffer, so they must not
+        // contribute to total_left in the occupancy calculation.
+        let pre_entry_dropped = self.pre_entry_dropped.consume();
 
         let current = current_metrics.current();
 
@@ -325,6 +352,19 @@ impl BufferUsageData {
                 total_byte_size: current.event_byte_size,
             });
         }
+
+        if pre_entry_dropped.has_updates() {
+            emit(BufferEventsDropped {
+                buffer_id: buffer_id.to_string(),
+                idx: self.idx,
+                intentional: false,
+                reason: "oversized_record",
+                count: pre_entry_dropped.event_count,
+                byte_size: pre_entry_dropped.event_byte_size,
+                total_count: current.event_count,
+                total_byte_size: current.event_byte_size,
+            });
+        }
     }
 }
 
@@ -339,6 +379,10 @@ pub struct BufferUsageSnapshot {
     pub dropped_event_byte_size: u64,
     pub dropped_event_count_intentional: u64,
     pub dropped_event_byte_size_intentional: u64,
+    /// Events dropped before entering the buffer (e.g. oversized records that cannot be encoded).
+    /// These are NOT included in `dropped_event_count` because they never affected buffer occupancy.
+    pub dropped_event_count_pre_entry: u64,
+    pub dropped_event_byte_size_pre_entry: u64,
     pub max_size_bytes: u64,
     pub max_size_events: usize,
 }
@@ -488,6 +532,26 @@ mod tests {
         let current = metrics.current();
         assert_eq!(current.event_count, 7);
         assert_eq!(current.event_byte_size, 700);
+    }
+
+    #[test]
+    fn pre_entry_dropped_does_not_affect_occupancy() {
+        let data = BufferUsageData::new(0);
+        let mut metrics = ReporterCurrentMetrics::default();
+
+        data.pre_entry_dropped.increment(3, 300);
+
+        data.report(&mut metrics, "test");
+        let current = metrics.current();
+        assert_eq!(current.event_count, 0);
+        assert_eq!(current.event_byte_size, 0);
+
+        data.received.increment(10, 1000);
+
+        data.report(&mut metrics, "test");
+        let current = metrics.current();
+        assert_eq!(current.event_count, 10);
+        assert_eq!(current.event_byte_size, 1000);
     }
 
     #[test]
