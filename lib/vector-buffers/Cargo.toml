@@ -38,7 +38,8 @@ antithesis_sdk = { workspace = true, optional = true, features = ["full"] }
 serde_json = { workspace = true, optional = true }
 
 [features]
-antithesis-disk-asserts = ["dep:antithesis_sdk", "dep:serde_json"]
+antithesis-disk-tuning = []
+antithesis-disk-asserts = ["antithesis-disk-tuning", "dep:antithesis_sdk", "dep:serde_json"]
 test = []
 
 [dev-dependencies]

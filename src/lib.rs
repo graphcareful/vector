@@ -35,7 +35,8 @@ extern crate vector_lib;
     target_os = "linux",
     any(
         feature = "antithesis-scenario-memory",
-        feature = "antithesis-scenario-disk"
+        feature = "antithesis-scenario-disk",
+        feature = "antithesis-scenario-disk-progress",
     )
 ))]
 extern crate antithesis_instrumentation as _;

@@ -361,7 +361,7 @@ where
     // rotate constantly. That is what reaches the rare recovery paths the bug hides
     // in: reopening a file whose last write was cut short, and reusing a file number
     // after the counter wraps. Read from the environment, not the public YAML config.
-    #[cfg(feature = "antithesis-disk-asserts")]
+    #[cfg(feature = "antithesis-disk-tuning")]
     let builder = match std::env::var("VECTOR_DISK_V2_MAX_DATA_FILE_SIZE")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())

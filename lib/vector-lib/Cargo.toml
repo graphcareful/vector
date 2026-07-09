@@ -27,6 +27,7 @@ vector-top = { path = "../vector-top", optional = true }
 vrl = { workspace = true, optional = true }
 
 [features]
+antithesis-disk-tuning = ["vector-buffers/antithesis-disk-tuning"]
 antithesis-disk-asserts = ["vector-buffers/antithesis-disk-asserts"]
 api-client = ["dep:vector-api-client"]
 arrow = ["codecs/arrow"]

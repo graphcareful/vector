@@ -29,6 +29,8 @@
 #   WEBHOOK=<name>          default SCENARIO_WEBHOOK or persistent_storage
 #   SOURCE=<identifier>     property-history key; default is the git branch
 #   DRY_RUN=1               print the exact command and exit without submitting
+#   SKIP_BUILD=1            skip docker build/push; reuse images already in the registry
+#   GIT_SHA=<tag>           override the image tag (use with SKIP_BUILD=1 to pin to a prior build)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,9 +38,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCENARIO="${1:?usage: launch.sh <scenario> [extra snouty flags]}"
 shift
 SCENARIO_DIR="$SCRIPT_DIR/$SCENARIO"
-[ -d "$SCENARIO_DIR" ] || { echo "error: no scenario directory $SCENARIO_DIR" >&2; exit 1; }
-[ -f "$SCENARIO_DIR/docker-compose.yaml" ] || { echo "error: $SCENARIO_DIR/docker-compose.yaml not found" >&2; exit 1; }
-[ -f "$SCENARIO_DIR/launch.env" ] || { echo "error: $SCENARIO_DIR/launch.env not found" >&2; exit 1; }
+[ -d "$SCENARIO_DIR" ] || {
+  echo "error: no scenario directory $SCENARIO_DIR" >&2
+  exit 1
+}
+[ -f "$SCENARIO_DIR/docker-compose.yaml" ] || {
+  echo "error: $SCENARIO_DIR/docker-compose.yaml not found" >&2
+  exit 1
+}
+[ -f "$SCENARIO_DIR/launch.env" ] || {
+  echo "error: $SCENARIO_DIR/launch.env not found" >&2
+  exit 1
+}
 
 # Per-scenario settings. Declared here so a missing one is caught, not silently empty.
 SCENARIO_TEST_NAME=""
@@ -52,9 +63,12 @@ SCENARIO_WEBHOOK=""
 # tree has uncommitted changes so the tag never claims to be a clean commit it is
 # not. Images are tagged by this, never :latest, so a shot can never reuse a stale
 # mutable tag and every pushed image traces back to the source it was built from.
-GIT_SHA="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)" ]]; then
-  GIT_SHA="${GIT_SHA}-dirty"
+# GIT_SHA can be overridden (e.g. with SKIP_BUILD=1) to reuse images from a prior build.
+if [[ -z "${GIT_SHA:-}" ]]; then
+  GIT_SHA="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)" ]]; then
+    GIT_SHA="${GIT_SHA}-dirty"
+  fi
 fi
 export ANTITHESIS_IMAGE_TAG="$GIT_SHA"
 
@@ -119,9 +133,15 @@ cmd=(snouty launch
   "${FAULTS[@]}"
   "$@")
 
-printf 'build: '; printf ' %q' "${build[@]}"; printf '\n'
-printf 'render:'; printf ' %q' "${render[@]}"; printf ' > %q\n' "$LAUNCH_DIR/docker-compose.yaml"
-printf 'launch:'; printf ' %q' "${cmd[@]}"; printf '\n'
+printf 'build: '
+printf ' %q' "${build[@]}"
+printf '\n'
+printf 'render:'
+printf ' %q' "${render[@]}"
+printf ' > %q\n' "$LAUNCH_DIR/docker-compose.yaml"
+printf 'launch:'
+printf ' %q' "${cmd[@]}"
+printf '\n'
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   echo "(dry run; not building or submitting)"
   exit 0
