@@ -437,6 +437,6 @@ mod disk_buffer_driver_repro_tests {
         );
 
         drop(sender);
-        let _ = tokio::time::timeout(Duration::from_secs(2), driver_task).await;
+        drop(tokio::time::timeout(Duration::from_secs(2), driver_task).await);
     }
 }

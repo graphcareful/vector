@@ -493,6 +493,6 @@ mod tests {
         );
 
         drop(tx);
-        let _ = tokio::time::timeout(Duration::from_secs(2), driver_task).await;
+        drop(tokio::time::timeout(Duration::from_secs(2), driver_task).await);
     }
 }
