@@ -171,6 +171,10 @@ impl Finalizable for TraceEvent {
     fn take_finalizers(&mut self) -> EventFinalizers {
         self.0.take_finalizers()
     }
+
+    fn merge_finalizers(&mut self, finalizers: EventFinalizers) {
+        self.0.merge_finalizers(finalizers);
+    }
 }
 
 impl AsRef<LogEvent> for TraceEvent {

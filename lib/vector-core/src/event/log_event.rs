@@ -222,6 +222,10 @@ impl Finalizable for LogEvent {
     fn take_finalizers(&mut self) -> EventFinalizers {
         self.metadata.take_finalizers()
     }
+
+    fn merge_finalizers(&mut self, finalizers: EventFinalizers) {
+        self.metadata.merge_finalizers(finalizers);
+    }
 }
 
 impl EstimatedJsonEncodedSizeOf for LogEvent {

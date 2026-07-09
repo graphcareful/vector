@@ -476,6 +476,10 @@ impl Finalizable for Metric {
     fn take_finalizers(&mut self) -> EventFinalizers {
         self.metadata.take_finalizers()
     }
+
+    fn merge_finalizers(&mut self, finalizers: EventFinalizers) {
+        self.metadata.merge_finalizers(finalizers);
+    }
 }
 
 impl GetEventCountTags for Metric {

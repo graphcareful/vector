@@ -98,13 +98,31 @@ impl Arbitrary for WhenFull {
 /// It is a relaxed version of `Bufferable` that allows for items that are not `Encodable` (e.g., `Instant`),
 /// which is an unnecessary constraint for memory buffers.
 pub trait InMemoryBufferable:
-    AddBatchNotifier + Finalizable + ByteSizeOf + EventCount + Debug + Send + Sync + Unpin + Sized + 'static
+    AddBatchNotifier
+    + Finalizable
+    + ByteSizeOf
+    + EventCount
+    + Debug
+    + Send
+    + Sync
+    + Unpin
+    + Sized
+    + 'static
 {
 }
 
 // Blanket implementation for anything that is already in-memory bufferable.
 impl<T> InMemoryBufferable for T where
-    T: AddBatchNotifier + Finalizable + ByteSizeOf + EventCount + Debug + Send + Sync + Unpin + Sized + 'static
+    T: AddBatchNotifier
+        + Finalizable
+        + ByteSizeOf
+        + EventCount
+        + Debug
+        + Send
+        + Sync
+        + Unpin
+        + Sized
+        + 'static
 {
 }
 
