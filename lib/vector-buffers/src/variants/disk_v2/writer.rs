@@ -29,7 +29,6 @@ use super::{
     ledger::Ledger,
     record::{Record, RecordStatus, validate_record_archive},
 };
-use vector_common::finalization::EventStatus;
 
 use crate::{
     Bufferable,
@@ -1325,9 +1324,11 @@ where
                         // entire buffer (and with it the whole Vector topology). Instead, drop just
                         // this record and carry on: the buffer and every other record are unharmed.
                         //
-                        // The finalizers are rejected (a terminal status: the source stops trying to
-                        // redeliver, rather than retrying a record that can never succeed), and the
-                        // drop is surfaced as a non-intentional buffer drop for observability.
+                        // Drop the finalizers with their default EventStatus::Dropped, which
+                        // propagates as BatchStatus::Delivered. Acking sources therefore ack/checkpoint
+                        // the record rather than nacking or stalling, which prevents the oversized
+                        // record from becoming a retry loop. The drop is surfaced via metrics for
+                        // observability.
                         error!(
                             message = "Record too large to write to the disk buffer; dropping it.",
                             event_count = record_events.get(),
@@ -1335,7 +1336,7 @@ where
                             max_record_size = self.config.max_record_size,
                             error = %e,
                         );
-                        record_finalizers.update_status(EventStatus::Rejected);
+                        drop(record_finalizers);
                         self.ledger.track_unwritable_dropped_record(
                             record_events.get() as u64,
                             record_byte_size as u64,

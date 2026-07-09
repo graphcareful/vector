@@ -52,9 +52,10 @@ where
                 writer.write_record(item).await.map(|_| ()).map_err(|e| {
                     // Record-level failures that can never succeed (a record too large to encode
                     // within the max record size) are handled inside the writer: the record is
-                    // dropped, its finalizers rejected, and the drop is metered, so they never
-                    // surface here. Anything that reaches this point -- I/O errors, serialization
-                    // failures, an inconsistent writer state -- is genuinely unrecoverable.
+                    // dropped, its finalizers resolved as Delivered, and the drop is metered, so
+                    // they never surface here. Anything that reaches this point -- I/O errors,
+                    // serialization failures, an inconsistent writer state -- is genuinely
+                    // unrecoverable.
                     error!("Disk buffer writer has encountered an unrecoverable error.");
 
                     e.into()
@@ -75,9 +76,10 @@ where
                 writer.try_write_record(item).await.map_err(|e| {
                     // Record-level failures that can never succeed (a record too large to encode
                     // within the max record size) are handled inside the writer: the record is
-                    // dropped, its finalizers rejected, and the drop is metered, so they never
-                    // surface here. Anything that reaches this point -- I/O errors, serialization
-                    // failures, an inconsistent writer state -- is genuinely unrecoverable.
+                    // dropped, its finalizers resolved as Delivered, and the drop is metered, so
+                    // they never surface here. Anything that reaches this point -- I/O errors,
+                    // serialization failures, an inconsistent writer state -- is genuinely
+                    // unrecoverable.
                     error!("Disk buffer writer has encountered an unrecoverable error.");
 
                     e.into()
