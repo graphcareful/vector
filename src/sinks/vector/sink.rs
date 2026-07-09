@@ -64,6 +64,16 @@ where
                 let mut byte_size = telemetry().create_request_count_byte_size();
                 byte_size.add_event(&event, event.estimated_json_encoded_size_of());
 
+                // DEBUG (Antithesis id-trace): the send checkpoint between the two source-ingress
+                // checkpoints. If a lost id appears here but never at the peer's vector-source
+                // ingress, it was submitted but not received (transport/spurious ack); if the id's
+                // buffer ack advances without ever appearing here, the buffer eager-acked a record
+                // its sink never sent. Inert unless VECTOR_ANTITHESIS_ID_TRACE.
+                crate::sources::util::antithesis_trace_event_ids(
+                    "vector-sink-submit",
+                    std::slice::from_ref(&event),
+                );
+
                 EventData {
                     byte_size: event.size_of(),
                     json_byte_size: byte_size,
