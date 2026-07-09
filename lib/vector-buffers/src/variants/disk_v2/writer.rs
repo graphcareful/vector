@@ -29,6 +29,8 @@ use super::{
     ledger::Ledger,
     record::{Record, RecordStatus, validate_record_archive},
 };
+use vector_common::finalization::EventStatus;
+
 use crate::{
     Bufferable,
     encoding::{AsMetadata, Encodable},
@@ -131,6 +133,26 @@ where
     ///
     /// Empty records are not supported.
     EmptyRecord,
+}
+
+impl<T> WriterError<T>
+where
+    T: Bufferable,
+{
+    /// Whether this error means the record itself can never be written, no matter how many times
+    /// it is retried — as opposed to a transient, environmental, or buffer-wide failure.
+    ///
+    /// A record that exceeds the maximum record size fails identically on every attempt. It is
+    /// reported either as `RecordTooLarge` or, more commonly, as an encoder `FailedToEncode`
+    /// (encoders typically bail the moment they overflow the size-limited buffer rather than
+    /// filling it completely). Such a record is dropped rather than retried forever or escalated
+    /// into a fatal error that tears down the whole buffer/topology.
+    fn is_unwritable_record(&self) -> bool {
+        matches!(
+            self,
+            WriterError::RecordTooLarge { .. } | WriterError::FailedToEncode { .. }
+        )
+    }
 }
 
 impl<T: Bufferable + PartialEq> PartialEq for WriterError<T> {
@@ -1260,6 +1282,13 @@ where
             .try_into()
             .map_err(|_| WriterError::EmptyRecord)?;
 
+        // Capture the in-memory size and extract finalizers before `archive_record` consumes the
+        // record. The encoder unconditionally consumes the record (even on failure), so we must
+        // take what we need here to handle the case where encoding fails because the record is too
+        // large to ever write.
+        let record_byte_size = record.size_of();
+        let record_finalizers = record.take_finalizers();
+
         // Grab the next record ID and attempt to write the record.
         let record_id = self.get_next_record_id();
 
@@ -1295,6 +1324,29 @@ where
                             last_attempted_write_size = serialized_len,
                             "Current data file reached maximum size. Rolling to the next data file."
                         );
+                    }
+                    e if e.is_unwritable_record() => {
+                        // The record can never be written -- it exceeds the maximum record size --
+                        // so retrying would loop forever and returning an error would tear down the
+                        // entire buffer (and with it the whole Vector topology). Instead, drop just
+                        // this record and carry on: the buffer and every other record are unharmed.
+                        //
+                        // The finalizers are rejected (a terminal status: the source stops trying to
+                        // redeliver, rather than retrying a record that can never succeed), and the
+                        // drop is surfaced as a non-intentional buffer drop for observability.
+                        error!(
+                            message = "Record too large to write to the disk buffer; dropping it.",
+                            event_count = record_events.get(),
+                            byte_size = record_byte_size,
+                            max_record_size = self.config.max_record_size,
+                            error = %e,
+                        );
+                        record_finalizers.update_status(EventStatus::Rejected);
+                        self.ledger.track_unwritable_dropped_record(
+                            record_events.get() as u64,
+                            record_byte_size as u64,
+                        );
+                        return Ok(Ok(0));
                     }
                     e => return Err(e),
                 },
