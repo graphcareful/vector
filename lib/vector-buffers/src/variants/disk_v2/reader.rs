@@ -1348,7 +1348,19 @@ where
             .map_err(|_| ReaderError::EmptyRecord)?;
         self.track_read(record_id, record_bytes, record_events);
 
-        let (batch, receiver) = BatchNotifier::new_with_receiver();
+        // A record delivered downstream but whose finalizer is dropped without an explicit ack
+        // (e.g. the sink task is torn down with the request in flight) would otherwise finalize as
+        // `Dropped`, which the batch treats as a no-op and leaves at the optimistic `Delivered`
+        // default -- silently promoting the read-head for a record that was never delivered. Use a
+        // pessimistic notifier so such a drop reports `Errored` instead, mirroring the write path's
+        // `Errored`-on-drop guard. Only for real deliveries: during the recovery-seek replay the
+        // records are already-acknowledged re-reads that are intentionally discarded, so they keep
+        // the optimistic notifier and must not be reported as failures.
+        let (batch, receiver) = if self.ready_to_read {
+            BatchNotifier::new_with_receiver_pessimistic()
+        } else {
+            BatchNotifier::new_with_receiver()
+        };
         record.add_batch_notifier(batch);
         self.finalizer.add(record_events.get(), receiver);
 

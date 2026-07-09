@@ -223,10 +223,28 @@ impl BatchNotifier {
     /// Creates a new `BatchNotifier` along with the receiver used to await its finalization status.
     #[must_use]
     pub fn new_with_receiver() -> (Self, BatchStatusReceiver) {
+        Self::with_receiver(false)
+    }
+
+    /// Like [`BatchNotifier::new_with_receiver`], but the batch treats an event finalized as
+    /// `Dropped` -- a finalizer dropped without ever being acknowledged -- as a delivery failure
+    /// (`Errored`) rather than the optimistic `Delivered` default.
+    ///
+    /// Used by the disk buffer's read path: there a `Dropped` (never-acknowledged) finalizer means
+    /// a durable record was never delivered downstream, so it must not be promoted as if it were.
+    /// The default (optimistic) notifier keeps the usual semantics, where a `Dropped` event is an
+    /// intentional discard and a no-op on the batch.
+    #[must_use]
+    pub fn new_with_receiver_pessimistic() -> (Self, BatchStatusReceiver) {
+        Self::with_receiver(true)
+    }
+
+    fn with_receiver(pessimistic: bool) -> (Self, BatchStatusReceiver) {
         let (sender, receiver) = oneshot::channel();
         let notifier = OwnedBatchNotifier {
             status: AtomicCell::new(BatchStatus::Delivered),
             notifier: Some(sender),
+            pessimistic,
         };
         (Self(Arc::new(notifier)), BatchStatusReceiver(receiver))
     }
@@ -266,6 +284,16 @@ impl BatchNotifier {
 
     /// Updates the status of the notifier.
     fn update_status(&self, status: EventStatus) {
+        // A pessimistic notifier maps a `Dropped` contribution -- an event whose finalizer was
+        // dropped without ever being acknowledged -- to `Errored`, recording it as a delivery
+        // failure instead of leaving the batch at its optimistic `Delivered` default. Optimistic
+        // notifiers keep the original semantics (a `Dropped` event is an intentional discard and a
+        // no-op on the batch).
+        let status = if self.0.pessimistic && status == EventStatus::Dropped {
+            EventStatus::Errored
+        } else {
+            status
+        };
         // The status starts as Delivered and can only change if the new
         // status is different than that.
         if status != EventStatus::Delivered && status != EventStatus::Dropped {
@@ -282,6 +310,9 @@ impl BatchNotifier {
 pub struct OwnedBatchNotifier {
     status: AtomicCell<BatchStatus>,
     notifier: Option<oneshot::Sender<BatchStatus>>,
+    /// When set, a `Dropped` (never-acknowledged) event finalization is treated as `Errored`
+    /// rather than as a no-op. See [`BatchNotifier::new_with_receiver_pessimistic`].
+    pessimistic: bool,
 }
 
 impl OwnedBatchNotifier {
@@ -451,6 +482,29 @@ mod tests {
         let (fin, mut receiver) = make_finalizer();
         assert_eq!(receiver.try_recv(), Err(Empty));
         drop(fin);
+        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
+    }
+
+    #[test]
+    fn pessimistic_dropped_finalizer_reports_errored() {
+        // A pessimistic notifier whose finalizer is dropped without any acknowledgement must report
+        // `Errored` (a delivery failure) rather than the optimistic `Delivered` default, so a
+        // durable record whose downstream delivery never completed is not treated as delivered.
+        let (batch, mut receiver) = BatchNotifier::new_with_receiver_pessimistic();
+        let finalizer = EventFinalizers::new(EventFinalizer::new(batch));
+        assert_eq!(receiver.try_recv(), Err(Empty));
+        drop(finalizer);
+        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Errored));
+    }
+
+    #[test]
+    fn pessimistic_delivered_finalizer_reports_delivered() {
+        // Pessimism only rewrites the never-acknowledged (`Dropped`) case; an explicit `Delivered`
+        // still reports `Delivered`.
+        let (batch, mut receiver) = BatchNotifier::new_with_receiver_pessimistic();
+        let finalizer = EventFinalizers::new(EventFinalizer::new(batch));
+        finalizer.update_status(EventStatus::Delivered);
+        drop(finalizer);
         assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
     }
 
