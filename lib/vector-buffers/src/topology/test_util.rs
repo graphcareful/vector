@@ -3,7 +3,7 @@ use std::{error, fmt, num::NonZeroUsize};
 use bytes::{Buf, BufMut};
 use vector_common::{
     byte_size_of::ByteSizeOf,
-    finalization::{AddBatchNotifier, BatchNotifier},
+    finalization::{AddBatchNotifier, BatchNotifier, EventFinalizers, Finalizable},
 };
 
 use super::builder::TopologyBuilder;
@@ -53,6 +53,12 @@ impl Sample {
 impl AddBatchNotifier for Sample {
     fn add_batch_notifier(&mut self, batch: BatchNotifier) {
         drop(batch); // We never check acknowledgements for this type
+    }
+}
+
+impl Finalizable for Sample {
+    fn take_finalizers(&mut self) -> EventFinalizers {
+        EventFinalizers::DEFAULT
     }
 }
 

@@ -14,7 +14,7 @@ use crate::{
     BufferInstrumentation, Bufferable, WhenFull,
     buffer_usage_data::BufferUsageHandle,
     internal_events::BufferSendDuration,
-    variants::disk_v2::{self, ProductionFilesystem},
+    variants::disk_v2::{self, ProductionFilesystem, TryWriteOutcome},
 };
 
 /// Adapter for papering over various sender backends.
@@ -50,11 +50,11 @@ where
                 let mut writer = writer.lock().await;
 
                 writer.write_record(item).await.map(|_| ()).map_err(|e| {
-                    // TODO: Could some errors be handled and not be unrecoverable? Right now,
-                    // encoding should theoretically be recoverable -- encoded value was too big, or
-                    // error during encoding -- but the traits don't allow for recovering the
-                    // original event value because we have to consume it to do the encoding... but
-                    // that might not always be the case.
+                    // Record-level failures that can never succeed (a record too large to encode
+                    // within the max record size) are handled inside the writer: the record is
+                    // dropped, its finalizers rejected, and the drop is metered, so they never
+                    // surface here. Anything that reaches this point -- I/O errors, serialization
+                    // failures, an inconsistent writer state -- is genuinely unrecoverable.
                     error!("Disk buffer writer has encountered an unrecoverable error.");
 
                     e.into()
@@ -63,21 +63,21 @@ where
         }
     }
 
-    pub(crate) async fn try_send(&mut self, item: T) -> crate::Result<Option<T>> {
+    pub(crate) async fn try_send(&mut self, item: T) -> crate::Result<TryWriteOutcome<T>> {
         match self {
             Self::InMemory(tx) => tx
                 .try_send(item)
-                .map(|()| None)
-                .or_else(|e| Ok(Some(e.into_inner()))),
+                .map(|()| TryWriteOutcome::Written)
+                .or_else(|e| Ok(TryWriteOutcome::Full(e.into_inner()))),
             Self::DiskV2(writer) => {
                 let mut writer = writer.lock().await;
 
                 writer.try_write_record(item).await.map_err(|e| {
-                    // TODO: Could some errors be handled and not be unrecoverable? Right now,
-                    // encoding should theoretically be recoverable -- encoded value was too big, or
-                    // error during encoding -- but the traits don't allow for recovering the
-                    // original event value because we have to consume it to do the encoding... but
-                    // that might not always be the case.
+                    // Record-level failures that can never succeed (a record too large to encode
+                    // within the max record size) are handled inside the writer: the record is
+                    // dropped, its finalizers rejected, and the drop is metered, so they never
+                    // surface here. Anything that reaches this point -- I/O errors, serialization
+                    // failures, an inconsistent writer state -- is genuinely unrecoverable.
                     error!("Disk buffer writer has encountered an unrecoverable error.");
 
                     e.into()
@@ -232,18 +232,29 @@ impl<T: Bufferable> BufferSender<T> {
         match self.when_full {
             WhenFull::Block => self.base.send(item).await?,
             WhenFull::DropNewest => {
-                if self.base.try_send(item).await?.is_some() {
-                    was_dropped = true;
+                match self.base.try_send(item).await? {
+                    TryWriteOutcome::Full(_) => {
+                        was_dropped = true;
+                    }
+                    // Written: record is in the buffer.
+                    // Dropped: the writer already metered and balanced this via
+                    // track_unwritable_dropped_record / pre_entry_dropped. Setting was_dropped
+                    // here would emit a second drop metric and double-adjust total_left.
+                    TryWriteOutcome::Written | TryWriteOutcome::Dropped => {}
                 }
             }
             WhenFull::Overflow => {
-                if let Some(item) = self.base.try_send(item).await? {
-                    was_dropped = true;
-                    self.overflow
-                        .as_mut()
-                        .unwrap_or_else(|| unreachable!("overflow must exist"))
-                        .send(item, send_reference)
-                        .await?;
+                match self.base.try_send(item).await? {
+                    TryWriteOutcome::Full(item) => {
+                        self.overflow
+                            .as_mut()
+                            .unwrap_or_else(|| unreachable!("overflow must exist"))
+                            .send(item, send_reference)
+                            .await?;
+                    }
+                    // Written: record is in the buffer.
+                    // Dropped: same as DropNewest — writer already handled metrics/accounting.
+                    TryWriteOutcome::Written | TryWriteOutcome::Dropped => {}
                 }
             }
         }
