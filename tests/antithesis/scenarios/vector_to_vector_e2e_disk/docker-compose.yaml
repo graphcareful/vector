@@ -33,11 +33,12 @@ services:
       # DEBUG: trace the harness `id` at each source ingress (head http_server, tail vector)
       # to localize the hop where an acked-but-undelivered id is dropped.
       VECTOR_ANTITHESIS_ID_TRACE: "1"
-      # Shrink head's disk-buffer data file from the 128MiB default so files fill
-      # and rotate constantly, but floor it to hold the largest payload class:
-      # 768KiB raw is ~1.5MiB once hex-encoded, and a record cannot span data
-      # files. 2MiB leaves headroom for record framing.
-      VECTOR_DISK_V2_MAX_DATA_FILE_SIZE: "2097152"
+      # DIAGNOSTIC (roll-boundary isolation): normally shrunk to 2MiB to force
+      # constant file rotation. Raised to 64MiB so a data file never rolls for
+      # this workload, to test whether the residual acked-loss is the file-roll
+      # boundary (a large trailing record stranded, unread, in the freshly
+      # rolled data file). Pair with max_size >= 2x this in head.yaml.
+      VECTOR_DISK_V2_MAX_DATA_FILE_SIZE: "67108864"
     volumes: ["v2v-buffer-head:/var/lib/vector"]
     healthcheck: *node-health
 
@@ -60,9 +61,9 @@ services:
       # DEBUG: trace the harness `id` at each source ingress (head http_server, tail vector)
       # to localize the hop where an acked-but-undelivered id is dropped.
       VECTOR_ANTITHESIS_ID_TRACE: "1"
-      # Same as head: shrunk for constant rotation, floored at 2MiB to hold the
-      # largest payload class (768KiB raw, ~1.5MiB hex-encoded).
-      VECTOR_DISK_V2_MAX_DATA_FILE_SIZE: "2097152"
+      # DIAGNOSTIC (roll-boundary isolation): raised from 2MiB to 64MiB so files
+      # never roll for this workload. See head's note. Pair with max_size in tail.yaml.
+      VECTOR_DISK_V2_MAX_DATA_FILE_SIZE: "67108864"
     volumes: ["v2v-buffer-tail:/var/lib/vector"]
     healthcheck: *node-health
 
