@@ -282,6 +282,11 @@ async fn handle_request(
         Ok(mut events) => {
             let receiver = BatchNotifier::maybe_apply_to(acknowledgements, &mut events);
 
+            // DEBUG (Antithesis id-trace): record every id received at this HTTP ingress, so an
+            // acked-but-undelivered id can be localized to a hop. Inert unless
+            // VECTOR_ANTITHESIS_ID_TRACE.
+            crate::sources::util::antithesis_trace_event_ids("http-source-ingress", &events);
+
             let count = events.len();
             out.send_batch(events)
                 .map_err(|_| {

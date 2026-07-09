@@ -67,6 +67,10 @@ impl proto::Service for Service {
             }
         }
 
+        // DEBUG (Antithesis id-trace): record every id this node received from its upstream, so an
+        // acked-but-undelivered id can be localized to a hop. Inert unless VECTOR_ANTITHESIS_ID_TRACE.
+        crate::sources::util::antithesis_trace_event_ids("vector-source-ingress", &events);
+
         let count = events.len();
         let byte_size = events.estimated_json_encoded_size_of();
         let events_received = register!(EventsReceived);
