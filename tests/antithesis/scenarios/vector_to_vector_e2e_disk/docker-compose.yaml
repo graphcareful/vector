@@ -23,13 +23,12 @@ services:
     entrypoint: ["/usr/bin/vector", "--config", "/etc/vector/head.yaml"]
     environment:
       NO_COLOR: "1"
-      # Debug logging so runs capture the sink/buffer delivery path for triage. Kept at `debug`
-      # (not `trace`): the per-record trace volume from vector_stream/vector_buffers under a crash
-      # storm is large enough that Antithesis can drop logs, which would take the info-level
-      # id-trace and the WARN-level buffer signals down with it. Debug still retains everything
-      # triage relies on -- the id-trace (info), gap/bad-read WARNs, and the buffer-size recompute
-      # and data-file delete lines (debug).
-      VECTOR_LOG: "debug"
+      # Targeted logging: `info` globally to keep log volume low enough that Antithesis does not
+      # drop lines (the per-record vector_stream/hyper/h2/tower trace+debug volume under a crash
+      # storm is what risks dropped logs), while keeping disk_v2 at `debug` for the buffer-size
+      # recompute and data-file delete/roll lines triage relies on. The id-trace and the
+      # dropped-finalizer log are info-level and so are retained.
+      VECTOR_LOG: "info,vector_buffers::variants::disk_v2=debug"
       # DEBUG: trace the harness `id` at each source ingress (head http_server, tail vector)
       # to localize the hop where an acked-but-undelivered id is dropped.
       VECTOR_ANTITHESIS_ID_TRACE: "1"
@@ -51,13 +50,10 @@ services:
     entrypoint: ["/usr/bin/vector", "--config", "/etc/vector/tail.yaml"]
     environment:
       NO_COLOR: "1"
-      # Debug logging so runs capture the sink/buffer delivery path for triage. Kept at `debug`
-      # (not `trace`): the per-record trace volume from vector_stream/vector_buffers under a crash
-      # storm is large enough that Antithesis can drop logs, which would take the info-level
-      # id-trace and the WARN-level buffer signals down with it. Debug still retains everything
-      # triage relies on -- the id-trace (info), gap/bad-read WARNs, and the buffer-size recompute
-      # and data-file delete lines (debug).
-      VECTOR_LOG: "debug"
+      # Targeted logging: `info` globally to keep log volume low enough that Antithesis does not
+      # drop lines, while keeping disk_v2 at `debug` for the buffer recompute/delete/roll lines
+      # triage relies on. The id-trace and dropped-finalizer log are info-level and so are retained.
+      VECTOR_LOG: "info,vector_buffers::variants::disk_v2=debug"
       # DEBUG: trace the harness `id` at each source ingress (head http_server, tail vector)
       # to localize the hop where an acked-but-undelivered id is dropped.
       VECTOR_ANTITHESIS_ID_TRACE: "1"
