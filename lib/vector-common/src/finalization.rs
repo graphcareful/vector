@@ -147,8 +147,33 @@ impl EventFinalizer {
             .status
             .fetch_update(|_| Some(EventStatus::Recorded))
             .unwrap_or_else(|_| unreachable!());
+
+        // DEBUG (Antithesis, VECTOR_ANTITHESIS_ID_TRACE): a finalizer reaching finalization still in
+        // its initial `Dropped` state was never acknowledged by any sink. Because `Dropped` is a
+        // no-op on the batch status (see `BatchStatus::update`), the batch still reports `Delivered`
+        // -- silently promoting the source/disk-buffer read-head forward as if the event were
+        // delivered when it never was. That is an at-least-once violation via a dropped,
+        // unacknowledged finalizer; log it so the promotion is observable. Inert (one cached atomic
+        // load) unless the variable is set.
+        if status == EventStatus::Dropped && antithesis_finalizer_trace_enabled() {
+            error!(
+                target: "antithesis_id_trace",
+                "EventFinalizer dropped without acknowledgement; read-head promoted as delivered \
+                 without confirmed delivery"
+            );
+        }
+
         self.batch.update_status(status);
     }
+}
+
+/// DEBUG-ONLY gate for the Antithesis dropped-finalizer trace in [`EventFinalizer::update_batch`].
+/// Reads `VECTOR_ANTITHESIS_ID_TRACE` once and caches it, so the check is a single atomic load and
+/// inert on normal builds/runs where the variable is unset.
+fn antithesis_finalizer_trace_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("VECTOR_ANTITHESIS_ID_TRACE").is_ok());
+    *ENABLED
 }
 
 impl Drop for EventFinalizer {
