@@ -23,13 +23,13 @@ services:
     entrypoint: ["/usr/bin/vector", "--config", "/etc/vector/head.yaml"]
     environment:
       NO_COLOR: "1"
-      # Debug logging so runs capture the sink/buffer delivery path for triage. The two most
-      # useful signals -- the Driver submitting/completing a service request, and the disk buffer's
-      # size/acknowledgement progress -- are emitted at `trace`, so those crates are raised to
-      # trace while the rest stays at debug. Together with the WARN-level retry/timeout logs this
-      # lets a single record be traced end-to-end (submitted -> retried/timed out -> delivered ->
-      # buffer drained).
-      VECTOR_LOG: "debug,vector_stream=trace,vector_buffers=trace"
+      # Debug logging so runs capture the sink/buffer delivery path for triage. Kept at `debug`
+      # (not `trace`): the per-record trace volume from vector_stream/vector_buffers under a crash
+      # storm is large enough that Antithesis can drop logs, which would take the info-level
+      # id-trace and the WARN-level buffer signals down with it. Debug still retains everything
+      # triage relies on -- the id-trace (info), gap/bad-read WARNs, and the buffer-size recompute
+      # and data-file delete lines (debug).
+      VECTOR_LOG: "debug"
       # DEBUG: trace the harness `id` at each source ingress (head http_server, tail vector)
       # to localize the hop where an acked-but-undelivered id is dropped.
       VECTOR_ANTITHESIS_ID_TRACE: "1"
@@ -50,13 +50,13 @@ services:
     entrypoint: ["/usr/bin/vector", "--config", "/etc/vector/tail.yaml"]
     environment:
       NO_COLOR: "1"
-      # Debug logging so runs capture the sink/buffer delivery path for triage. The two most
-      # useful signals -- the Driver submitting/completing a service request, and the disk buffer's
-      # size/acknowledgement progress -- are emitted at `trace`, so those crates are raised to
-      # trace while the rest stays at debug. Together with the WARN-level retry/timeout logs this
-      # lets a single record be traced end-to-end (submitted -> retried/timed out -> delivered ->
-      # buffer drained).
-      VECTOR_LOG: "debug,vector_stream=trace,vector_buffers=trace"
+      # Debug logging so runs capture the sink/buffer delivery path for triage. Kept at `debug`
+      # (not `trace`): the per-record trace volume from vector_stream/vector_buffers under a crash
+      # storm is large enough that Antithesis can drop logs, which would take the info-level
+      # id-trace and the WARN-level buffer signals down with it. Debug still retains everything
+      # triage relies on -- the id-trace (info), gap/bad-read WARNs, and the buffer-size recompute
+      # and data-file delete lines (debug).
+      VECTOR_LOG: "debug"
       # DEBUG: trace the harness `id` at each source ingress (head http_server, tail vector)
       # to localize the hop where an acked-but-undelivered id is dropped.
       VECTOR_ANTITHESIS_ID_TRACE: "1"
