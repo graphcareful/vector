@@ -59,7 +59,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
       --config 'profile.release.debug = true' \
       --config "target.x86_64-unknown-linux-gnu.rustflags = ${SANCOV_RUSTFLAGS}" \
     && D=target/x86_64-unknown-linux-gnu/release \
-    && cp "$D/oracle" "$D/parallel_disk_progress_produce" "$D/eventually_disk_progress_check" /usr/local/bin/ \
+    && cp "$D/oracle" "$D/parallel_driver_disk_progress_produce" "$D/eventually_disk_progress_check" /usr/local/bin/ \
     && echo "validating instrumentation symbols..." \
     && nm /usr/local/bin/oracle | grep -q __sanitizer_cov_trace_pc_guard \
     && nm /usr/local/bin/oracle | grep -q antithesis_load_libvoidstar \
@@ -87,14 +87,14 @@ FROM debian:stable-slim AS workload
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=workload-build /usr/local/bin/oracle /usr/bin/oracle
-# parallel_ prefix: Antithesis runs this many times concurrently during fault injection.
-COPY --from=workload-build /usr/local/bin/parallel_disk_progress_produce /opt/antithesis/test/v1/diskprogress/parallel_disk_progress_produce
+# parallel_driver_ prefix: Antithesis runs this many times concurrently during fault injection.
+COPY --from=workload-build /usr/local/bin/parallel_driver_disk_progress_produce /opt/antithesis/test/v1/diskprogress/parallel_driver_disk_progress_produce
 # eventually_ prefix: Antithesis runs this once after fault injection stops.
 COPY --from=workload-build /usr/local/bin/eventually_disk_progress_check /opt/antithesis/test/v1/diskprogress/eventually_disk_progress_check
 # Symbolize all instrumented binaries so crashes resolve against /symbols.
 RUN mkdir -p /symbols \
  && ln -s /usr/bin/oracle /symbols/oracle \
- && ln -s /opt/antithesis/test/v1/diskprogress/parallel_disk_progress_produce /symbols/parallel_disk_progress_produce \
+ && ln -s /opt/antithesis/test/v1/diskprogress/parallel_driver_disk_progress_produce /symbols/parallel_driver_disk_progress_produce \
  && ln -s /opt/antithesis/test/v1/diskprogress/eventually_disk_progress_check /symbols/eventually_disk_progress_check
 ENV NO_COLOR=1
 ENTRYPOINT ["/usr/bin/oracle"]
