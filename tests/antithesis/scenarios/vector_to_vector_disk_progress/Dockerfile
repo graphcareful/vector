@@ -24,7 +24,7 @@ ARG SANCOV_RUSTFLAGS
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --no-default-features \
-      --features "sources-http_server,sinks-http,sources-internal_metrics,sinks-prometheus,sources-demo_logs,sources-vector,sinks-vector,antithesis-scenario-disk" \
+      --features "sources-http_server,sinks-http,sources-internal_metrics,sinks-prometheus,sources-demo_logs,sources-vector,sinks-vector,antithesis-scenario-disk-progress" \
       --bin vector \
       --config 'build.target = "x86_64-unknown-linux-gnu"' \
       --config 'profile.release.debug = true' \
