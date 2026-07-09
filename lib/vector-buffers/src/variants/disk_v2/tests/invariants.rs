@@ -170,6 +170,93 @@ async fn idle_flush_publishes_trailing_record_to_reader() {
 }
 
 #[tokio::test]
+async fn read_record_dropped_without_ack_is_retained_for_redelivery() {
+    // A record read from the buffer and handed downstream, whose finalizer is then dropped WITHOUT
+    // an explicit acknowledgement -- the sink task torn down with the delivery in flight during a
+    // graceful shutdown -- must NOT advance the durable read position. Otherwise the record is
+    // skipped on reopen and permanently lost even though it was never delivered. (A hard kill runs
+    // no Drop at all, so nothing fires and the frontier is likewise never advanced -- this makes
+    // the graceful path match that same at-least-once outcome.)
+    //
+    // The read path uses a pessimistic notifier so a dropped-without-ack finalizer finalizes
+    // `Errored` (not the optimistic `Delivered`), and spawn_finalizer halts the ack frontier on the
+    // first `Errored`, retaining that record and everything after it for redelivery on reopen.
+    //
+    // Two records so we can drive one more `next()` to consume pending acks: with the bug both are
+    // finalized `Delivered` (the drop is a no-op) and consumed, advancing the frontier past both so
+    // the reopened buffer is empty; with the fix the frontier halts at the first (dropped) record
+    // and both are retained.
+    let _a = install_tracing_helpers();
+
+    let fut = with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            {
+                let (mut writer, mut reader, ledger) =
+                    create_default_buffer_v2::<_, SizedRecord>(data_dir.clone()).await;
+
+                for _ in 0..2 {
+                    let bytes_written = writer
+                        .write_record(SizedRecord::new(64))
+                        .await
+                        .expect("write should not fail");
+                    assert_enough_bytes_written!(bytes_written, SizedRecord, 64);
+                }
+                writer.flush().await.expect("flush should not fail");
+
+                // Read the first record and DROP it without acknowledging -- the sink torn down
+                // mid-delivery on a graceful shutdown.
+                let first = read_next_some(&mut reader).await;
+                assert_eq!(first, SizedRecord::new(64));
+                drop(first);
+
+                // Read and genuinely acknowledge the second record.
+                let second = read_next_some(&mut reader).await;
+                assert_eq!(second, SizedRecord::new(64));
+                acknowledge(second).await;
+
+                // Let the background finalizer task observe both finalizations (the first `Errored`,
+                // which halts the frontier, then the second `Delivered`, which is retained behind
+                // it).
+                tokio::time::sleep(DEFAULT_FLUSH_INTERVAL * 2).await;
+
+                // Drive one more `next()` poll so pending acknowledgements are consumed. It parks on
+                // the (nonexistent) third record after handling acks.
+                {
+                    let mut next = spawn(reader.next());
+                    assert_pending!(next.poll());
+                }
+
+                // The frontier must not have advanced past the dropped record: both records remain.
+                assert_eq!(
+                    ledger.get_total_records(),
+                    2,
+                    "an unacknowledged read must not advance the durable read position"
+                );
+
+                ledger.flush().expect("flush should not fail");
+                drop(writer);
+                drop(reader);
+                drop(ledger);
+            }
+
+            // Reopen: the retained record must be re-delivered rather than skipped.
+            let (_writer, mut reader, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+            assert_eq!(ledger.get_total_records(), 2);
+            let redelivered = await_timeout!(reader.next(), 5)
+                .expect("read should not fail")
+                .expect("the retained record must be re-delivered after reopen");
+            assert_eq!(redelivered, SizedRecord::new(64));
+        }
+    });
+
+    let parent = trace_span!("read_record_dropped_without_ack_is_retained_for_redelivery");
+    fut.instrument(parent.or_current()).await;
+}
+
+#[tokio::test]
 async fn last_record_is_valid_during_load_when_buffer_correctly_flushed_and_stopped() {
     let assertion_registry = install_tracing_helpers();
 
