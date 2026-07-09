@@ -195,6 +195,12 @@ impl AddBatchNotifier for UndecodableRecord {
     }
 }
 
+impl Finalizable for UndecodableRecord {
+    fn take_finalizers(&mut self) -> EventFinalizers {
+        EventFinalizers::DEFAULT
+    }
+}
+
 impl ByteSizeOf for UndecodableRecord {
     fn allocated_bytes(&self) -> usize {
         0

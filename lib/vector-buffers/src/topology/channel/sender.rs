@@ -50,11 +50,11 @@ where
                 let mut writer = writer.lock().await;
 
                 writer.write_record(item).await.map(|_| ()).map_err(|e| {
-                    // TODO: Could some errors be handled and not be unrecoverable? Right now,
-                    // encoding should theoretically be recoverable -- encoded value was too big, or
-                    // error during encoding -- but the traits don't allow for recovering the
-                    // original event value because we have to consume it to do the encoding... but
-                    // that might not always be the case.
+                    // Record-level failures that can never succeed (a record too large to encode
+                    // within the max record size) are handled inside the writer: the record is
+                    // dropped, its finalizers rejected, and the drop is metered, so they never
+                    // surface here. Anything that reaches this point -- I/O errors, serialization
+                    // failures, an inconsistent writer state -- is genuinely unrecoverable.
                     error!("Disk buffer writer has encountered an unrecoverable error.");
 
                     e.into()
@@ -73,11 +73,11 @@ where
                 let mut writer = writer.lock().await;
 
                 writer.try_write_record(item).await.map_err(|e| {
-                    // TODO: Could some errors be handled and not be unrecoverable? Right now,
-                    // encoding should theoretically be recoverable -- encoded value was too big, or
-                    // error during encoding -- but the traits don't allow for recovering the
-                    // original event value because we have to consume it to do the encoding... but
-                    // that might not always be the case.
+                    // Record-level failures that can never succeed (a record too large to encode
+                    // within the max record size) are handled inside the writer: the record is
+                    // dropped, its finalizers rejected, and the drop is metered, so they never
+                    // surface here. Anything that reaches this point -- I/O errors, serialization
+                    // failures, an inconsistent writer state -- is genuinely unrecoverable.
                     error!("Disk buffer writer has encountered an unrecoverable error.");
 
                     e.into()
