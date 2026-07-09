@@ -825,30 +825,55 @@ where
     pub(super) fn spawn_finalizer(self: Arc<Self>) -> OrderedFinalizer<u64> {
         let (finalizer, mut stream) = OrderedFinalizer::new(None);
         vector_common::spawn_in_current_span(async move {
+            // Acknowledgements are count-based and strictly ordered, so the frontier advances
+            // contiguously: we cannot retain one record's slot while still advancing over later
+            // records (their counts would be misattributed to the retained record's marker).
+            // Therefore, on the first `Errored` we HALT -- stop advancing the frontier entirely --
+            // so that record and every record after it are re-read and re-delivered when the buffer
+            // is reopened, rather than being skipped (a lost, previously acknowledged event).
+            //
+            // This is safe against wedging a healthy buffer: a read-side `Errored` only arises when
+            // a record's finalizer is dropped without acknowledgement (the sink Driver itself only
+            // ever finalizes `Delivered` on success or `Rejected` on a permanent give-up), which
+            // happens when the sink task is torn down with a delivery in flight -- always followed
+            // by a reopen. A permanent `Rejected`, in contrast, can never be delivered, so it is
+            // still dropped (advanced past) and recorded, rather than wedging redelivery forever.
+            let mut halted = false;
             while let Some((status, amount)) = stream.next().await {
-                // We advance the acknowledgement frontier for every finalized record so the
-                // count-based ack accounting stays aligned with the records the reader has read,
-                // and so the buffer keeps making progress rather than wedging on a single record.
-                //
-                // Retriable failures never reach this point: the sink retries them indefinitely
-                // (its retry policy only gives up on a permanent/non-retriable failure) and only
-                // finalizes a record on success (`Delivered`) or a permanent failure. So a
-                // non-`Delivered` status means the sink permanently gave up on these events. They
-                // are being dropped from a durable buffer that already acknowledged them to its
-                // upstream source, so record that explicitly -- a metric and a log -- rather than
-                // letting it be a silent at-least-once violation. The byte size is not known here,
-                // so it is reported as zero (matching how skipped records are accounted).
-                if status != BatchStatus::Delivered {
-                    warn!(
-                        message = "Dropping events from the disk buffer after a non-retriable \
-                                   downstream delivery failure; the buffer had already acknowledged \
-                                   them to its upstream source.",
-                        event_count = amount,
-                        delivery_status = ?status,
-                        internal_log_rate_limit = true,
-                    );
-                    self.usage_handle
-                        .increment_dropped_event_count_and_byte_size(amount, 0, false);
+                if halted {
+                    // The frontier is frozen pending a reopen; drain the stream but retain
+                    // everything after the first failure for redelivery.
+                    continue;
+                }
+
+                match status {
+                    BatchStatus::Delivered => {}
+                    BatchStatus::Errored => {
+                        warn!(
+                            message = "Retaining disk buffer records for redelivery: a downstream \
+                                       delivery was dropped without acknowledgement. The read \
+                                       position will not advance past it, so it is re-delivered \
+                                       when the buffer is reopened.",
+                            event_count = amount,
+                            internal_log_rate_limit = true,
+                        );
+                        halted = true;
+                        continue;
+                    }
+                    BatchStatus::Rejected => {
+                        // A permanent rejection can never be delivered; advancing past it (rather
+                        // than retaining) avoids wedging redelivery forever. Record the drop so the
+                        // at-least-once violation is observable rather than silent.
+                        warn!(
+                            message = "Dropping events from the disk buffer after a permanent \
+                                       downstream rejection; the buffer had already acknowledged \
+                                       them to its upstream source.",
+                            event_count = amount,
+                            internal_log_rate_limit = true,
+                        );
+                        self.usage_handle
+                            .increment_dropped_event_count_and_byte_size(amount, 0, false);
+                    }
                 }
 
                 self.increment_pending_acks(amount);

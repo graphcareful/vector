@@ -2,6 +2,7 @@ use std::{collections::VecDeque, io, mem, task::Poll};
 
 use futures::{Future, FutureExt, future::BoxFuture};
 use tokio_test::task::{Spawn, spawn};
+use vector_common::finalization::{EventStatus, Finalizable};
 
 use super::{
     action::Action,
@@ -285,7 +286,15 @@ impl ActionSequencer {
                     Some(a)
                 }
                 Action::AcknowledgeRead => {
-                    drop(self.unacked_events.pop_front().expect("FIXME"));
+                    // Acknowledge as delivered. This previously relied on dropping the event, whose
+                    // finalizer defaulted to `Delivered`; the reader now attaches a pessimistic
+                    // notifier where a dropped-without-ack finalizer means a failed delivery, so a
+                    // successful acknowledgement must set `Delivered` explicitly.
+                    let mut record = self.unacked_events.pop_front().expect("FIXME");
+                    record
+                        .take_finalizers()
+                        .update_status(EventStatus::Delivered);
+                    drop(record);
                     Some(Action::AcknowledgeRead)
                 }
             }
