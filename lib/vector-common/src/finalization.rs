@@ -458,7 +458,7 @@ pub trait Finalizable {
 
     /// Merges grouped finalizers back into this object.
     ///
-    /// The default implementation flattens all groups before calling [`merge_finalizers`]. Container
+    /// The default implementation flattens all groups before calling [`Self::merge_finalizers`]. Container
     /// types that can later split into independently-finalized events should override this method
     /// and reattach each group to the corresponding event.
     fn merge_finalizer_groups(&mut self, finalizers: EventFinalizerGroups) {
