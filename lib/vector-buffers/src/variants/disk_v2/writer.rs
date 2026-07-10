@@ -142,26 +142,19 @@ where
     /// Whether this error means the record itself can never be written, no matter how many times
     /// it is retried — as opposed to a transient, environmental, or buffer-wide failure.
     ///
-    /// This covers two categories:
-    ///
-    /// - **Size violations**: the record exceeds the maximum record size (`RecordTooLarge`), or the
-    ///   encoder bailed the moment it overflowed the size-limited buffer (`FailedToEncode`).
-    ///
-    /// - **Permanent serialization failures**: the rkyv wrapper serialization failed
-    ///   (`FailedToSerialize`), e.g. due to insufficient scratch space. Like size violations,
-    ///   retrying would produce the same error for the same record.
+    /// This covers size violations: the record exceeds the maximum record size
+    /// (`RecordTooLarge`), or the encoder bailed the moment it overflowed the size-limited buffer
+    /// (`FailedToEncode`). Both are permanent regardless of retries.
     ///
     /// These records are dropped (finalizers resolved as `Delivered`) rather than retried forever
-    /// or escalated into a fatal error that tears down the whole buffer/topology. I/O errors and
-    /// writer-internal state errors are explicitly excluded because they are either transient
-    /// (I/O) or writer-level rather than record-level (`InconsistentState`); those reach the
-    /// catch-all arm and propagate as `Errored`.
+    /// or escalated into a fatal error that tears down the whole buffer/topology. All other errors
+    /// — I/O errors, OOM scratch-space failures (`FailedToSerialize`), and writer-internal state
+    /// errors (`InconsistentState`) — are explicitly excluded: they are either transient or
+    /// writer-level faults, so they propagate as fatal errors.
     fn is_unwritable_record(&self) -> bool {
         matches!(
             self,
-            WriterError::RecordTooLarge { .. }
-                | WriterError::FailedToEncode { .. }
-                | WriterError::FailedToSerialize { .. }
+            WriterError::RecordTooLarge { .. } | WriterError::FailedToEncode { .. }
         )
     }
 }
@@ -593,9 +586,9 @@ where
 
         // Sanity check before we do our length math.
         if serialized_len <= 8 || self.ser_buf.len() != serialized_len {
-            return Err(WriterError::FailedToSerialize {
+            return Err(WriterError::InconsistentState {
                 reason: format!(
-                    "serializer position invalid for context: pos={} len={}",
+                    "serializer position invalid after serializing record: pos={} len={}",
                     serialized_len,
                     self.ser_buf.len(),
                 ),
