@@ -111,6 +111,33 @@ where
     }
 }
 
+enum UsageAccounting {
+    Accepted,
+    DroppedNewest,
+    NotAccepted,
+}
+
+impl UsageAccounting {
+    fn record(self, instrumentation: &BufferUsageHandle, item_count: usize, item_size: usize) {
+        match self {
+            Self::Accepted => instrumentation
+                .increment_received_event_count_and_byte_size(item_count as u64, item_size as u64),
+            Self::DroppedNewest => {
+                instrumentation.increment_received_event_count_and_byte_size(
+                    item_count as u64,
+                    item_size as u64,
+                );
+                instrumentation.increment_dropped_event_count_and_byte_size(
+                    item_count as u64,
+                    item_size as u64,
+                    true,
+                );
+            }
+            Self::NotAccepted => {}
+        }
+    }
+}
+
 /// A buffer sender.
 ///
 /// The sender handles sending events into the buffer, as well as the behavior around handling
@@ -223,53 +250,34 @@ impl<T: Bufferable> BufferSender<T> {
             .as_ref()
             .map(|_| (item.event_count(), item.size_of()));
 
-        let mut was_dropped = false;
+        let accounting = match self.when_full {
+            WhenFull::Block => {
+                self.base.send(item).await?;
+                UsageAccounting::Accepted
+            }
+            WhenFull::DropNewest => match self.base.try_send(item).await? {
+                TryWriteOutcome::Written => UsageAccounting::Accepted,
+                TryWriteOutcome::Full(_) => UsageAccounting::DroppedNewest,
+                TryWriteOutcome::Dropped => UsageAccounting::NotAccepted,
+            },
+            WhenFull::Overflow => match self.base.try_send(item).await? {
+                TryWriteOutcome::Written => UsageAccounting::Accepted,
+                TryWriteOutcome::Full(item) => {
+                    self.overflow
+                        .as_mut()
+                        .unwrap_or_else(|| unreachable!("overflow must exist"))
+                        .send(item, send_reference)
+                        .await?;
+                    UsageAccounting::NotAccepted
+                }
+                TryWriteOutcome::Dropped => UsageAccounting::NotAccepted,
+            },
+        };
 
         if let Some(instrumentation) = self.usage_instrumentation.as_ref()
             && let Some((item_count, item_size)) = item_sizing
         {
-            instrumentation
-                .increment_received_event_count_and_byte_size(item_count as u64, item_size as u64);
-        }
-        match self.when_full {
-            WhenFull::Block => self.base.send(item).await?,
-            WhenFull::DropNewest => {
-                match self.base.try_send(item).await? {
-                    TryWriteOutcome::Full(_) => {
-                        was_dropped = true;
-                    }
-                    // Written: record is in the buffer.
-                    // Dropped: the writer already metered and balanced this via
-                    // track_unwritable_dropped_record / pre_entry_dropped. Setting was_dropped
-                    // here would emit a second drop metric and double-adjust total_left.
-                    TryWriteOutcome::Written | TryWriteOutcome::Dropped => {}
-                }
-            }
-            WhenFull::Overflow => {
-                match self.base.try_send(item).await? {
-                    TryWriteOutcome::Full(item) => {
-                        self.overflow
-                            .as_mut()
-                            .unwrap_or_else(|| unreachable!("overflow must exist"))
-                            .send(item, send_reference)
-                            .await?;
-                    }
-                    // Written: record is in the buffer.
-                    // Dropped: same as DropNewest — writer already handled metrics/accounting.
-                    TryWriteOutcome::Written | TryWriteOutcome::Dropped => {}
-                }
-            }
-        }
-
-        if let Some(instrumentation) = self.usage_instrumentation.as_ref()
-            && let Some((item_count, item_size)) = item_sizing
-            && was_dropped
-        {
-            instrumentation.increment_dropped_event_count_and_byte_size(
-                item_count as u64,
-                item_size as u64,
-                true,
-            );
+            accounting.record(instrumentation, item_count, item_size);
         }
         if let Some(send_duration) = self.send_duration.as_ref()
             && let Some(send_reference) = send_reference
