@@ -36,6 +36,17 @@ impl AsyncFile for DuplexStream {
         Ok(Metadata { len: 0 })
     }
 
+    async fn truncate(&self, size: u64) -> io::Result<()> {
+        if size == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot extend a file through the truncation API",
+            ))
+        }
+    }
+
     async fn sync_all(&self) -> io::Result<()> {
         Ok(())
     }
@@ -43,7 +54,20 @@ impl AsyncFile for DuplexStream {
 
 impl AsyncFile for Cursor<Vec<u8>> {
     async fn metadata(&self) -> io::Result<Metadata> {
-        Ok(Metadata { len: 0 })
+        Ok(Metadata {
+            len: u64::try_from(self.get_ref().len()).expect("cursor length should fit in u64"),
+        })
+    }
+
+    async fn truncate(&self, size: u64) -> io::Result<()> {
+        if size > self.metadata().await?.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot extend a file through the truncation API",
+            ));
+        }
+
+        Ok(())
     }
 
     async fn sync_all(&self) -> io::Result<()> {
@@ -426,4 +450,38 @@ pub(crate) async fn set_file_length<P: AsRef<Path>>(
     drop(file);
 
     Ok(())
+}
+
+#[tokio::test]
+async fn async_file_truncate_rejects_extension() {
+    crate::test::with_temp_dir(|dir| {
+        let path = dir.join("truncate-test");
+
+        async move {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(path)
+                .await
+                .expect("file should open");
+            file.write_all(b"test").await.expect("write should succeed");
+            file.flush().await.expect("flush should succeed");
+
+            file.truncate(2).await.expect("truncation should succeed");
+            assert_eq!(
+                file.metadata().await.expect("metadata should load").len(),
+                2
+            );
+
+            let error = file.truncate(3).await.expect_err("extension should fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                file.metadata().await.expect("metadata should load").len(),
+                2
+            );
+        }
+    })
+    .await;
 }

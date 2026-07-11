@@ -182,6 +182,7 @@ use snafu::{ResultExt, Snafu};
 use vector_common::finalization::Finalizable;
 
 mod backed_archive;
+mod checkpoint_recovery;
 pub(crate) mod common;
 mod io;
 mod ledger;

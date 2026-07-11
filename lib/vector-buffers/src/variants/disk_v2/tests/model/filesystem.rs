@@ -216,6 +216,26 @@ impl AsyncFile for TestFile {
         Ok(Metadata { len: len as u64 })
     }
 
+    async fn truncate(&self, size: u64) -> io::Result<()> {
+        if !self.is_writable {
+            return Err(io_err_permission_denied());
+        }
+
+        let size = usize::try_from(size)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file size out of range"))?;
+        let mut inner = self.inner.lock().expect("poisoned");
+        let buf = inner.buf.as_mut().expect("file buf consumed");
+        if size > buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot extend a file through the truncation API",
+            ));
+        }
+        buf.truncate(size);
+
+        Ok(())
+    }
+
     async fn sync_all(&self) -> io::Result<()> {
         Ok(())
     }

@@ -35,7 +35,7 @@ use crate::{
     encoding::{AsMetadata, Encodable},
     variants::disk_v2::{
         io::AsyncFile,
-        reader::decode_record_payload,
+        reader::{RecordReader, decode_record_payload},
         record::{RECORD_HEADER_LEN, try_as_record_archive},
     },
 };
@@ -509,6 +509,23 @@ where
         }
     }
 
+    async fn truncate(&mut self, size: u64) -> io::Result<()> {
+        if size > self.current_data_file_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot extend a file through the truncation API",
+            ));
+        }
+
+        self.writer.flush().await?;
+        let writer = self.writer.get_mut();
+        writer.truncate(size).await?;
+        writer.sync_all().await?;
+        self.current_data_file_size = size;
+
+        Ok(())
+    }
+
     /// Gets a reference to the underlying writer.
     #[cfg(test)]
     pub fn get_ref(&self) -> &W {
@@ -926,6 +943,90 @@ where
         should_skip
     }
 
+    async fn truncate_current_data_file_to_checkpoint(&mut self) -> Result<(), WriterError<T>> {
+        let checkpoint_next_record_id = self.ledger.state().get_next_writer_record_id();
+        let data_file_path = self.ledger.get_current_writer_data_file_path();
+        let data_file = self
+            .ledger
+            .filesystem()
+            .open_file_readable(&data_file_path)
+            .await
+            .context(IoSnafu)?;
+        let mut reader = RecordReader::new(data_file);
+        let mut record_start_offset = 0;
+
+        loop {
+            let token = match reader.try_next_record(true).await {
+                Ok(Some(token)) => token,
+                Ok(None) => break,
+                Err(e) if e.is_bad_read() => {
+                    warn!(
+                        data_file_path = data_file_path.to_string_lossy().as_ref(),
+                        truncate_at = record_start_offset,
+                        error = %e,
+                        "Truncating torn writer data file tail at last checkpointed record boundary."
+                    );
+                    break;
+                }
+                Err(e) => {
+                    return Err(WriterError::FailedToValidate {
+                        reason: e.to_string(),
+                    });
+                }
+            };
+
+            let record_id = token.record_id();
+            let record_bytes = token.record_bytes() as u64;
+            if record_id >= checkpoint_next_record_id {
+                debug!(
+                    data_file_path = data_file_path.to_string_lossy().as_ref(),
+                    checkpoint_next_record_id,
+                    record_id,
+                    truncate_at = record_start_offset,
+                    "Truncating writer data file tail beyond durable checkpoint."
+                );
+                break;
+            }
+
+            let record: T =
+                reader
+                    .read_record(token)
+                    .map_err(|e| WriterError::FailedToValidate {
+                        reason: e.to_string(),
+                    })?;
+            let record_events =
+                u64::try_from(record.event_count()).expect("event count should never exceed u64");
+            let record_next = record_id.wrapping_add(record_events);
+            if record_next > checkpoint_next_record_id {
+                warn!(
+                    data_file_path = data_file_path.to_string_lossy().as_ref(),
+                    checkpoint_next_record_id,
+                    record_id,
+                    record_events,
+                    truncate_at = record_start_offset,
+                    "Truncating writer data file at record that crosses durable checkpoint."
+                );
+                break;
+            }
+
+            record_start_offset += record_bytes;
+        }
+
+        self.truncate_current_data_file(record_start_offset).await?;
+        Ok(())
+    }
+
+    async fn truncate_current_data_file(&mut self, size: u64) -> io::Result<()> {
+        let writer = self
+            .writer
+            .as_mut()
+            .expect("writer should exist after `ensure_ready_for_write`");
+        writer.truncate(size).await?;
+        self.data_file_size = size;
+
+        Ok(())
+    }
+
     /// Validates that the last write in the current writer data file matches the ledger.
     ///
     /// # Errors
@@ -1022,25 +1123,18 @@ where
                         true
                     }
                     Ordering::Less => {
-                        // We're actually _ahead_ of the ledger, which is to say we wrote a valid
-                        // record to the data file, but never incremented our "writer next record
-                        // ID" field.  Given that record IDs are monotonic, it's safe to forward
-                        // ourselves to make the "writer next record ID" in the ledger match the
-                        // reality of the data file.  If there were somehow gaps in the data file,
-                        // the reader will detect it, and this way, we avoid duplicate record IDs.
+                        // The data file is ahead of the durable writer checkpoint. Treat the
+                        // checkpoint as authoritative: truncate any post-checkpoint tail instead
+                        // of fast-forwarding the ledger to match bytes that may not have been
+                        // durably committed before the crash.
                         debug!(
                             ledger_next,
                             last_record_id,
                             record_events,
-                            new_ledger_next = record_next,
-                            "Ledger desynchronized from data files. Fast forwarding ledger state."
+                            record_next,
+                            "Writer data file is ahead of durable checkpoint."
                         );
-                        let ledger_record_delta = record_next - ledger_next;
-                        let next_record_id = self
-                            .ledger
-                            .state()
-                            .increment_next_writer_record_id(ledger_record_delta);
-                        self.next_record_id = next_record_id;
+                        self.truncate_current_data_file_to_checkpoint().await?;
                         self.unflushed_events = 0;
 
                         false
@@ -1048,29 +1142,29 @@ where
                 }
             }
             // The record payload was corrupted, somehow: we know the checksum failed to match on
-            // both sides, but it could be cosmic radiation that flipped a bit or some process
-            // trampled over the data file... who knows.
-            //
-            // We skip to the next data file to try and start from a clean slate.
+            // both sides, but we do not know whether the damage is limited to the last record or
+            // extends farther back. Treat the durable checkpoint as authoritative and truncate the
+            // current file to the last checkpointed boundary we can validate.
             RecordStatus::Corrupted { .. } => {
                 error!(
                     "Last written record did not match the expected checksum. Corruption likely."
                 );
-                true
+                self.truncate_current_data_file_to_checkpoint().await?;
+                false
             }
             // The record itself was corrupted, somehow: it was sufficiently different that `rkyv`
             // couldn't even validate it, which likely means missing bytes but could also be certain
-            // bytes being invalid for the struct fields they represent.  Like invalid checksums, we
-            // really don't know why it happened, only that it happened.
-            //
-            // We skip to the next data file to try and start from a clean slate.
+            // bytes being invalid for the struct fields they represent. Like invalid checksums,
+            // truncate the current file back to the durable checkpoint instead of rolling forward
+            // onto a new data file.
             RecordStatus::FailedDeserialization(de) => {
                 let reason = de.into_inner();
                 error!(
                     ?reason,
                     "Last written record was unable to be deserialized. Corruption likely."
                 );
-                true
+                self.truncate_current_data_file_to_checkpoint().await?;
+                false
             }
         };
 
