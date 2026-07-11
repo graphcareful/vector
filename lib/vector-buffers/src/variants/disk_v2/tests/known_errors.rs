@@ -39,7 +39,7 @@ impl AsMetadata for u32 {
 }
 
 #[tokio::test]
-async fn reader_throws_error_when_record_length_delimiter_is_zero() {
+async fn startup_truncates_record_length_delimiter_that_is_zero() {
     with_temp_dir(|dir| {
         let data_dir = dir.to_path_buf();
 
@@ -90,15 +90,22 @@ async fn reader_throws_error_when_record_length_delimiter_is_zero() {
             data_file.sync_all().await.expect("sync should not fail");
             drop(data_file);
 
-            // Now reopen the buffer and attempt a read, which should return an error for
-            // deserialization failure, but specifically that the record length was zero.
+            // Now reopen the buffer. Startup recovery treats the durable ledger checkpoint as
+            // authoritative, so the corrupted record is truncated before the reader is handed out.
             let (_, mut reader, _) = create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
-            match reader.next().await {
-                Err(ReaderError::Deserialization { reason }) => {
-                    assert!(reason.ends_with("record length was zero"));
-                }
-                _ => panic!("read_result should be deserialization error"),
-            }
+            let data_file = OpenOptions::new()
+                .read(true)
+                .open(&data_file_path)
+                .await
+                .expect("open should not fail");
+            let metadata = data_file
+                .metadata()
+                .await
+                .expect("metadata should not fail");
+            assert_eq!(0, metadata.len());
+
+            let read_result = reader.next().await.expect("read should not fail");
+            assert_eq!(read_result, None);
         }
     })
     .await;
@@ -203,30 +210,35 @@ async fn reader_throws_error_when_finished_file_has_truncated_record_data() {
             data_file.sync_all().await.expect("sync should not fail");
             drop(data_file);
 
-            // Now reopen the buffer.  We should get a good read, a failed read, and then a final
-            // good read:
-            // - first read is the first record, nothing special
-            // - second read is an error because we detect a partial record write which can't be
-            //   read as a valid record, forcing us to skip to the second data file
-            // - third read is the third record that we successfully wrote to the second data file
+            // Now reopen the buffer. Startup recovery truncates the torn tail of the first data
+            // file to the last valid record boundary, so runtime sees the first valid record and
+            // then the valid record in the next data file without surfacing the startup corruption
+            // as a reader error.
             let (mut writer, mut reader, ledger) =
                 create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
             writer.close();
             assert_reader_writer_v2_file_positions!(ledger, 0, 1);
+
+            let data_file = OpenOptions::new()
+                .read(true)
+                .open(&first_data_file_path)
+                .await
+                .expect("open should not fail");
+            let metadata = data_file
+                .metadata()
+                .await
+                .expect("metadata should not fail");
+            assert_eq!(first_bytes_written as u64, metadata.len());
 
             let first_read = await_timeout!(reader.next(), 2).expect("read should not fail");
             assert_eq!(first_read, Some(SizedRecord::new(first_record_size)));
             assert_reader_writer_v2_file_positions!(ledger, 0, 1);
             acknowledge(first_read.unwrap()).await;
 
-            let second_read = await_timeout!(reader.next(), 2).expect_err("read should fail");
-            assert!(matches!(second_read, ReaderError::PartialWrite));
+            let second_read = await_timeout!(reader.next(), 2).expect("read should not fail");
+            assert_eq!(second_read, Some(SizedRecord::new(third_record_size)));
             assert_reader_writer_v2_file_positions!(ledger, 1, 1);
-
-            let third_read = await_timeout!(reader.next(), 2).expect("read should not fail");
-            assert_eq!(third_read, Some(SizedRecord::new(third_record_size)));
-            assert_reader_writer_v2_file_positions!(ledger, 1, 1);
-            acknowledge(third_read.unwrap()).await;
+            acknowledge(second_read.unwrap()).await;
 
             let final_read = await_timeout!(reader.next(), 2).expect("read should not fail");
             assert_eq!(final_read, None);
@@ -241,10 +253,8 @@ async fn reader_throws_error_when_finished_file_has_truncated_record_data() {
 // first and third record back and that after reading and acking the first and third record (plus
 // one more read to trigger it) that we've deleted all three data files.
 
-// TODO: Update this test, and the other "reader throws error when" tests to assert that the data
-// file is immediately deleted on the next call to `next`.
 #[tokio::test]
-async fn reader_throws_error_when_record_has_scrambled_archive_data() {
+async fn startup_truncates_file_when_record_has_scrambled_archive_data() {
     with_temp_dir(|dir| {
         let data_dir = dir.to_path_buf();
 
@@ -307,15 +317,27 @@ async fn reader_throws_error_when_record_has_scrambled_archive_data() {
             data_file.sync_all().await.expect("sync should not fail");
             drop(data_file);
 
-            // Now reopen the buffer and attempt a read, which should return an error for
-            // deserialization failure.
-            let (_writer, mut reader, _ledger) =
+            // Now reopen the buffer. Startup recovery discovers the corrupted first record and
+            // truncates the file at offset zero, because records after a corrupted record are not
+            // reachable through the normal sequential reader.
+            let (mut writer, mut reader, ledger) =
                 create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
-            let read_result = reader.next().await;
-            assert!(matches!(
-                read_result,
-                Err(ReaderError::Deserialization { .. })
-            ));
+            writer.close();
+            assert_eq!(0, ledger.get_total_buffer_size());
+
+            let data_file = OpenOptions::new()
+                .read(true)
+                .open(&data_file_path)
+                .await
+                .expect("open should not fail");
+            let metadata = data_file
+                .metadata()
+                .await
+                .expect("metadata should not fail");
+            assert_eq!(0, metadata.len());
+
+            let read_result = reader.next().await.expect("read should not fail");
+            assert_eq!(read_result, None);
         }
     })
     .await;
@@ -353,17 +375,16 @@ async fn writer_detects_when_last_record_has_scrambled_archive_data() {
         let data_dir = dir.to_path_buf();
 
         async move {
-            let marked_for_skip = assertion_registry
+            let writer_did_not_mark_for_skip = assertion_registry
                 .build()
                 .with_name("mark_for_skip")
                 .with_parent_name("writer_detects_when_last_record_has_scrambled_archive_data")
-                .was_entered()
+                .was_not_entered()
                 .finalize();
 
             // Create a regular buffer, no customizations required.
             let (mut writer, _, ledger) = create_default_buffer_v2(data_dir.clone()).await;
             let starting_writer_file_id = ledger.get_current_writer_file_id();
-            let expected_final_writer_file_id = ledger.get_next_writer_file_id();
             let expected_final_write_data_file = ledger.get_next_writer_data_file_path();
             assert_file_does_not_exist_async!(&expected_final_write_data_file);
 
@@ -387,8 +408,7 @@ async fn writer_detects_when_last_record_has_scrambled_archive_data() {
             drop(writer);
             drop(ledger);
 
-            // We should not have seen a call to `mark_for_skip` yet.
-            assert!(!marked_for_skip.try_assert());
+            writer_did_not_mark_for_skip.assert();
 
             // Open the file and set the last eight bytes of the record to something clearly
             // wrong/invalid, which should end up messing with the relative pointer stuff in the
@@ -420,23 +440,34 @@ async fn writer_detects_when_last_record_has_scrambled_archive_data() {
             data_file.sync_all().await.expect("sync should not fail");
             drop(data_file);
 
-            // Now reopen the buffer, which should trigger a `Writer::mark_for_skip` call which
-            // instructs the writer to skip to the next data file, although this doesn't happen
-            // until the first write is attempted.
+            // Now reopen the buffer. The durable checkpoint is authoritative, so startup truncates
+            // the corrupted tail and keeps writing in the current data file instead of marking the
+            // writer to skip to the next one.
             let (mut writer, _, ledger) =
                 create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
-            marked_for_skip.assert();
+            writer_did_not_mark_for_skip.assert();
             assert_reader_writer_v2_file_positions!(ledger, 0, starting_writer_file_id);
             assert_file_does_not_exist_async!(&expected_final_write_data_file);
 
-            // Do a simple write to ensure it opens the next data file.
+            let data_file = OpenOptions::new()
+                .read(true)
+                .open(&data_file_path)
+                .await
+                .expect("open should not fail");
+            let metadata = data_file
+                .metadata()
+                .await
+                .expect("metadata should not fail");
+            assert_eq!(0, metadata.len());
+
+            // Do a simple write to ensure it continues in the current data file.
             let _bytes_written = writer
                 .write_record(SizedRecord::new(64))
                 .await
                 .expect("write should not fail");
             writer.flush().await.expect("flush should not fail");
-            assert_reader_writer_v2_file_positions!(ledger, 0, expected_final_writer_file_id);
-            assert_file_exists_async!(&expected_final_write_data_file);
+            assert_reader_writer_v2_file_positions!(ledger, 0, starting_writer_file_id);
+            assert_file_does_not_exist_async!(&expected_final_write_data_file);
         }
     });
 
@@ -451,17 +482,16 @@ async fn writer_detects_when_last_record_has_invalid_checksum() {
         let data_dir = dir.to_path_buf();
 
         async move {
-            let marked_for_skip = assertion_registry
+            let writer_did_not_mark_for_skip = assertion_registry
                 .build()
                 .with_name("mark_for_skip")
                 .with_parent_name("writer_detects_when_last_record_has_invalid_checksum")
-                .was_entered()
+                .was_not_entered()
                 .finalize();
 
             // Create a regular buffer, no customizations required.
             let (mut writer, _, ledger) = create_default_buffer_v2(data_dir.clone()).await;
             let starting_writer_file_id = ledger.get_current_writer_file_id();
-            let expected_final_writer_file_id = ledger.get_next_writer_file_id();
             let expected_final_write_data_file = ledger.get_next_writer_data_file_path();
             assert_file_does_not_exist_async!(&expected_final_write_data_file);
 
@@ -487,8 +517,7 @@ async fn writer_detects_when_last_record_has_invalid_checksum() {
             drop(writer);
             drop(ledger);
 
-            // We should not have seen a call to `mark_for_skip` yet.
-            assert!(!marked_for_skip.try_assert());
+            writer_did_not_mark_for_skip.assert();
 
             // Open the file, mutably deserialize the record, and flip a bit in the checksum.
             let data_file = OpenOptions::new()
@@ -530,23 +559,34 @@ async fn writer_detects_when_last_record_has_invalid_checksum() {
                 .expect("flush should not fail");
             drop(backed_record);
 
-            // Now reopen the buffer, which should trigger a `Writer::mark_for_skip` call which
-            // instructs the writer to skip to the next data file, although this doesn't happen
-            // until the first write is attempted.
+            // Now reopen the buffer. The durable checkpoint is authoritative, so startup truncates
+            // the corrupted tail and keeps writing in the current data file instead of marking the
+            // writer to skip to the next one.
             let (mut writer, _, ledger) =
                 create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
-            marked_for_skip.assert();
+            writer_did_not_mark_for_skip.assert();
             assert_reader_writer_v2_file_positions!(ledger, 0, starting_writer_file_id);
             assert_file_does_not_exist_async!(&expected_final_write_data_file);
 
-            // Do a simple write to ensure it opens the next data file.
+            let data_file = OpenOptions::new()
+                .read(true)
+                .open(&data_file_path)
+                .await
+                .expect("open should not fail");
+            let metadata = data_file
+                .metadata()
+                .await
+                .expect("metadata should not fail");
+            assert_eq!(0, metadata.len());
+
+            // Do a simple write to ensure it continues in the current data file.
             let _bytes_written = writer
                 .write_record(SizedRecord::new(64))
                 .await
                 .expect("write should not fail");
             writer.flush().await.expect("flush should not fail");
-            assert_reader_writer_v2_file_positions!(ledger, 0, expected_final_writer_file_id);
-            assert_file_exists_async!(&expected_final_write_data_file);
+            assert_reader_writer_v2_file_positions!(ledger, 0, starting_writer_file_id);
+            assert_file_does_not_exist_async!(&expected_final_write_data_file);
         }
     });
 
@@ -657,7 +697,7 @@ async fn writer_detects_when_last_record_was_flushed_but_id_wasnt_incremented() 
                 .expect("write should not fail");
             assert_enough_bytes_written!(bytes_written, SizedRecord, 64);
             writer.flush().await.expect("flush should not fail");
-            let actual_writer_next_record_id = ledger.state().get_next_writer_record_id();
+            let current_writer_data_file = ledger.get_current_writer_data_file_path();
 
             // Now unsafely decrement the next writer record ID, which will cause a divergence
             // between the actual data file and the ledger.  Specifically, the code will think that
@@ -676,18 +716,28 @@ async fn writer_detects_when_last_record_was_flushed_but_id_wasnt_incremented() 
 
             writer_did_not_call_reset.assert();
 
-            // Now reopen the buffer, which should trigger the skip ahead logic where we move our
-            // writer next record ID to be ahead of the actual last record ID, but on whatever we
-            // pulled out of the data file.  This is required to maintain our monotonicity invariant
-            // for all records written into the buffer.
+            // Now reopen the buffer. The durable checkpoint is authoritative, so startup should
+            // truncate the post-checkpoint record instead of fast-forwarding the ledger to match
+            // bytes that may not have been durable before the crash.
             let (_, _, ledger) = create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
             writer_did_not_call_reset.assert();
             assert_reader_writer_v2_file_positions!(ledger, 0, expected_final_writer_file_id);
             assert_file_does_not_exist_async!(&expected_final_write_data_file);
             assert_eq!(
-                actual_writer_next_record_id,
+                starting_writer_next_record_id,
                 ledger.state().get_next_writer_record_id()
             );
+
+            let data_file = OpenOptions::new()
+                .read(true)
+                .open(&current_writer_data_file)
+                .await
+                .expect("open should not fail");
+            let metadata = data_file
+                .metadata()
+                .await
+                .expect("metadata should not fail");
+            assert_eq!(0, metadata.len());
         }
     });
 
@@ -832,10 +882,9 @@ async fn reader_throws_error_when_record_is_undecodable_via_metadata() {
 }
 
 struct ScrambledTestSetup {
-    marked_for_skip: Assertion,
+    writer_did_not_mark_for_skip: Assertion,
     data_file_path: PathBuf,
     starting_writer_file_id: u16,
-    expected_final_writer_file_id: u16,
     expected_final_write_data_file: PathBuf,
     expected_data_file_len: u64,
 }
@@ -844,17 +893,16 @@ async fn write_two_records_and_read_all_then_drop(
     data_dir: PathBuf,
     assertion_registry: &AssertionRegistry,
 ) -> ScrambledTestSetup {
-    let marked_for_skip = assertion_registry
+    let writer_did_not_mark_for_skip = assertion_registry
         .build()
         .with_name("mark_for_skip")
-        .with_parent_name("writer_detects_when_last_record_has_scrambled_archive_data")
-        .was_entered()
+        .with_parent_name("writer_and_reader_handle_when_last_record_has_scrambled_archive_data")
+        .was_not_entered()
         .finalize();
 
     let (mut writer, mut reader, ledger) = create_default_buffer_v2(data_dir.clone()).await;
 
     let starting_writer_file_id = ledger.get_current_writer_file_id();
-    let expected_final_writer_file_id = ledger.get_next_writer_file_id();
     let expected_final_write_data_file = ledger.get_next_writer_data_file_path();
     assert_file_does_not_exist_async!(&expected_final_write_data_file);
 
@@ -893,10 +941,9 @@ async fn write_two_records_and_read_all_then_drop(
     ledger.flush().expect("flush failed");
 
     ScrambledTestSetup {
-        marked_for_skip,
+        writer_did_not_mark_for_skip,
         data_file_path: ledger.get_current_writer_data_file_path(),
         starting_writer_file_id,
-        expected_final_writer_file_id,
         expected_final_write_data_file,
         expected_data_file_len: expected_data_file_len as u64,
     }
@@ -910,17 +957,15 @@ async fn writer_and_reader_handle_when_last_record_has_scrambled_archive_data() 
 
         async move {
             let ScrambledTestSetup {
-                marked_for_skip,
+                writer_did_not_mark_for_skip,
                 data_file_path,
                 starting_writer_file_id,
-                expected_final_writer_file_id,
                 expected_final_write_data_file,
                 expected_data_file_len,
             } = write_two_records_and_read_all_then_drop(data_dir.clone(), &assertion_registry)
                 .await;
 
-            // We should not have seen a call to `mark_for_skip` yet.
-            assert!(!marked_for_skip.try_assert());
+            writer_did_not_mark_for_skip.assert();
 
             // Open the file and set the last eight bytes of the record to something clearly
             // wrong/invalid, which should end up messing with the relative pointer stuff in the
@@ -952,25 +997,23 @@ async fn writer_and_reader_handle_when_last_record_has_scrambled_archive_data() 
             data_file.sync_all().await.expect("sync should not fail");
             drop(data_file);
 
-            // Now reopen the buffer, which should trigger a `Writer::mark_for_skip` call which
-            // instructs the writer to skip to the next data file, although this doesn't happen
-            // until the first write is attempted.
+            // Now reopen the buffer. Startup recovery truncates the corrupted writer tail to the
+            // last valid record boundary and keeps the writer on the current file.
             let (mut writer, mut reader, ledger) =
                 create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
-            marked_for_skip.assert();
-            // When writer see last record as corrupted set flag to skip to next file but reader moves to next file id and wait for writer to create it.
+            writer_did_not_mark_for_skip.assert();
             assert_reader_writer_v2_file_positions!(
                 ledger,
-                expected_final_writer_file_id,
+                starting_writer_file_id,
                 starting_writer_file_id
             );
             assert_file_does_not_exist_async!(&expected_final_write_data_file);
 
-            // At this point reader is waiting for writer to create next data file, so we can test that reader.next() times out.
+            // At this point there are no unread bytes, so reader.next() should still wait.
             let result = timeout(Duration::from_millis(100), reader.next()).await;
             assert!(result.is_err(), "expected reader.next() to time out");
 
-            // Do a simple write to ensure it opens the next data file.
+            // Do a simple write to ensure it appends to the current data file.
             let _bytes_written = writer
                 .write_record(SizedRecord::new(72))
                 .await
@@ -978,10 +1021,10 @@ async fn writer_and_reader_handle_when_last_record_has_scrambled_archive_data() 
             writer.flush().await.expect("flush should not fail");
             assert_reader_writer_v2_file_positions!(
                 ledger,
-                expected_final_writer_file_id,
-                expected_final_writer_file_id
+                starting_writer_file_id,
+                starting_writer_file_id
             );
-            assert_file_exists_async!(&expected_final_write_data_file);
+            assert_file_does_not_exist_async!(&expected_final_write_data_file);
 
             let read = reader
                 .next()
@@ -989,10 +1032,16 @@ async fn writer_and_reader_handle_when_last_record_has_scrambled_archive_data() 
                 .expect("should not fail to read record")
                 .expect("should contain first record");
             assert_eq!(SizedRecord::new(72), read);
+            assert_reader_writer_v2_file_positions!(
+                ledger,
+                starting_writer_file_id,
+                starting_writer_file_id
+            );
             acknowledge(read).await;
         }
     });
 
-    let parent = trace_span!("writer_detects_when_last_record_has_scrambled_archive_data");
+    let parent =
+        trace_span!("writer_and_reader_handle_when_last_record_has_scrambled_archive_data");
     fut.instrument(parent.or_current()).await;
 }

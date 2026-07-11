@@ -96,6 +96,13 @@ pub trait AsyncFile: AsyncRead + AsyncWrite + Send + Sync {
     /// will be returned describing the underlying error.
     async fn metadata(&self) -> io::Result<Metadata>;
 
+    /// Truncates the underlying file to the specified size.
+    ///
+    /// # Errors
+    /// If `size` is greater than the current file size, or an I/O error occurred when attempting to
+    /// truncate the file, an error variant will be returned describing the underlying error.
+    async fn truncate(&self, size: u64) -> io::Result<()>;
+
     /// Attempts to synchronize all OS-internal data, and metadata, to disk.
     ///
     /// This function will attempt to ensure that all in-memory data reaches the filesystem before returning.
@@ -219,6 +226,18 @@ impl AsyncFile for tokio::fs::File {
         Ok(Metadata {
             len: metadata.len(),
         })
+    }
+
+    async fn truncate(&self, size: u64) -> io::Result<()> {
+        let current_size = self.metadata().await?.len();
+        if size > current_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot extend a file through the truncation API",
+            ));
+        }
+
+        self.set_len(size).await
     }
 
     async fn sync_all(&self) -> io::Result<()> {

@@ -129,7 +129,7 @@ impl<T> ReaderError<T>
 where
     T: Bufferable,
 {
-    fn is_bad_read(&self) -> bool {
+    pub(super) fn is_bad_read(&self) -> bool {
         matches!(
             self,
             ReaderError::Checksum { .. }
@@ -439,6 +439,10 @@ where
         }
     }
 
+    pub(super) fn ledger(&self) -> &Ledger<FS> {
+        self.ledger.as_ref()
+    }
+
     fn reset(&mut self) {
         self.reader = None;
         self.bytes_read = 0;
@@ -461,12 +465,18 @@ where
             self.data_file_start_record_id = Some(record_id);
         }
 
-        // Track the amount of data we read.  If we're still loading the buffer, then the only thing
-        // other we need to do is update the total buffer size.  Everything else below only matters
-        // when we're doing real record reads.
+        // Track the amount of data consumed within the current data file. During initialization,
+        // this still positions the reader at the persisted checkpoint, but the authoritative unread
+        // buffer size is computed separately from the checkpointed file window.
         self.bytes_read += record_bytes;
         if !self.ready_to_read {
-            self.ledger.decrement_total_buffer_size(record_bytes);
+            // During initialization we are only replaying already-read records to reposition the
+            // reader; we deliberately do NOT adjust `total_buffer_size` here. The authoritative
+            // unread total is installed once, at the end of `seek_to_next_record`, from a single
+            // consistent snapshot. Decrementing per-record during this replay was the historical
+            // approach, and -- because the seeded total and the replayed records came from
+            // snapshots taken at different times across a crash -- it is what allowed the
+            // buffer-size counter to underflow and wrap.
             return;
         }
 
@@ -514,18 +524,14 @@ where
             bytes_read, "Deleting completed data file."
         );
 
-        // Grab the size of the data file before we delete it, which gives us a chance to fix up the
-        // total buffer size for corrupted files or fast-forwarded files.
+        // Grab the size of the data file before we delete it. For normal post-read deletion,
+        // `bytes_read` is known, and any unread tail left in the file must be removed from
+        // `total_buffer_size`.
         //
-        // Since we only decrement the buffer size after a successful read in normal cases, skipping
-        // the rest of a corrupted file could lead to the total buffer size being unsynchronized.
-        // We use the difference between the number of bytes read and the file size to figure out if
-        // we need to make a manual adjustment.
-        //
-        // Likewise, when we skip over a file in "fast forward" mode during initialization, no reads
-        // occur at all, so we're relying on this method to correct the buffer size for us.  This is
-        // why `bytes_read` is optional: when it's specified, we calculate a delta for handling
-        // partial-read scenarios, otherwise, we just use the entire data file size as is.
+        // During startup fast-forward deletion, `bytes_read` is `None`. Initialization does not
+        // mutate `total_buffer_size` incrementally; `seek_to_next_record` installs the recomputed
+        // unread total after it finishes positioning the reader. In that mode this method only
+        // deletes the file and advances the persisted reader file id.
         let data_file = self
             .ledger
             .filesystem()
@@ -534,7 +540,11 @@ where
         let metadata = data_file.metadata().await?;
 
         let decrease_amount = bytes_read.map_or_else(
-            || metadata.len(),
+            // `None` is only passed from `seek_to_next_record`'s fast path while it deletes
+            // fully-read straggler files during initialization. Initialization does not mutate
+            // `total_buffer_size` incrementally -- the authoritative value is installed once at the
+            // end of the seek -- so deleting a file here must not decrement it.
+            || 0,
             |bytes_read| {
                 // A file shorter than bytes_read makes the delta below underflow
                 // and feed a wrapped value into decrement_total_buffer_size.
@@ -900,9 +910,9 @@ where
                     // marker, but the internal state tracking first/last record ID, bytes read,
                     // etc, won't actually be usable.
                     if ledger_last > last_record_id_in_data_file {
-                        // By passing 0 bytes, `delete_completed_data_file` does the work of
-                        // ensuring the buffer size is updated to reflect the data file being
-                        // deleted in its entirety.
+                        // This fully-read file is behind `ledger_last`, so startup can delete it
+                        // and advance. Passing `None` marks init fast-forward mode: buffer size is
+                        // recomputed once `seek_to_next_record` finishes positioning the reader.
                         self.delete_completed_data_file(data_file_path, None)
                             .await
                             .context(IoSnafu)?;

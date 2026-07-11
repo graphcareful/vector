@@ -44,6 +44,40 @@ pub const MAX_FILE_ID: u16 = u16::MAX;
 #[cfg(test)]
 pub const MAX_FILE_ID: u16 = 6;
 
+pub(crate) fn next_data_file_id(file_id: u16) -> u16 {
+    (file_id + 1) % MAX_FILE_ID
+}
+
+#[derive(Debug)]
+pub(crate) struct DataFileIdRangeInclusive {
+    next: Option<u16>,
+    end: u16,
+}
+
+impl DataFileIdRangeInclusive {
+    pub(crate) fn new(start: u16, end: u16) -> Self {
+        Self {
+            next: Some(start),
+            end,
+        }
+    }
+}
+
+impl Iterator for DataFileIdRangeInclusive {
+    type Item = u16;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.next?;
+        self.next = if current == self.end {
+            None
+        } else {
+            Some(next_data_file_id(current))
+        };
+
+        Some(current)
+    }
+}
+
 // The alignment used by the record serializer.
 const SERIALIZER_ALIGNMENT: usize = 16;
 const MAX_ALIGNABLE_AMOUNT: usize = usize::MAX - SERIALIZER_ALIGNMENT;
@@ -421,7 +455,8 @@ mod tests {
     use proptest::{prop_assert, proptest, test_runner::Config};
 
     use super::{
-        BuildError, DiskBufferConfigBuilder, MINIMUM_MAX_RECORD_SIZE, SERIALIZER_ALIGNMENT, align16,
+        BuildError, DataFileIdRangeInclusive, DiskBufferConfigBuilder, MINIMUM_MAX_RECORD_SIZE,
+        SERIALIZER_ALIGNMENT, align16,
     };
     use crate::variants::disk_v2::common::MAX_ALIGNABLE_AMOUNT;
 
@@ -432,6 +467,24 @@ mod tests {
         // that's a huge amount even on 32-bit systems and in non-test code, we only use `align16` in a const context,
         // so it will panic during compilation, not at runtime.
         align16(MAX_ALIGNABLE_AMOUNT + 1);
+    }
+
+    #[test]
+    fn data_file_id_range_inclusive_handles_non_wrapping_range() {
+        let ids = DataFileIdRangeInclusive::new(1, 4).collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn data_file_id_range_inclusive_handles_wrapping_range() {
+        let ids = DataFileIdRangeInclusive::new(4, 1).collect::<Vec<_>>();
+        assert_eq!(ids, vec![4, 5, 0, 1]);
+    }
+
+    #[test]
+    fn data_file_id_range_inclusive_handles_single_file_range() {
+        let ids = DataFileIdRangeInclusive::new(3, 3).collect::<Vec<_>>();
+        assert_eq!(ids, vec![3]);
     }
 
     proptest! {
