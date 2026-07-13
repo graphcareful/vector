@@ -43,17 +43,20 @@ impl<T> SenderAdapter<T>
 where
     T: Bufferable,
 {
-    pub(crate) async fn send(&mut self, item: T) -> crate::Result<()> {
+    pub(crate) async fn send(&mut self, item: T) -> crate::Result<TryWriteOutcome<T>> {
         match self {
-            Self::InMemory(tx) => tx.send(item).await.map_err(Into::into),
+            Self::InMemory(tx) => tx
+                .send(item)
+                .await
+                .map(|()| TryWriteOutcome::Written)
+                .map_err(Into::into),
             Self::DiskV2(writer) => {
                 let mut writer = writer.lock().await;
 
-                writer.write_record(item).await.map(|_| ()).map_err(|e| {
+                writer.write_record_outcome(item).await.map_err(|e| {
                     // Record-level failures that can never succeed (a record too large to encode
-                    // within the max record size) are handled inside the writer: the record is
-                    // dropped, its finalizers resolved as Delivered, and the drop is metered, so
-                    // they never surface here. Anything that reaches this point -- I/O errors,
+                    // within the max record size) are handled inside the writer and surfaced as a
+                    // dropped outcome. Anything that reaches this point -- I/O errors,
                     // serialization failures, an inconsistent writer state -- is genuinely
                     // unrecoverable.
                     error!("Disk buffer writer has encountered an unrecoverable error.");
@@ -75,9 +78,8 @@ where
 
                 writer.try_write_record(item).await.map_err(|e| {
                     // Record-level failures that can never succeed (a record too large to encode
-                    // within the max record size) are handled inside the writer: the record is
-                    // dropped, its finalizers resolved as Delivered, and the drop is metered, so
-                    // they never surface here. Anything that reaches this point -- I/O errors,
+                    // within the max record size) are handled inside the writer and surfaced as a
+                    // dropped outcome. Anything that reaches this point -- I/O errors,
                     // serialization failures, an inconsistent writer state -- is genuinely
                     // unrecoverable.
                     error!("Disk buffer writer has encountered an unrecoverable error.");
@@ -251,10 +253,11 @@ impl<T: Bufferable> BufferSender<T> {
             .map(|_| (item.event_count(), item.size_of()));
 
         let accounting = match self.when_full {
-            WhenFull::Block => {
-                self.base.send(item).await?;
-                UsageAccounting::Accepted
-            }
+            WhenFull::Block => match self.base.send(item).await? {
+                TryWriteOutcome::Written => UsageAccounting::Accepted,
+                TryWriteOutcome::Full(_) => unreachable!("blocking sends wait until space exists"),
+                TryWriteOutcome::Dropped => UsageAccounting::NotAccepted,
+            },
             WhenFull::DropNewest => match self.base.try_send(item).await? {
                 TryWriteOutcome::Written => UsageAccounting::Accepted,
                 TryWriteOutcome::Full(_) => UsageAccounting::DroppedNewest,

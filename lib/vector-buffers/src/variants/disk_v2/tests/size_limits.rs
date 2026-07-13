@@ -6,7 +6,7 @@ use tracing::Instrument;
 
 use super::{
     create_buffer_v2_with_data_file_count_limit, create_buffer_v2_with_max_data_file_size,
-    create_buffer_v2_with_max_record_size, read_next, read_next_some,
+    create_buffer_v2_with_max_record_size_and_usage, read_next, read_next_some,
 };
 use vector_common::finalization::{AddBatchNotifier, BatchNotifier, BatchStatus};
 
@@ -45,8 +45,8 @@ async fn writer_drops_record_that_is_over_the_limit() {
             let third_record = SizedRecord::new(first_write_size);
 
             let max_record_size = get_corrected_max_record_size(&first_record);
-            let (mut writer, _reader, ledger) =
-                create_buffer_v2_with_max_record_size(data_dir, max_record_size).await;
+            let (mut writer, _reader, ledger, usage) =
+                create_buffer_v2_with_max_record_size_and_usage(data_dir, max_record_size).await;
 
             assert_buffer_is_empty!(ledger);
 
@@ -72,6 +72,11 @@ async fn writer_drops_record_that_is_over_the_limit() {
                 dropped_bytes_written, 0,
                 "an over-limit record should write no bytes",
             );
+            let snapshot = usage.snapshot();
+            assert_eq!(snapshot.received_event_count, 2);
+            assert_eq!(snapshot.sent_event_count, 0);
+            assert_eq!(snapshot.dropped_event_count, 1);
+            assert_eq!(snapshot.dropped_event_count_intentional, 0);
 
             // The dropped record's finalizer must resolve to `Delivered` so that acking sources
             // (e.g. Pulsar, file) ack/checkpoint rather than nacking and redelivering a record

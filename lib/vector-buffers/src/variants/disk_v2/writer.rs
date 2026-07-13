@@ -239,7 +239,7 @@ pub enum TryWriteOutcome<T> {
     Full(T),
     /// The record permanently exceeded the maximum record size and was dropped.
     ///
-    /// Its finalizers have already been resolved as [`EventStatus::Dropped`] (≡
+    /// Its finalizers have already been resolved as [`EventStatus::Dropped`] (equivalent to
     /// `BatchStatus::Delivered`), so acking sources ack/checkpoint rather than redelivering
     /// a record that can never be written.
     Dropped,
@@ -1372,8 +1372,9 @@ where
                         //
                         // Drop the finalizers with their default EventStatus::Dropped, which
                         // propagates as BatchStatus::Delivered. Acking sources therefore ack/checkpoint
-                        // the record rather than nacking or stalling, preventing a permanent failure
-                        // from becoming a retry loop. The drop is surfaced via metrics for observability.
+                        // the record rather than nacking or stalling, preventing a permanent
+                        // failure from becoming a retry loop. The ledger records matching
+                        // received and dropped usage so occupancy stays balanced.
                         error!(
                             message = "Record cannot be written to the disk buffer; dropping it.",
                             event_count = record_events.get(),
@@ -1489,6 +1490,23 @@ where
                     self.ledger.wait_for_reader().await;
                 }
             }
+        }
+    }
+
+    /// Writes a record, preserving whether the blocking write completed by dropping an unwritable
+    /// record.
+    ///
+    /// Unlike [`Self::try_write_record`], this waits for reader progress when the buffer is full.
+    #[instrument(skip_all, level = "debug")]
+    pub async fn write_record_outcome(
+        &mut self,
+        record: T,
+    ) -> Result<TryWriteOutcome<T>, WriterError<T>> {
+        // `write_record` reports a zero-byte write as the sentinel for an unwritable record that
+        // was dropped; every other byte count means the record was written.
+        match self.write_record(record).await? {
+            0 => Ok(TryWriteOutcome::Dropped),
+            _ => Ok(TryWriteOutcome::Written),
         }
     }
 
