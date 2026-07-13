@@ -566,11 +566,11 @@ where
     /// Records that a record was dropped because it could never be written to the buffer (e.g. it
     /// exceeds the maximum record size).
     ///
-    /// The record never entered the buffer, so this is metric-only accounting: it emits a discard
-    /// metric but does not affect occupancy.
+    /// Unlike [`track_dropped_events`], the record never entered the buffer, so we know its exact
+    /// event count and byte size. It is reported as a non-intentional drop.
     pub fn track_unwritable_dropped_record(&self, count: u64, byte_size: u64) {
         self.usage_handle
-            .increment_pre_entry_dropped_event_count_and_byte_size(count, byte_size);
+            .increment_dropped_event_count_and_byte_size(count, byte_size, false);
     }
 }
 
