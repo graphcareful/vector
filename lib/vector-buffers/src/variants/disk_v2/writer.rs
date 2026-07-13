@@ -61,8 +61,12 @@ where
     /// necessary bytes during encoding, and so this error will typically only be emitted when the
     /// encoder throws no error during the encoding step itself, but manages to fill up the encoding
     /// buffer to the limit.
-    #[snafu(display("record too large: limit is {}", limit))]
-    RecordTooLarge { limit: usize },
+    #[snafu(display(
+        "record too large: encoded length is {}, limit is {}",
+        encoded_len,
+        limit
+    ))]
+    RecordTooLarge { encoded_len: usize, limit: usize },
 
     /// The data file did not have enough remaining space to write the record.
     ///
@@ -165,9 +169,16 @@ impl<T: Bufferable + PartialEq> PartialEq for WriterError<T> {
             (Self::Io { source: l_source }, Self::Io { source: r_source }) => {
                 l_source.kind() == r_source.kind()
             }
-            (Self::RecordTooLarge { limit: l_limit }, Self::RecordTooLarge { limit: r_limit }) => {
-                l_limit == r_limit
-            }
+            (
+                Self::RecordTooLarge {
+                    encoded_len: l_encoded_len,
+                    limit: l_limit,
+                },
+                Self::RecordTooLarge {
+                    encoded_len: r_encoded_len,
+                    limit: r_limit,
+                },
+            ) => l_encoded_len == r_encoded_len && l_limit == r_limit,
             (
                 Self::DataFileFull {
                     record: l_record,
@@ -551,6 +562,7 @@ where
             .context(FailedToEncodeSnafu)?;
         if encoded_len > self.max_record_size {
             return Err(WriterError::RecordTooLarge {
+                encoded_len,
                 limit: self.max_record_size,
             });
         }
@@ -1319,12 +1331,11 @@ where
             .try_into()
             .map_err(|_| WriterError::EmptyRecord)?;
 
-        // Capture the in-memory size and extract finalizers before `archive_record` consumes the
-        // record. The encoder unconditionally consumes the record (even on failure), so we must
-        // take what we need here to handle the case where encoding fails because the record is too
-        // large to ever write. The guard automatically resolves the finalizers as Errored if this
-        // function exits via `?`; call `disarm()` or `into_inner()` on the non-error paths.
-        let record_byte_size = record.size_of();
+        // Extract the finalizers before `archive_record` consumes the record. The encoder
+        // unconditionally consumes the record (even on failure), so we must take what we need here
+        // to handle the case where encoding fails because the record is too large to ever write.
+        // The guard automatically resolves the finalizers as Errored if this function exits via
+        // `?`; call `disarm()` or `into_inner()` on the non-error paths.
         let mut record_finalizers = FinalizerGuard::new(record.take_finalizer_groups());
 
         // Grab the next record ID and attempt to write the record.
@@ -1375,17 +1386,29 @@ where
                         // the record rather than nacking or stalling, preventing a permanent
                         // failure from becoming a retry loop. The ledger records matching
                         // received and dropped usage so occupancy stays balanced.
+                        //
+                        // `RecordTooLarge` carries the exact encoded length; `FailedToEncode` bails
+                        // before that size is known, so we fall back to the configured limit as a
+                        // lower-bound estimate. This byte size only feeds the cumulative
+                        // received/discarded byte counters — occupancy self-cancels because the
+                        // ledger adds the same value to both — so an estimate is acceptable for the
+                        // rare encode-failure case, and it avoids an `O(events)` `size_of()` on the
+                        // hot write path just to report a value consumed only when a record drops.
+                        let encoded_len = match &e {
+                            WriterError::RecordTooLarge { encoded_len, .. } => *encoded_len,
+                            _ => self.config.max_record_size,
+                        };
                         error!(
                             message = "Record cannot be written to the disk buffer; dropping it.",
                             event_count = record_events.get(),
-                            byte_size = record_byte_size,
+                            encoded_len,
                             max_record_size = self.config.max_record_size,
                             error = %e,
                         );
                         record_finalizers.disarm();
                         self.ledger.track_unwritable_dropped_record(
                             record_events.get() as u64,
-                            record_byte_size as u64,
+                            encoded_len as u64,
                         );
                         return Ok(Ok(0));
                     }
