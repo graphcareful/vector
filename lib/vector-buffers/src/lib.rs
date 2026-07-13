@@ -43,7 +43,7 @@ use std::fmt::Debug;
 use quickcheck::{Arbitrary, Gen};
 use vector_common::{
     byte_size_of::ByteSizeOf,
-    finalization::{AddBatchNotifier, Finalizable},
+    finalization::{AddBatchNotifier, Finalizable, MergeFinalizable},
 };
 
 /// Event handling behavior when a buffer is full.
@@ -100,6 +100,7 @@ impl Arbitrary for WhenFull {
 pub trait InMemoryBufferable:
     AddBatchNotifier
     + Finalizable
+    + MergeFinalizable
     + ByteSizeOf
     + EventCount
     + Debug
@@ -115,6 +116,7 @@ pub trait InMemoryBufferable:
 impl<T> InMemoryBufferable for T where
     T: AddBatchNotifier
         + Finalizable
+        + MergeFinalizable
         + ByteSizeOf
         + EventCount
         + Debug

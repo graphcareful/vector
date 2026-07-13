@@ -4,7 +4,7 @@ pub use array::{EventArray, EventContainer, LogArray, MetricArray, TraceArray, i
 pub use estimated_json_encoded_size_of::EstimatedJsonEncodedSizeOf;
 pub use finalization::{
     BatchNotifier, BatchStatus, BatchStatusReceiver, EventFinalizer, EventFinalizerGroups,
-    EventFinalizers, EventStatus, Finalizable,
+    EventFinalizers, EventStatus, Finalizable, MergeFinalizable,
 };
 pub use log_event::LogEvent;
 pub use metadata::{DatadogMetricOriginMetadata, EventMetadata, Secrets, WithMetadata};
@@ -90,7 +90,9 @@ impl Finalizable for Event {
             Event::Trace(trace_event) => trace_event.take_finalizers(),
         }
     }
+}
 
+impl MergeFinalizable for Event {
     fn merge_finalizers(&mut self, finalizers: EventFinalizers) {
         match self {
             Event::Log(log_event) => log_event.merge_finalizers(finalizers),

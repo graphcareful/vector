@@ -4,7 +4,10 @@ use bytes::{Buf, BufMut};
 use quickcheck::{Arbitrary, Gen};
 use vector_common::{
     byte_size_of::ByteSizeOf,
-    finalization::{AddBatchNotifier, BatchNotifier, EventFinalizer, EventFinalizers, Finalizable},
+    finalization::{
+        AddBatchNotifier, BatchNotifier, EventFinalizer, EventFinalizers, Finalizable,
+        MergeFinalizable,
+    },
 };
 
 use crate::{EventCount, encoding::FixedEncodable};
@@ -43,7 +46,9 @@ macro_rules! message_wrapper {
             fn take_finalizers(&mut self) -> EventFinalizers {
                 std::mem::take(&mut self.1)
             }
+        }
 
+        impl MergeFinalizable for $id {
             fn merge_finalizers(&mut self, finalizers: EventFinalizers) {
                 self.1.merge(finalizers);
             }
@@ -202,6 +207,12 @@ impl AddBatchNotifier for UndecodableRecord {
 impl Finalizable for UndecodableRecord {
     fn take_finalizers(&mut self) -> EventFinalizers {
         EventFinalizers::DEFAULT
+    }
+}
+
+impl MergeFinalizable for UndecodableRecord {
+    fn merge_finalizers(&mut self, _finalizers: EventFinalizers) {
+        // We never check acknowledgements for this type.
     }
 }
 

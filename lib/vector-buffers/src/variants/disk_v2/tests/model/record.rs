@@ -3,7 +3,10 @@ use std::{error, fmt, mem};
 use bytes::{Buf, BufMut};
 use vector_common::{
     byte_size_of::ByteSizeOf,
-    finalization::{AddBatchNotifier, BatchNotifier, EventFinalizer, EventFinalizers, Finalizable},
+    finalization::{
+        AddBatchNotifier, BatchNotifier, EventFinalizer, EventFinalizers, Finalizable,
+        MergeFinalizable,
+    },
 };
 
 use crate::{
@@ -100,7 +103,9 @@ impl Finalizable for Record {
     fn take_finalizers(&mut self) -> EventFinalizers {
         std::mem::take(&mut self.finalizers)
     }
+}
 
+impl MergeFinalizable for Record {
     fn merge_finalizers(&mut self, finalizers: EventFinalizers) {
         self.finalizers.merge(finalizers);
     }

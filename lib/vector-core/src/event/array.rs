@@ -12,6 +12,7 @@ use vector_common::{
     byte_size_of::ByteSizeOf,
     finalization::{
         AddBatchNotifier, BatchNotifier, EventFinalizerGroups, EventFinalizers, Finalizable,
+        MergeFinalizable,
     },
     json_size::JsonSize,
 };
@@ -317,6 +318,22 @@ impl Finalizable for EventArray {
         }
     }
 
+    fn take_finalizer_groups(&mut self) -> EventFinalizerGroups {
+        match self {
+            Self::Logs(a) => EventFinalizerGroups::from_groups(
+                a.iter_mut().map(Finalizable::take_finalizers).collect(),
+            ),
+            Self::Metrics(a) => EventFinalizerGroups::from_groups(
+                a.iter_mut().map(Finalizable::take_finalizers).collect(),
+            ),
+            Self::Traces(a) => EventFinalizerGroups::from_groups(
+                a.iter_mut().map(Finalizable::take_finalizers).collect(),
+            ),
+        }
+    }
+}
+
+impl MergeFinalizable for EventArray {
     fn merge_finalizers(&mut self, finalizers: EventFinalizers) {
         // Flat finalizers no longer carry their original element ownership, so this lossy fallback
         // can only attach them to one surviving element. Retry/recovery paths where an `EventArray`
@@ -347,22 +364,8 @@ impl Finalizable for EventArray {
         }
     }
 
-    fn take_finalizer_groups(&mut self) -> EventFinalizerGroups {
-        match self {
-            Self::Logs(a) => EventFinalizerGroups::from_groups(
-                a.iter_mut().map(Finalizable::take_finalizers).collect(),
-            ),
-            Self::Metrics(a) => EventFinalizerGroups::from_groups(
-                a.iter_mut().map(Finalizable::take_finalizers).collect(),
-            ),
-            Self::Traces(a) => EventFinalizerGroups::from_groups(
-                a.iter_mut().map(Finalizable::take_finalizers).collect(),
-            ),
-        }
-    }
-
     fn merge_finalizer_groups(&mut self, finalizers: EventFinalizerGroups) {
-        fn merge_into<T: Finalizable>(items: &mut [T], finalizers: EventFinalizerGroups) {
+        fn merge_into<T: MergeFinalizable>(items: &mut [T], finalizers: EventFinalizerGroups) {
             assert_eq!(
                 items.len(),
                 finalizers.len(),

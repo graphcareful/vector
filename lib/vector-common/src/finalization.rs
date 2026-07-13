@@ -99,7 +99,9 @@ impl Finalizable for EventFinalizers {
     fn take_finalizers(&mut self) -> EventFinalizers {
         mem::take(self)
     }
+}
 
+impl MergeFinalizable for EventFinalizers {
     fn merge_finalizers(&mut self, finalizers: EventFinalizers) {
         self.merge(finalizers);
     }
@@ -437,16 +439,6 @@ pub trait Finalizable {
     /// all finalizations will be processed when the batch itself is processed.
     fn take_finalizers(&mut self) -> EventFinalizers;
 
-    /// Merges the given finalizers back into this object.
-    ///
-    /// Used to reattach finalizers to a record that is being returned for retry (e.g. when a
-    /// `disk_v2` write is rejected because the buffer is full). The default is a **silent no-op**
-    /// that drops `_finalizers` as `Delivered`, prematurely acking the upstream source. Any type
-    /// that implements a bufferable type and stores finalizers MUST override this method — failure
-    /// to do so causes data loss on the buffer-full retry path with no compile
-    /// error or runtime warning.
-    fn merge_finalizers(&mut self, _finalizers: EventFinalizers) {}
-
     /// Consumes this object's finalizers while preserving independent finalizer groups.
     ///
     /// The default implementation treats this object as a single finalization group. Container
@@ -455,6 +447,19 @@ pub trait Finalizable {
     fn take_finalizer_groups(&mut self) -> EventFinalizerGroups {
         EventFinalizerGroups::from_flat(self.take_finalizers())
     }
+}
+
+/// A [`Finalizable`] object whose finalizers can be reattached after being taken.
+///
+/// Used to reattach finalizers to a record that is being returned for retry (e.g. when a
+/// `disk_v2` write is rejected because the buffer is full). This is a separate trait from
+/// [`Finalizable`], with no default implementation, so that only types actually used as a
+/// `Bufferable`/`InMemoryBufferable` item — the ones that can hit a buffer-full retry path — are
+/// required by the compiler to implement it. Types that only ever have their finalizers taken
+/// once (e.g. sink request/service types) are unaffected.
+pub trait MergeFinalizable: Finalizable {
+    /// Merges the given finalizers back into this object.
+    fn merge_finalizers(&mut self, finalizers: EventFinalizers);
 
     /// Merges grouped finalizers back into this object.
     ///
