@@ -167,6 +167,12 @@ impl EventFinalizerGroups {
     }
 }
 
+impl FromIterator<EventFinalizers> for EventFinalizerGroups {
+    fn from_iter<T: IntoIterator<Item = EventFinalizers>>(iter: T) -> Self {
+        EventFinalizerGroups(Vec::from_iter(iter))
+    }
+}
+
 /// An event finalizer is the shared data required to handle tracking the status of an event, and updating the status of
 /// a batch with that when the event is dropped.
 #[derive(Debug)]

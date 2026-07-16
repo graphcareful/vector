@@ -320,15 +320,9 @@ impl Finalizable for EventArray {
 
     fn take_finalizer_groups(&mut self) -> EventFinalizerGroups {
         match self {
-            Self::Logs(a) => EventFinalizerGroups::from_groups(
-                a.iter_mut().map(Finalizable::take_finalizers).collect(),
-            ),
-            Self::Metrics(a) => EventFinalizerGroups::from_groups(
-                a.iter_mut().map(Finalizable::take_finalizers).collect(),
-            ),
-            Self::Traces(a) => EventFinalizerGroups::from_groups(
-                a.iter_mut().map(Finalizable::take_finalizers).collect(),
-            ),
+            Self::Logs(a) => a.iter_mut().map(Finalizable::take_finalizers).collect(),
+            Self::Metrics(a) => a.iter_mut().map(Finalizable::take_finalizers).collect(),
+            Self::Traces(a) => a.iter_mut().map(Finalizable::take_finalizers).collect(),
         }
     }
 }

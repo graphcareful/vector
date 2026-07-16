@@ -61,11 +61,7 @@ where
     /// necessary bytes during encoding, and so this error will typically only be emitted when the
     /// encoder throws no error during the encoding step itself, but manages to fill up the encoding
     /// buffer to the limit.
-    #[snafu(display(
-        "record too large: encoded length is {}, limit is {}",
-        encoded_len,
-        limit
-    ))]
+    #[snafu(display("record too large: encoded length is {encoded_len}, limit is {limit}"))]
     RecordTooLarge { encoded_len: usize, limit: usize },
 
     /// The data file did not have enough remaining space to write the record.
@@ -158,7 +154,7 @@ where
     fn is_unwritable_record(&self) -> bool {
         matches!(
             self,
-            WriterError::RecordTooLarge { .. } | WriterError::FailedToEncode { .. }
+            Self::RecordTooLarge { .. } | Self::FailedToEncode { .. }
         )
     }
 }
