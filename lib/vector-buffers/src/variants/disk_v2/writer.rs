@@ -257,31 +257,38 @@ pub enum TryWriteOutcome<T> {
 ///
 /// Used in `try_write_record_inner` so that every `?` exit automatically notifies acking sources
 /// to nack / withhold checkpoints for any record that did not reach durable storage.
-struct FinalizerGuard(Option<EventFinalizerGroups>);
+struct FinalizerGuard {
+    finalizers: EventFinalizerGroups,
+    error_on_drop: bool,
+}
 
 impl FinalizerGuard {
     fn new(finalizers: EventFinalizerGroups) -> Self {
-        Self(Some(finalizers))
+        Self {
+            finalizers,
+            error_on_drop: true,
+        }
     }
 
     /// Releases the guard without marking finalizers as errored.
     ///
     /// Call when the record was intentionally dropped (unwritable) or successfully flushed to
     /// disk — both cases where the upstream source should ack rather than retry.
-    fn disarm(&mut self) {
-        self.0 = None;
+    fn disarm(mut self) {
+        self.error_on_drop = false;
     }
 
     /// Returns the finalizers for reattachment to the recovered record on buffer-full retry.
-    fn take_inner(&mut self) -> EventFinalizerGroups {
-        self.0.take().expect("FinalizerGuard already consumed")
+    fn into_inner(mut self) -> EventFinalizerGroups {
+        self.error_on_drop = false;
+        std::mem::take(&mut self.finalizers)
     }
 }
 
 impl Drop for FinalizerGuard {
     fn drop(&mut self) {
-        if let Some(finalizers) = self.0.take() {
-            finalizers.update_status(EventStatus::Errored);
+        if self.error_on_drop {
+            self.finalizers.update_status(EventStatus::Errored);
         }
     }
 }
@@ -1332,7 +1339,7 @@ where
         // to handle the case where encoding fails because the record is too large to ever write.
         // The guard automatically resolves the finalizers as Errored if this function exits via
         // `?`; call `disarm()` or `into_inner()` on the non-error paths.
-        let mut record_finalizers = FinalizerGuard::new(record.take_finalizer_groups());
+        let record_finalizers = FinalizerGuard::new(record.take_finalizer_groups());
 
         // Grab the next record ID and attempt to write the record.
         let record_id = self.get_next_record_id();
@@ -1440,10 +1447,10 @@ where
             //
             // Reattach the finalizers: they were taken before archiving to handle the unwritable-
             // record path, but this record is being returned for retry (block mode) or overflow.
-            // `take_inner` extracts from the guard without resolving status; the finalizers will
+            // `into_inner` extracts from the guard without resolving status; the finalizers will
             // be resolved only when the returned record is eventually written or dropped.
             let mut record = writer.recover_archived_record(&token)?;
-            record.merge_finalizer_groups(record_finalizers.take_inner());
+            record.merge_finalizer_groups(record_finalizers.into_inner());
             return Ok(Err(record));
         };
 
