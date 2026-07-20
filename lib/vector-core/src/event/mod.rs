@@ -4,7 +4,7 @@ pub use array::{EventArray, EventContainer, LogArray, MetricArray, TraceArray, i
 pub use estimated_json_encoded_size_of::EstimatedJsonEncodedSizeOf;
 pub use finalization::{
     BatchNotifier, BatchStatus, BatchStatusReceiver, EventFinalizer, EventFinalizerGroups,
-    EventFinalizers, EventStatus, Finalizable, MergeFinalizable,
+    EventFinalizers, EventStatus, Finalizable, GroupedFinalizable, MergeFinalizable,
 };
 pub use log_event::LogEvent;
 pub use metadata::{DatadogMetricOriginMetadata, EventMetadata, Secrets, WithMetadata};

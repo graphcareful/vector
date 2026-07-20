@@ -43,7 +43,7 @@ use std::fmt::Debug;
 use quickcheck::{Arbitrary, Gen};
 use vector_common::{
     byte_size_of::ByteSizeOf,
-    finalization::{AddBatchNotifier, Finalizable, MergeFinalizable},
+    finalization::{AddBatchNotifier, Finalizable, GroupedFinalizable},
 };
 
 /// Event handling behavior when a buffer is full.
@@ -100,7 +100,6 @@ impl Arbitrary for WhenFull {
 pub trait InMemoryBufferable:
     AddBatchNotifier
     + Finalizable
-    + MergeFinalizable
     + ByteSizeOf
     + EventCount
     + Debug
@@ -116,7 +115,6 @@ pub trait InMemoryBufferable:
 impl<T> InMemoryBufferable for T where
     T: AddBatchNotifier
         + Finalizable
-        + MergeFinalizable
         + ByteSizeOf
         + EventCount
         + Debug
@@ -131,10 +129,10 @@ impl<T> InMemoryBufferable for T where
 /// An item that can be buffered.
 ///
 /// This supertrait serves as the base trait for any item that can be pushed into a buffer.
-pub trait Bufferable: InMemoryBufferable + Encodable {}
+pub trait Bufferable: InMemoryBufferable + Encodable + GroupedFinalizable {}
 
 // Blanket implementation for anything that is already bufferable.
-impl<T> Bufferable for T where T: InMemoryBufferable + Encodable {}
+impl<T> Bufferable for T where T: InMemoryBufferable + Encodable + GroupedFinalizable {}
 
 /// Hook for observing items as they are sent into a `BufferSender`.
 pub trait BufferInstrumentation<T: Bufferable>: Send + Sync + 'static {

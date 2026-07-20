@@ -12,7 +12,7 @@ use vector_common::{
     byte_size_of::ByteSizeOf,
     finalization::{
         AddBatchNotifier, BatchNotifier, EventFinalizerGroups, EventFinalizers, Finalizable,
-        MergeFinalizable,
+        GroupedFinalizable, MergeFinalizable,
     },
     json_size::JsonSize,
 };
@@ -327,37 +327,7 @@ impl Finalizable for EventArray {
     }
 }
 
-impl MergeFinalizable for EventArray {
-    fn merge_finalizers(&mut self, finalizers: EventFinalizers) {
-        // Flat finalizers no longer carry their original element ownership, so this lossy fallback
-        // can only attach them to one surviving element. Retry/recovery paths where an `EventArray`
-        // may later split into individual events must use grouped finalizer take/merge instead.
-        if finalizers.is_empty() {
-            return;
-        }
-
-        match self {
-            Self::Logs(a) => {
-                let e = a
-                    .first_mut()
-                    .expect("merge_finalizers called on an empty EventArray");
-                e.merge_finalizers(finalizers);
-            }
-            Self::Metrics(a) => {
-                let e = a
-                    .first_mut()
-                    .expect("merge_finalizers called on an empty EventArray");
-                e.merge_finalizers(finalizers);
-            }
-            Self::Traces(a) => {
-                let e = a
-                    .first_mut()
-                    .expect("merge_finalizers called on an empty EventArray");
-                e.merge_finalizers(finalizers);
-            }
-        }
-    }
-
+impl GroupedFinalizable for EventArray {
     fn merge_finalizer_groups(&mut self, finalizers: EventFinalizerGroups) {
         fn merge_into<T: MergeFinalizable>(items: &mut [T], finalizers: EventFinalizerGroups) {
             assert_eq!(
@@ -418,6 +388,16 @@ mod tests {
         drop(second_finalizers);
 
         assert_eq!(second_rx.try_recv(), Ok(BatchStatus::Errored));
+    }
+
+    #[test]
+    fn empty_event_array_grouped_round_trip() {
+        let mut array = EventArray::Logs(Vec::new());
+        let finalizers = array.take_finalizer_groups();
+
+        assert!(finalizers.is_empty());
+        array.merge_finalizer_groups(finalizers);
+        assert!(array.is_empty());
     }
 }
 

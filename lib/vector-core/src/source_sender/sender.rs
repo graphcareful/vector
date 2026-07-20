@@ -18,7 +18,6 @@ use vector_common::{
     byte_size_of::ByteSizeOf,
     finalization::{
         AddBatchNotifier, BatchNotifier, EventFinalizerGroups, EventFinalizers, Finalizable,
-        MergeFinalizable,
     },
     json_size::JsonSize,
 };
@@ -67,16 +66,6 @@ impl Finalizable for SourceSenderItem {
 
     fn take_finalizer_groups(&mut self) -> EventFinalizerGroups {
         self.events.take_finalizer_groups()
-    }
-}
-
-impl MergeFinalizable for SourceSenderItem {
-    fn merge_finalizers(&mut self, finalizers: EventFinalizers) {
-        self.events.merge_finalizers(finalizers);
-    }
-
-    fn merge_finalizer_groups(&mut self, finalizers: EventFinalizerGroups) {
-        self.events.merge_finalizer_groups(finalizers);
     }
 }
 

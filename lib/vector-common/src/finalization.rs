@@ -455,23 +455,24 @@ pub trait Finalizable {
     }
 }
 
-/// A [`Finalizable`] object whose finalizers can be reattached after being taken.
-///
-/// Used to reattach finalizers to a record that is being returned for retry (e.g. when a
-/// `disk_v2` write is rejected because the buffer is full). This is a separate trait from
-/// [`Finalizable`], with no default implementation, so that only types actually used as a
-/// `Bufferable`/`InMemoryBufferable` item — the ones that can hit a buffer-full retry path — are
-/// required by the compiler to implement it. Types that only ever have their finalizers taken
-/// once (e.g. sink request/service types) are unaffected.
+/// A scalar [`Finalizable`] object whose finalizers can be reattached after being taken.
 pub trait MergeFinalizable: Finalizable {
     /// Merges the given finalizers back into this object.
     fn merge_finalizers(&mut self, finalizers: EventFinalizers);
+}
 
+/// A [`Finalizable`] buffer record whose grouped finalizers can be reattached after being taken.
+///
+/// Used to reattach finalizers to a record that is being returned for retry, such as when a
+/// `disk_v2` write is rejected because the buffer is full. Scalar records receive this behavior
+/// automatically through [`MergeFinalizable`]. Containers that can later split into independently
+/// finalized events must implement this trait directly to preserve each finalizer group's owner.
+pub trait GroupedFinalizable: Finalizable {
     /// Merges grouped finalizers back into this object.
-    ///
-    /// The default implementation flattens all groups before calling [`Self::merge_finalizers`]. Container
-    /// types that can later split into independently-finalized events should override this method
-    /// and reattach each group to the corresponding event.
+    fn merge_finalizer_groups(&mut self, finalizers: EventFinalizerGroups);
+}
+
+impl<T: MergeFinalizable> GroupedFinalizable for T {
     fn merge_finalizer_groups(&mut self, finalizers: EventFinalizerGroups) {
         self.merge_finalizers(finalizers.flatten());
     }
@@ -547,6 +548,22 @@ mod tests {
         assert_eq!(receiver1.try_recv(), Err(Empty));
         assert_eq!(receiver2.try_recv(), Err(Empty));
         drop(fin0);
+        assert_eq!(receiver1.try_recv(), Ok(BatchStatus::Delivered));
+        assert_eq!(receiver2.try_recv(), Ok(BatchStatus::Delivered));
+    }
+
+    #[test]
+    fn scalar_grouped_merge_flattens_groups() {
+        let (fin1, mut receiver1) = make_finalizer();
+        let (fin2, mut receiver2) = make_finalizer();
+        let mut merged = EventFinalizers::default();
+
+        merged.merge_finalizer_groups(EventFinalizerGroups::from_groups(vec![fin1, fin2]));
+        assert_eq!(merged.len(), 2);
+        assert_eq!(receiver1.try_recv(), Err(Empty));
+        assert_eq!(receiver2.try_recv(), Err(Empty));
+
+        drop(merged);
         assert_eq!(receiver1.try_recv(), Ok(BatchStatus::Delivered));
         assert_eq!(receiver2.try_recv(), Ok(BatchStatus::Delivered));
     }
