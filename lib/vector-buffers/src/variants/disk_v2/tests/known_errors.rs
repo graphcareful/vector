@@ -249,13 +249,13 @@ async fn reader_throws_error_when_finished_file_has_truncated_record_data() {
 }
 
 #[tokio::test]
-async fn reader_accounts_abandoned_tail_when_runtime_bad_read_rolls_file() {
+async fn reader_skips_corrupted_record_and_continues_current_data_file() {
     with_temp_dir(|dir| {
         let data_dir = dir.to_path_buf();
 
         async move {
             let (mut writer, mut reader, ledger) =
-                create_buffer_v2_with_max_data_file_size(data_dir.clone(), 172).await;
+                create_default_buffer_v2(data_dir.clone()).await;
 
             let first_record_size = 32;
             let first_bytes_written = writer
@@ -267,13 +267,6 @@ async fn reader_accounts_abandoned_tail_when_runtime_bad_read_rolls_file() {
                 .write_record(SizedRecord::new(second_record_size))
                 .await
                 .expect("write should not fail");
-            writer.flush().await.expect("flush should not fail");
-
-            let first_data_file_len = first_bytes_written + second_bytes_written;
-            let first_data_file_path = ledger.get_current_writer_data_file_path();
-            assert_buffer_size!(ledger, 2, first_data_file_len);
-            assert_reader_writer_v2_file_positions!(ledger, 0, 0);
-
             let third_record_size = 34;
             let third_bytes_written = writer
                 .write_record(SizedRecord::new(third_record_size))
@@ -281,72 +274,93 @@ async fn reader_accounts_abandoned_tail_when_runtime_bad_read_rolls_file() {
                 .expect("write should not fail");
             writer.flush().await.expect("flush should not fail");
 
-            assert_buffer_size!(ledger, 3, first_data_file_len + third_bytes_written);
-            assert_reader_writer_v2_file_positions!(ledger, 0, 1);
+            let initial_data_file_len =
+                first_bytes_written + second_bytes_written + third_bytes_written;
+            let data_file_path = ledger.get_current_writer_data_file_path();
+            assert_buffer_size!(ledger, 3, initial_data_file_len);
+            assert_reader_writer_v2_file_positions!(ledger, 0, 0);
 
-            // Corrupt the already-open reader file after startup while preserving its length, so
-            // the runtime bad-read path accounts for the whole abandoned unread tail rather than
-            // startup recovery truncating it first.
-            let mut data_file = OpenOptions::new()
+            // Flip only the checksum of the middle record. Its length delimiter and archive remain
+            // valid, so the reader can consume exactly this frame and continue with the next one.
+            let data_file = OpenOptions::new()
+                .read(true)
                 .write(true)
-                .open(&first_data_file_path)
+                .open(&data_file_path)
                 .await
                 .expect("open should not fail");
             assert_eq!(
-                first_data_file_len as u64,
+                initial_data_file_len as u64,
                 data_file
                     .metadata()
                     .await
                     .expect("metadata should not fail")
                     .len()
             );
-            let corrupt_offset = u64::try_from(first_bytes_written)
-                .expect("record size should fit in u64")
-                + 8;
-            data_file
-                .seek(SeekFrom::Start(corrupt_offset))
-                .await
-                .expect("seek should not fail");
-            data_file
-                .write_all(&[0xFF; 8])
-                .await
-                .expect("write should not fail");
-            data_file.flush().await.expect("flush should not fail");
-            data_file.sync_all().await.expect("sync should not fail");
-            drop(data_file);
-            writer.close();
+
+            let std_data_file = data_file.into_std().await;
+            let mut data_file_mmap =
+                unsafe { MmapMut::map_mut(&std_data_file).expect("mmap should not fail") };
+            drop(std_data_file);
+            let second_record_end = first_bytes_written + second_bytes_written;
+            {
+                let mut backed_record = BackedArchive::<_, Record>::from_backing(
+                    &mut data_file_mmap[first_bytes_written..second_record_end],
+                )
+                .expect("archive should not fail");
+                let record = backed_record.get_archive_mut();
+                let projected_checksum =
+                    unsafe { record.map_unchecked_mut(|record| &mut record.checksum) };
+                let projected_checksum = projected_checksum.get_mut();
+                *projected_checksum ^= 1 << 15;
+            }
+            data_file_mmap.flush().expect("flush should not fail");
+            drop(data_file_mmap);
 
             let first_read = await_timeout!(reader.next(), 2).expect("read should not fail");
             assert_eq!(first_read, Some(SizedRecord::new(first_record_size)));
             acknowledge(first_read.unwrap()).await;
 
-            let expected_after_ack = second_bytes_written + third_bytes_written;
-            let expected_after_bad_read = third_bytes_written;
             let bad_read = await_timeout!(reader.next(), 2).expect_err("read should fail");
-            assert!(matches!(
-                bad_read,
-                ReaderError::Checksum { .. }
-                    | ReaderError::Deserialization { .. }
-                    | ReaderError::PartialWrite
-            ));
+            assert!(matches!(bad_read, ReaderError::Checksum { .. }));
             assert_eq!(
-                expected_after_bad_read as u64,
+                third_bytes_written as u64,
                 ledger.get_total_buffer_size(),
-                "runtime bad-read recovery should subtract the unread abandoned tail from the buffer size"
+                "the acknowledged first record and corrupted second record should both be removed from byte occupancy"
             );
-            assert!(
-                ledger.get_total_buffer_size() < expected_after_ack as u64,
-                "test should prove the abandoned-tail accounting changed the buffer size"
+            assert_reader_writer_v2_file_positions!(ledger, 0, 0);
+
+            // The checksum error must not retire the file. Append another record to the same file
+            // after the reader has skipped the corrupt frame.
+            let fourth_record_size = 35;
+            let fourth_bytes_written = writer
+                .write_record(SizedRecord::new(fourth_record_size))
+                .await
+                .expect("write should not fail");
+            writer.flush().await.expect("flush should not fail");
+            assert_eq!(
+                (third_bytes_written + fourth_bytes_written) as u64,
+                ledger.get_total_buffer_size()
             );
-            assert_reader_writer_v2_file_positions!(ledger, 1, 1);
+            assert_reader_writer_v2_file_positions!(ledger, 0, 0);
 
             let third_read = await_timeout!(reader.next(), 2).expect("read should not fail");
             assert_eq!(third_read, Some(SizedRecord::new(third_record_size)));
             acknowledge(third_read.unwrap()).await;
 
+            let fourth_read = await_timeout!(reader.next(), 2).expect("read should not fail");
+            assert_eq!(fourth_read, Some(SizedRecord::new(fourth_record_size)));
+            assert_eq!(
+                fourth_bytes_written as u64,
+                ledger.get_total_buffer_size(),
+                "acknowledging the third record should leave only the fourth record occupied"
+            );
+            acknowledge(fourth_read.unwrap()).await;
+
+            writer.close();
             let final_read = await_timeout!(reader.next(), 2).expect("read should not fail");
             assert_eq!(final_read, None);
-            assert_reader_writer_v2_file_positions!(ledger, 1, 1);
+            assert_eq!(0, ledger.get_total_buffer_size());
+            assert_reader_writer_v2_file_positions!(ledger, 0, 0);
         }
     })
     .await;
