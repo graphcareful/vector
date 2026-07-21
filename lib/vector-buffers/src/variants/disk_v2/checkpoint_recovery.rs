@@ -54,6 +54,9 @@ impl CheckpointRecord {
 struct CheckpointBoundaryScanResult {
     logical_file_size: u64,
     acknowledged_prefix_bytes: u64,
+    last_checkpoint_record_id: Option<u64>,
+    last_checkpoint_record_next_id: Option<u64>,
+    has_trailing_corrupt_records: bool,
 }
 
 enum DataFileClassification {
@@ -75,10 +78,57 @@ impl CheckpointBoundaryScanResult {
             self.acknowledged_prefix_bytes = record_end_offset;
         }
         self.logical_file_size = record_end_offset;
+        self.last_checkpoint_record_id = Some(record.checkpoint_last_id());
+        self.last_checkpoint_record_next_id = record.next_id;
+        self.has_trailing_corrupt_records = false;
+    }
+
+    /// Includes a complete corrupt record whose physical byte span is still part of the file.
+    fn include_corrupt_record(&mut self, record_bytes: u64) {
+        self.logical_file_size += record_bytes;
+        self.has_trailing_corrupt_records = true;
+    }
+
+    /// Returns whether the validated prefix proves that the next frame starts at or beyond the
+    /// durable writer checkpoint.
+    fn corrupt_record_is_provably_post_checkpoint(&self, writer_next_record_id: u64) -> bool {
+        writer_next_record_id == 1
+            || self.last_checkpoint_record_next_id == Some(writer_next_record_id)
+    }
+
+    /// Extends the acknowledged prefix through corrupt records that the durable reader checkpoint
+    /// proves were already traversed.
+    fn reconcile_corrupt_acknowledged_prefix(
+        &mut self,
+        skip_through_record_id: u64,
+        next_record_id: Option<u64>,
+    ) {
+        if !self.has_trailing_corrupt_records {
+            return;
+        }
+
+        let checkpoint_is_after_last_valid_record = self
+            .last_checkpoint_record_id
+            .is_some_and(|last_record_id| last_record_id < skip_through_record_id);
+        let checkpoint_is_before_next_valid_record =
+            next_record_id.is_none_or(|record_id| skip_through_record_id < record_id);
+
+        if checkpoint_is_after_last_valid_record && checkpoint_is_before_next_valid_record {
+            self.acknowledged_prefix_bytes = self.logical_file_size;
+        }
+    }
+
+    fn include_reader_record(&mut self, record: &CheckpointRecord, skip_through_record_id: u64) {
+        self.reconcile_corrupt_acknowledged_prefix(skip_through_record_id, Some(record.id));
+        self.include_record(
+            record,
+            record.checkpoint_last_id() <= skip_through_record_id,
+        );
     }
 
     /// Returns the checkpoint-live bytes after excluding the acknowledged prefix.
-    fn unread_bytes(&self) -> u64 {
+    fn unread_bytes(mut self, skip_through_record_id: u64) -> u64 {
+        self.reconcile_corrupt_acknowledged_prefix(skip_through_record_id, None);
         debug_assert!(self.logical_file_size >= self.acknowledged_prefix_bytes);
         self.logical_file_size - self.acknowledged_prefix_bytes
     }
@@ -384,7 +434,8 @@ where
                 &mut record_reader,
                 data_file_id,
                 data_file_path,
-                scan_result.current_offset(),
+                &mut scan_result,
+                None,
             )
             .await?
         {
@@ -394,13 +445,10 @@ where
                 data_file_id,
                 data_file_path,
             );
-            scan_result.include_record(
-                &record,
-                record.checkpoint_last_id() <= skip_through_record_id,
-            );
+            scan_result.include_reader_record(&record, skip_through_record_id);
         }
 
-        Ok(scan_result.unread_bytes())
+        Ok(scan_result.unread_bytes(skip_through_record_id))
     }
 
     /// Scans the writer boundary, truncating data beyond the durable writer checkpoint.
@@ -432,7 +480,8 @@ where
                 &mut record_reader,
                 data_file_id,
                 data_file_path,
-                scan_result.current_offset(),
+                &mut scan_result,
+                Some(stop_before_record_id),
             )
             .await?
         {
@@ -505,7 +554,8 @@ where
                 &mut record_reader,
                 data_file_id,
                 data_file_path,
-                scan_result.current_offset(),
+                &mut scan_result,
+                Some(stop_before_record_id),
             )
             .await?
         {
@@ -541,13 +591,10 @@ where
                 break;
             }
 
-            scan_result.include_record(
-                &record,
-                record.checkpoint_last_id() <= skip_through_record_id,
-            );
+            scan_result.include_reader_record(&record, skip_through_record_id);
         }
 
-        Ok(scan_result.unread_bytes())
+        Ok(scan_result.unread_bytes(skip_through_record_id))
     }
 
     /// Opens a boundary file while treating a missing checkpointed file as lost rather than fatal.
@@ -579,31 +626,71 @@ where
         }
     }
 
-    /// Reads the next checkpoint record and truncates torn tails at the last valid record boundary.
+    /// Reads the next checkpoint record, preserving complete corrupt frames while truncating torn
+    /// tails at the last complete record boundary.
     async fn try_next_checkpoint_record(
         &self,
         record_reader: &mut RecordReader<FS::File, T>,
         data_file_id: u16,
         data_file_path: &Path,
-        record_start_offset: u64,
+        scan_result: &mut CheckpointBoundaryScanResult,
+        writer_next_record_id: Option<u64>,
     ) -> Result<Option<ReadToken>, ReaderError<T>> {
-        match record_reader.try_next_record(true).await {
-            Ok(Some(token)) => Ok(Some(token)),
-            Ok(None) => Ok(None),
-            Err(e) if e.is_bad_read() => {
-                warn!(
-                    data_file_id,
-                    data_file_path = data_file_path.to_string_lossy().as_ref(),
-                    truncate_at = record_start_offset,
-                    error = %e,
-                    "Truncating torn data file tail at last valid record boundary."
-                );
-                self.truncate_data_file(data_file_path, record_start_offset)
-                    .await
-                    .map_err(|source| ReaderError::Io { source })?;
-                Ok(None)
+        loop {
+            match record_reader.try_next_record(true).await {
+                Ok(Some(token)) => return Ok(Some(token)),
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    if let Some(record_bytes) = e.consumed_record_bytes() {
+                        if writer_next_record_id.is_some_and(|writer_next_record_id| {
+                            scan_result
+                                .corrupt_record_is_provably_post_checkpoint(writer_next_record_id)
+                        }) {
+                            let record_start_offset = scan_result.current_offset();
+                            warn!(
+                                data_file_id,
+                                data_file_path = data_file_path.to_string_lossy().as_ref(),
+                                truncate_at = record_start_offset,
+                                record_bytes,
+                                error = %e,
+                                "Truncating complete corrupt record proven to be beyond the durable writer checkpoint."
+                            );
+                            self.truncate_data_file(data_file_path, record_start_offset)
+                                .await
+                                .map_err(|source| ReaderError::Io { source })?;
+                            return Ok(None);
+                        }
+
+                        warn!(
+                            data_file_id,
+                            data_file_path = data_file_path.to_string_lossy().as_ref(),
+                            record_start_offset = scan_result.current_offset(),
+                            record_bytes,
+                            error = %e,
+                            "Preserving complete corrupt checkpoint record and continuing scan."
+                        );
+                        scan_result.include_corrupt_record(record_bytes);
+                        continue;
+                    }
+
+                    if e.is_bad_read() {
+                        let record_start_offset = scan_result.current_offset();
+                        warn!(
+                            data_file_id,
+                            data_file_path = data_file_path.to_string_lossy().as_ref(),
+                            truncate_at = record_start_offset,
+                            error = %e,
+                            "Truncating torn data file tail at last complete record boundary."
+                        );
+                        self.truncate_data_file(data_file_path, record_start_offset)
+                            .await
+                            .map_err(|source| ReaderError::Io { source })?;
+                        return Ok(None);
+                    }
+
+                    return Err(e);
+                }
             }
-            Err(e) => Err(e),
         }
     }
 
