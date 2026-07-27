@@ -550,6 +550,10 @@ ntapi = { git = "https://github.com/MSxDOS/ntapi.git", rev = "24fc1e47677fc9f6e3
 default = ["enable-api-client", "sources-dnstap", "tikv-jemallocator"]
 antithesis-scenario-memory = ["dep:antithesis-instrumentation"]
 antithesis-scenario-disk = ["dep:antithesis-instrumentation", "vector-lib/antithesis-disk-asserts"]
+# Like antithesis-scenario-disk but without the disk-buffer Sometimes assertions (torn record,
+# full-buffer-block). Those assertions require specific fault conditions that the disk_progress
+# scenario's workload doesn't exercise, so they would show as unreachable coverage gaps.
+antithesis-scenario-disk-progress = ["dep:antithesis-instrumentation", "vector-lib/antithesis-disk-tuning"]
 # Default features for `cargo docs`. We're not using `gssapi` which would require installing libsasl2 in our doc environment.
 docs = ["enable-api-client", "sources-dnstap"]
 # Default features for *-unknown-linux-* which make use of `cmake` for dependencies
