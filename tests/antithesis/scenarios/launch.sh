@@ -13,7 +13,8 @@
 # launch.env (sourced from the scenario directory) sets:
 #   SCENARIO_TEST_NAME      test name reported to Antithesis
 #   SCENARIO_DESCRIPTION    human description; the git commit is appended
-#   SCENARIO_FAULT_NODES    space-separated SUT container names to fault
+#   SCENARIO_FAULT_NODES    space-separated SUT container names to fault; empty
+#                           means no node-level faults (network + clock still apply)
 #   SCENARIO_WEBHOOK        optional; tenant webhook, default persistent_storage
 #
 # Required environment (read by snouty):
@@ -62,7 +63,7 @@ WEBHOOK="${WEBHOOK:-${SCENARIO_WEBHOOK:-persistent_storage}}"
 DURATION="${DURATION:-30}"
 TEST_NAME="${TEST_NAME:-${SCENARIO_TEST_NAME:?launch.env must set SCENARIO_TEST_NAME}}"
 DESCRIPTION="${DESCRIPTION:-$SCENARIO_DESCRIPTION} (commit ${GIT_SHA})"
-FAULT_NODES="${FAULT_NODES:-${SCENARIO_FAULT_NODES:?launch.env must set SCENARIO_FAULT_NODES}}"
+FAULT_NODES="${FAULT_NODES:-$SCENARIO_FAULT_NODES}"
 
 # Property-history key. Passing --source makes the run tracked (not ephemeral),
 # so findings are produced and each property's history is grouped by this key.
@@ -82,13 +83,18 @@ SOURCE="${SOURCE:-$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null
 # /claim and /acked inside the oracle container are never network-faulted
 # regardless.) cpu_mod perturbs the source/sink/ack races; clock_jitter stresses
 # timers.
-FAULTS=(
-  --param custom.include_for_node_termination="$FAULT_NODES"
-  --param custom.include_for_node_hang="$FAULT_NODES"
-  --param custom.include_for_node_throttle="$FAULT_NODES"
-  --param custom.cpu_mod=true
-  --param custom.clock_jitter=true
-)
+FAULTS=(--param custom.clock_jitter=true)
+# Node-level faults only when the scenario names nodes to fault. Node termination
+# kills a process, tearing its buffer's last data file; a scenario that asserts
+# exact disk-buffer drop counts leaves SCENARIO_FAULT_NODES empty to opt out.
+if [[ -n "$FAULT_NODES" ]]; then
+  FAULTS+=(
+    --param custom.include_for_node_termination="$FAULT_NODES"
+    --param custom.include_for_node_hang="$FAULT_NODES"
+    --param custom.include_for_node_throttle="$FAULT_NODES"
+    --param custom.cpu_mod=true
+  )
+fi
 
 for v in ANTITHESIS_TENANT ANTITHESIS_REPOSITORY; do
   if [[ -z "${!v:-}" ]]; then
