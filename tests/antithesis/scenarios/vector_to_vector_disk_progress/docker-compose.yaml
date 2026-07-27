@@ -1,0 +1,60 @@
+name: vector-to-vector-disk-progress
+
+x-vector-build: &vector-build
+  context: ../../../..
+  dockerfile: tests/antithesis/scenarios/vector_to_vector_disk_progress/Dockerfile
+  target: vector
+
+x-node-health: &node-health
+  test: ["CMD", "curl", "-fsS", "http://localhost:9598/metrics"]
+  interval: 5s
+  timeout: 3s
+  retries: 30
+  start_period: 10s
+
+services:
+  head:
+    container_name: head
+    hostname: head
+    platform: linux/amd64
+    init: true
+    build: *vector-build
+    image: vdp-vector:${ANTITHESIS_IMAGE_TAG:-dev}
+    entrypoint: ["/usr/bin/vector", "--config", "/etc/vector/head.yaml"]
+    environment:
+      NO_COLOR: "1"
+      # info retains everything triage relies on: the id-trace (info) and the WARN-level buffer
+      # signals (bad-read, gap). The debug-level buffer-size recompute and data-file delete lines
+      # are noise for this scenario and drop us below the 200 MB/core-hour Antithesis threshold.
+      VECTOR_LOG: "info"
+      # Trace the harness `id` at each source ingress to localize where records are dropped.
+      VECTOR_ANTITHESIS_ID_TRACE: "1"
+      # The Antithesis-only tuning hook applies this to both the data-file and
+      # record limit. The 768KiB payload class is therefore an oversized record.
+      VECTOR_DISK_V2_MAX_DATA_FILE_SIZE: "65536"
+    volumes: ["vdp-buffer-head:/var/lib/vector"]
+    healthcheck: *node-health
+
+  oracle:
+    container_name: oracle
+    hostname: oracle
+    platform: linux/amd64
+    init: true
+    build:
+      context: ../../../..
+      dockerfile: tests/antithesis/scenarios/vector_to_vector_disk_progress/Dockerfile
+      target: workload
+    image: vdp-oracle:${ANTITHESIS_IMAGE_TAG:-dev}
+    environment:
+      NO_COLOR: "1"
+      SCENARIO_NAME: "vector_to_vector_disk_progress"
+      VECTOR_SOURCE_URL: "http://head:8080/"
+      VECTOR_METRICS_URL: "http://head:9598/metrics"
+      VECTOR_METRICS_URLS: "http://head:9598/metrics"
+      # Test commands run in this container, so they reach the oracle locally.
+      ORACLE_URL: "http://127.0.0.1:8686"
+    depends_on:
+      head: { condition: service_healthy }
+
+volumes:
+  vdp-buffer-head:
