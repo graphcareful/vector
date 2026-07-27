@@ -19,6 +19,21 @@ const PAYLOAD_LENGTHS: [usize; 8] = [
     768 * 1024,
 ];
 
+fn payload_length(id: u64) -> usize {
+    PAYLOAD_LENGTHS[(id % PAYLOAD_LENGTHS.len() as u64) as usize]
+}
+
+/// True for the payload class that always exceeds the 64KiB record cap used by
+/// the oversized-record scenario, even before record framing is added.
+pub fn is_guaranteed_oversized_payload(id: u64) -> bool {
+    payload_length(id) == 768 * 1024
+}
+
+/// True for the small probe class used to prove later writes still make progress.
+pub fn is_small_payload(id: u64) -> bool {
+    payload_length(id) == 1
+}
+
 /// One splitmix64 step. A full-avalanche mixer, so flipping any input bit
 /// scrambles the whole output. Seeding the stream with this keyed by id means a
 /// length-preserving corruption still changes the bytes the oracle expects.
@@ -35,7 +50,7 @@ fn splitmix64(state: &mut u64) -> u64 {
 /// the same expected bytes with no per-id state to carry. Length comes from the
 /// id's class; content is a splitmix64 stream seeded by id.
 pub fn payload_for(id: u64) -> Vec<u8> {
-    let len = PAYLOAD_LENGTHS[(id % PAYLOAD_LENGTHS.len() as u64) as usize];
+    let len = payload_length(id);
     let mut out = Vec::with_capacity(len);
     let mut state = id;
     while out.len() < len {
