@@ -5,6 +5,8 @@
 //! Endpoints:
 //!   POST /claim          -> one fresh id (body is the id)
 //!   POST /acked          -> newline-separated ids the pipeline acked (must come back)
+//!   POST /expect/delivery -> newline-separated ids that must arrive at the oracle
+//!   POST /expect/drop     -> newline-separated ids that must not arrive at the oracle
 //!   POST /ingest         -> the pipeline's egress sink delivers the round trip here
 //!   GET  /report         -> JSON: issued/acked/delivered/delivered_total/missing/spurious/corrupted
 //!   GET  /delivered?id=X -> "1" if returned, else "0"
@@ -54,6 +56,8 @@ struct Args {
 #[derive(Default)]
 struct Sets {
     issued: HashSet<u64>,
+    expected_delivered: HashSet<u64>,
+    expected_dropped: HashSet<u64>,
     acked: HashSet<u64>,
     delivered: HashSet<u64>,
     delivered_total: u64,
@@ -122,6 +126,34 @@ async fn acked(State(st): State<Arc<AppState>>, body: String) -> StatusCode {
     StatusCode::OK
 }
 
+async fn expect_delivery(State(st): State<Arc<AppState>>, body: String) -> StatusCode {
+    let mut sets = st.sets.lock().unwrap();
+    for id in body
+        .lines()
+        .filter_map(|line| line.trim().parse::<u64>().ok())
+    {
+        if !sets.issued.contains(&id) {
+            return StatusCode::BAD_REQUEST;
+        }
+        sets.expected_delivered.insert(id);
+    }
+    StatusCode::OK
+}
+
+async fn expect_drop(State(st): State<Arc<AppState>>, body: String) -> StatusCode {
+    let mut sets = st.sets.lock().unwrap();
+    for id in body
+        .lines()
+        .filter_map(|line| line.trim().parse::<u64>().ok())
+    {
+        if !sets.issued.contains(&id) {
+            return StatusCode::BAD_REQUEST;
+        }
+        sets.expected_dropped.insert(id);
+    }
+    StatusCode::OK
+}
+
 async fn ingest(State(st): State<Arc<AppState>>, body: String) -> StatusCode {
     let (records, understood) = parse_delivered(&body);
     // 200 only if understood, so the sink never counts an unparseable body as
@@ -154,6 +186,12 @@ async fn ingest(State(st): State<Arc<AppState>>, body: String) -> StatusCode {
                 sets.corrupted += 1;
             }
 
+            assert_always!(
+                !sets.expected_dropped.contains(&id),
+                "an oversized record expected to be dropped never reaches the oracle",
+                &json!({ "id": id })
+            );
+
             sets.delivered.insert(id);
             sets.delivered_total += 1;
         }
@@ -181,6 +219,10 @@ async fn report(State(st): State<Arc<AppState>>) -> String {
         "missing_sample": missing,
         "spurious_count": sets.delivered.difference(&sets.issued).count(),
         "corrupted_count": sets.corrupted,
+        "expected_delivered_count": sets.expected_delivered.len(),
+        "expected_delivered_missing_count": sets.expected_delivered.difference(&sets.delivered).count(),
+        "expected_dropped_count": sets.expected_dropped.len(),
+        "expected_dropped_delivered_count": sets.expected_dropped.intersection(&sets.delivered).count(),
     })
     .to_string()
 }
@@ -227,6 +269,8 @@ async fn main() {
     let app = Router::new()
         .route("/claim", post(claim))
         .route("/acked", post(acked))
+        .route("/expect/delivery", post(expect_delivery))
+        .route("/expect/drop", post(expect_drop))
         .route("/ingest", post(ingest))
         .route("/report", get(report))
         .route("/delivered", get(delivered))
