@@ -76,6 +76,108 @@ pub fn decode_payload_field(field: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// ---------------------------------------------------------------------------
+// Shared oracle / pipeline HTTP helpers.
+//
+// The oracle protocol (/claim, /acked, /delivered) and the source data path are
+// identical across scenarios, so the drivers and eventually-phase checks share
+// these instead of each carrying a private copy.
+// ---------------------------------------------------------------------------
+
+use std::time::Duration;
+
+use serde_json::json;
+
+/// Claim one fresh id from the oracle. `None` if the oracle is unreachable.
+pub async fn claim(client: &reqwest::Client, oracle_url: &str) -> Option<u64> {
+    let resp = client
+        .post(format!("{oracle_url}/claim"))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    resp.text().await.ok()?.trim().parse().ok()
+}
+
+/// Claim ids until one satisfies `matches`, up to 8 attempts. A claimed id that
+/// does not match is simply not used — it is issued-but-never-acked, so it is no
+/// obligation and no false loss.
+pub async fn claim_matching_payload(
+    client: &reqwest::Client,
+    oracle_url: &str,
+    matches: fn(u64) -> bool,
+) -> Option<u64> {
+    for _ in 0..8 {
+        let id = claim(client, oracle_url).await?;
+        if matches(id) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// Tell the oracle the pipeline acked `id`, so it must come back. Returns whether
+/// the oracle recorded the obligation.
+pub async fn report_acked(client: &reqwest::Client, oracle_url: &str, id: u64) -> bool {
+    matches!(
+        client
+            .post(format!("{oracle_url}/acked"))
+            .timeout(Duration::from_secs(10))
+            .body(id.to_string())
+            .send()
+            .await,
+        Ok(resp) if resp.status().is_success()
+    )
+}
+
+/// POST one event (its id and the deterministic payload for that id) to the
+/// source. `true` on a 2xx, meaning the pipeline took responsibility for the
+/// event. The payload is a pure function of the id, so every retry re-sends the
+/// exact same bytes and the oracle can recompute what to expect.
+pub async fn post_event(
+    client: &reqwest::Client,
+    source_url: &str,
+    id: u64,
+    timeout: Duration,
+) -> bool {
+    let event = json!([{ "id": id, "data": payload_field(id) }]);
+    matches!(
+        client.post(source_url).timeout(timeout).json(&event).send().await,
+        Ok(resp) if resp.status().is_success()
+    )
+}
+
+/// True once the oracle has recorded delivery of the round-tripped record `id`.
+pub async fn delivered_contains(client: &reqwest::Client, oracle_url: &str, id: u64) -> bool {
+    let Ok(resp) = client
+        .get(format!("{oracle_url}/delivered?id={id}"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    resp.text().await.map(|s| s.trim() == "1").unwrap_or(false)
+}
+
+/// Whether a single node's metrics endpoint answers 2xx.
+pub async fn node_healthy(client: &reqwest::Client, metrics_url: &str) -> bool {
+    matches!(
+        client.get(metrics_url).timeout(Duration::from_secs(3)).send().await,
+        Ok(resp) if resp.status().is_success()
+    )
+}
+
+/// Whether every node's metrics endpoint answers 2xx.
+pub async fn all_healthy(client: &reqwest::Client, metrics_urls: &[String]) -> bool {
+    for u in metrics_urls {
+        if !node_healthy(client, u).await {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
