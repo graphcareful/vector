@@ -1,0 +1,62 @@
+name: vector-disk-crash-soundness
+
+x-vector-build: &vector-build
+  context: ../../../..
+  dockerfile: tests/antithesis/scenarios/vector_disk_crash_soundness/Dockerfile
+  target: vector
+
+x-node-health: &node-health
+  test: ["CMD", "curl", "-fsS", "http://localhost:9598/metrics"]
+  interval: 5s
+  timeout: 3s
+  retries: 30
+  start_period: 10s
+
+services:
+  vector:
+    container_name: vector
+    hostname: vector
+    platform: linux/amd64
+    init: true
+    build: *vector-build
+    image: vdcs-vector:${ANTITHESIS_IMAGE_TAG:-dev}
+    entrypoint: ["/usr/bin/vector", "--config", "/etc/vector/vector.yaml"]
+    environment:
+      NO_COLOR: "1"
+      # info retains the WARN-level buffer signals (bad-read, gap) triage relies
+      # on; the debug-level buffer-size recompute and data-file delete lines are
+      # noise here and drop us below the 200 MB/core-hour Antithesis threshold.
+      VECTOR_LOG: "info"
+      # Shrink the disk-buffer data file from the 128MiB default so files fill and
+      # roll constantly under fault-injected load -- that is what reaches the rare
+      # recovery paths a crash needs to exercise: reopening a file whose last
+      # write was cut short, and reusing a file number after a roll. Floored to
+      # hold the largest payload class (768KiB raw, ~1.5MiB hex-encoded); 2MiB
+      # leaves headroom for record framing.
+      VECTOR_DISK_V2_MAX_DATA_FILE_SIZE: "2097152"
+    volumes: ["vdcs-buffer:/var/lib/vector"]
+    healthcheck: *node-health
+
+  oracle:
+    container_name: oracle
+    hostname: oracle
+    platform: linux/amd64
+    init: true
+    build:
+      context: ../../../..
+      dockerfile: tests/antithesis/scenarios/vector_disk_crash_soundness/Dockerfile
+      target: workload
+    image: vdcs-oracle:${ANTITHESIS_IMAGE_TAG:-dev}
+    environment:
+      NO_COLOR: "1"
+      SCENARIO_NAME: "vector_disk_crash_soundness"
+      VECTOR_SOURCE_URL: "http://vector:8080/"
+      VECTOR_METRICS_URL: "http://vector:9598/metrics"
+      VECTOR_METRICS_URLS: "http://vector:9598/metrics"
+      # Test commands run in this container, so they reach the oracle locally.
+      ORACLE_URL: "http://127.0.0.1:8686"
+    depends_on:
+      vector: { condition: service_healthy }
+
+volumes:
+  vdcs-buffer:
