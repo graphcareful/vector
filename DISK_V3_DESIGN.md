@@ -46,8 +46,8 @@ watermark may have advanced.
 - Explicit accepted, committed, data-synchronized, durable,
   observed-acknowledged, and reclaimable-acknowledged progress.
 - Batched writes and group synchronization.
-- Logical capacity derived from the segment catalog and frame-boundary
-  positions rather than a mutable size counter.
+- Logical capacity recovered from the segment catalog and frame-boundary
+  positions, then maintained through checked exact-byte transitions.
 - Crash recovery from checkpoints and segment scanning.
 - Asynchronous segment deletion.
 - Deterministic fault-injection and model-based testing.
@@ -176,13 +176,13 @@ The following Rust-like interfaces show ownership and communication boundaries.
 They are design sketches rather than final public APIs.
 
 The initial implementation has a single-owner `DiskBuffer` facade over the
-low-level reader, writer, and logical-size tracker:
+low-level reader, writer, and logical-capacity manager:
 
 ```rust
 struct DiskBuffer {
     writer: SegmentedLogWriter<FilesystemSegmentStorage>,
     reader: SegmentedLogReader,
-    logical_size: Arc<LogicalBufferSize>,
+    logical_capacity: LogicalCapacity,
     acknowledgements: AcknowledgementTracker,
 }
 
@@ -210,10 +210,16 @@ impl DiskBuffer {
         directory: PathBuf,
         reclaimable: Position,
         max_frame_len: usize,
+        max_logical_bytes: u64,
         writer_config: SegmentedLogWriterConfig,
     ) -> Result<Self, DiskBufferError>;
 
-    async fn append(&mut self, frame: PreparedFrame) -> Result<(), DiskBufferError>;
+    fn capacity(&self) -> LogicalCapacity;
+    async fn append(
+        &mut self,
+        frame: PreparedFrame,
+        reservation: LogicalCapacityReservation,
+    ) -> Result<(), DiskBufferError>;
     async fn next(&mut self) -> Result<DiskBufferRead, DiskBufferError>;
     fn acknowledge(
         &mut self,
@@ -311,6 +317,16 @@ uses its dedicated control path rather than a producer operation.
 exact framed byte count in queued or batched accounting until publication moves
 those bytes into committed positional accounting. It releases the corresponding
 byte permits only when the reclaimable acknowledgement advances.
+
+The current single-owner implementation calls these types `LogicalCapacity`
+and `LogicalCapacityReservation`. A producer acquires a reservation before
+calling `DiskBuffer::append`. `append` validates that the reservation belongs to
+that buffer and matches the frame's exact encoded length. Dropping a reservation
+before successful append returns its bytes, while accepted bytes remain charged
+until a durable reader checkpoint releases them. Acquiring the reservation
+outside `append(&mut self, ...)` is essential: waiting while exclusively
+borrowing the buffer would prevent the same owner from reading, acknowledging,
+and checkpointing the data needed to free capacity.
 
 ```rust
 struct WriterActor<T, S> {
@@ -838,44 +854,45 @@ Bytes before the acknowledged boundary include every complete earlier segment
 plus `segment_byte_offset` bytes in the acknowledged segment. Bytes after the
 committed boundary normally do not exist, but subtracting a partial or otherwise
 unpublished active tail makes recovery accounting explicit. This calculation
-is needed only during startup. Normal operation maintains the result directly
-from committed and reclaimable byte deltas.
+is needed only during startup. Normal operation maintains occupancy through
+reservation and reclaimable byte deltas.
 
-### Initial logical-size tracker
+### Logical-capacity accounting
 
-The first implementation uses a shared `LogicalBufferSize` backed by one
-`AtomicU64`. `DiskBuffer` retains the concrete handle for queries and passes
-the writer a clone behind the mutation-only `LogSizeTracker` trait. The writer
-exposes no size getters and does not initialize the tracker.
+The first implementation uses a shared `LogicalCapacity` backed by one
+`AtomicU64` and a Tokio `Notify`. `DiskBuffer` retains the handle so durable
+checkpoints can release bytes, while producer-facing senders receive clones
+that can reserve bytes. All clones refer to the same occupancy counter; the
+writer neither owns nor updates capacity accounting.
 
 On startup, `DiskBuffer` recovers the writer and opens the reader at the durable
 reclaimable position. One calculation totals bytes through the committed writer
 position, and a second totals bytes through the actual reader position. Checked
 subtraction produces the initial logical size. Bytes before the reader and a
 physical tail after the writer are therefore excluded. `DiskBuffer` initializes
-the atomic with this value; no segment collection is retained.
+capacity occupancy with this value; no segment collection is retained. There
+are no in-flight reservations to recover after process restart.
 
 Normal operation uses exact byte deltas rather than positions:
 
-- After successfully publishing a batch, the writer adds its encoded byte
-  length.
+- Acquiring a reservation adds the frame's exact encoded length.
+- Dropping an unaccepted reservation subtracts that length automatically.
+- Accepting or publishing the frame does not change occupancy; it only changes
+  the frame's lifecycle state.
 - After acknowledgement progress is durable, the checkpoint owner subtracts
-  the encoded bytes that became reclaimable.
+  the encoded bytes that became reclaimable and wakes blocked producers.
 
 Rotation, segment sealing, and segment deletion do not change the logical byte
 count. Fully acknowledged segments already stopped contributing when their
 bytes became reclaimable, regardless of when their files are deleted.
 
-This counter represents committed, non-reclaimable bytes on disk. Admission
-control must separately reserve bytes accepted into the MPSC queue or
-aggregation batch but not yet committed. Keeping reservations separate avoids
-making the disk counter represent two different lifecycle states.
-
 The producer-facing adapter reserves the exact framed length before reporting
-acceptance. When a batch commits, its bytes move atomically from in-flight byte
-accounting to committed on-disk accounting. Reservations prevent concurrent
-producers, flushes, and acknowledgements from admitting more logical data than
-configured.
+acceptance. Capacity occupancy remains unchanged when a batch commits: the
+bytes merely move from an in-flight lifecycle state to a committed on-disk
+lifecycle state. Reservations prevent concurrent producers, flushes, and
+acknowledgements from admitting more logical data than configured. A future
+committed-byte metric, if needed, is observability state rather than a second
+admission counter.
 
 Using observed but non-durable acknowledgement for admission is unsafe. A
 writer could reuse capacity released by an in-memory acknowledgement, crash
@@ -889,7 +906,6 @@ Physical usage is tracked separately:
 physical usage =
     segment file lengths
     + checkpoint file length
-    + acknowledged files pending deletion
 ```
 
 There is no universal ordering between physical and logical usage. Buffered and
@@ -897,16 +913,18 @@ queued records can make logical occupancy larger, while acknowledged segments
 pending deletion can make physical usage larger. Metrics and assertions must
 not assume one is always an upper bound for the other.
 
-The existing `max_size` setting continues to mean a hard upper bound on disk
-usage, not merely a logical-data target. Disk v3 derives a lower logical
-admission limit after reserving operational headroom for an active segment, the
-checkpoint file, and deletion bookkeeping. Before an append or rotation, the
-actor enforces both the logical admission limit and the physical hard limit.
+For disk v3, `max_size` is the logical admission limit. It covers committed
+non-reclaimable frame bytes plus exact reservations for queued and batched
+frames. It does not reserve space for segment slack, rotation, the checkpoint
+file, or acknowledged files pending deletion. A single frame larger than the
+limit is rejected immediately; otherwise a full buffer blocks or follows the
+configured overflow policy until a durable acknowledgement checkpoint releases
+enough logical bytes.
 
-Asynchronous deletion failures cannot be allowed to grow physical usage without
-bound. When pending deletions consume the reserved headroom, new writes block or
-fail according to the buffer failure policy until deletion succeeds. Physical
-usage and pending-delete bytes remain visible separately.
+Physical usage and pending-delete bytes remain separately observable. Segment
+reclamation is still required to prevent stale files from accumulating, and an
+actual filesystem exhaustion error remains fatal to the running buffer, but
+physical file sizes do not alter logical admission.
 
 ## Segment lifecycle
 
@@ -1013,8 +1031,8 @@ The error policy is operation-specific:
   or dropped record according to existing buffer semantics and does not corrupt
   the actor state.
 - Failure to delete a reclaimable segment is retryable because the durable
-  checkpoint already makes the operation idempotent. Physical admission stops
-  if retry backlog consumes reserved headroom.
+  checkpoint already makes the operation idempotent. A deletion backlog is
+  reported independently and does not change logical admission.
 - Interrupted operations may be retried only when the platform API guarantees
   that doing so cannot duplicate an ambiguous partial effect.
 
@@ -1073,7 +1091,7 @@ or fail each operation. Required cases include:
 - Complete corruption and torn-tail recovery.
 - Checkpoint corruption and fallback to the earliest retained segment.
 - Asynchronous deletion failure and retry.
-- Deletion backlog reaching the physical hard limit.
+- A growing deletion backlog without any change to logical admission.
 - Large frames spanning multiple underlying write-buffer operations.
 - A full append queue while acknowledgement progress still reaches the actor.
 
@@ -1122,8 +1140,7 @@ that disk buffers do not promise. It should cover:
 - No record-ID regression.
 - No frame crossing a segment boundary.
 - Logical occupancy never exceeds admitted capacity.
-- Physical usage never exceeds the configured hard limit and is reported
-  independently from logical occupancy.
+- Physical usage is reported independently from logical occupancy.
 - A retryable deletion failure does not prevent acknowledgement progress and
   resumes deletion when the fault clears.
 - A permanent failure is surfaced rather than represented as a stuck buffer.
@@ -1182,18 +1199,64 @@ owned record allocations. Current Tokio file I/O still coalesces vectored slices
 into its internal buffer, so this adds ownership and partial-write complexity
 without clearly removing a copy. It should only be considered after profiling.
 
-### Retain mutable occupancy counters
+### Recalculate runtime occupancy from segment positions
 
-Mutable counters are cheap to read but can drift when updates span cancellation,
-errors, or recovery. Monotonic logical positions make occupancy derivable and
-are easier to validate against the on-disk log.
+Frame-boundary positions and the segment catalog remain the recovery authority,
+but rescanning files for every admission decision would make a hot producer path
+perform directory and metadata I/O. Disk v3 instead derives the initial value at
+startup, then maintains checked atomic counters with exact frame-byte deltas.
+RAII reservations cover cancellation before acceptance, and restart scanning
+repairs any process-local accounting after a crash.
+
+## Remaining implementation work
+
+The segmented reader, writer, framing, logical-capacity accounting,
+acknowledgements, and reader checkpoint provide the core storage path. The
+remaining work, in priority order, is:
+
+1. **Reclaim fully acknowledged segments.** After a reader checkpoint is
+   durable, delete segments strictly older than its segment base offset. Keep
+   the segment containing the checkpoint, synchronize the directory after
+   deletion, and track physical bytes independently from logical bytes. A
+   deletion failure must be retryable without rolling back the durable
+   checkpoint. Until this exists, logical capacity can be released but physical
+   segment files accumulate forever.
+2. **Drive acknowledgements and checkpoints automatically.** The finalizer
+   consumer must pass completed tokens to `acknowledge`, then batch calls to
+   `checkpoint` according to manual flushes, an acknowledged-byte threshold,
+   and graceful shutdown. Without this owner, acknowledged progress can remain
+   in memory indefinitely and be replayed after restart.
+3. **Harden crash recovery.** Recovery must preserve every complete valid
+   frame, truncate an incomplete frame in the newest segment, remove logically
+   later orphan segments, and reopen the last valid boundary for append.
+   Complete frame corruption continues to fail closed. Startup must also obtain
+   an exclusive directory lock and validate that a loaded reader checkpoint is
+   within the recovered log.
+4. **Complete capacity integration in the MPSC adapter.** `DiskBuffer` now
+   initializes logical admission from recovered committed non-reclaimable bytes,
+   requires an exact frame reservation on append, returns abandoned
+   reservations through RAII, and releases accepted capacity only after a
+   durable acknowledgement checkpoint. The topology adapter must acquire and
+   transfer those reservations with queued frames and map full admission to its
+   block, drop, and overflow policies.
+5. **Add the Vector-facing adapter.** The adapter needs cloneable MPSC senders,
+   one task owning `DiskBuffer`, the existing `BufferSender` and
+   `BufferReceiver` interfaces, ordered-finalizer completion handling, flush
+   and shutdown wiring, and the real `EventArray` codec. Disk v3 also needs an
+   opt-in configuration path before it can replace disk v2.
+6. **Complete production validation.** Add metrics and failure diagnostics,
+   deterministic failure injection, subprocess crash tests, golden frame and
+   checkpoint fixtures, an Antithesis scenario, migration guidance, and
+   benchmarks against disk v2.
+
+Segment reclamation should be implemented next, followed by incomplete-tail
+recovery. Together they complete the physical storage lifecycle before topology
+integration is added.
 
 ## Outstanding questions
 
 - What synchronization byte threshold should complement the initial 500 ms
   interval?
-- How much of `max_size` should be reserved as physical headroom, and should it
-  be a fixed amount, a segment multiple, or a percentage?
 - What exact topology API owns the writer actor's shutdown handle and waits for
   its drain result during reload and graceful shutdown?
 - How should a full or overflow result recover an encoded record without adding
@@ -1218,7 +1281,8 @@ are easier to validate against the on-disk log.
   earliest retained segment.
 - Observed acknowledgement does not release capacity until it is checkpointed
   and becomes reclaimable.
-- `max_size` remains a hard physical disk-usage limit.
+- `max_size` is a logical byte limit over committed non-reclaimable frames and
+  accepted in-flight reservations; physical disk usage is separate.
 - Ingress durability finalizers are resolved only after data synchronization;
   there is no separate durability mode initially.
 - Disk v3 is opt-in through a versioned configuration and directory.
@@ -1237,11 +1301,10 @@ are easier to validate against the on-disk log.
 - [ ] Implement the writer actor and its actor-owned asynchronous I/O sequence.
 - [ ] Implement committed-position publication and the bounded reader stream.
 - [ ] Add group synchronization and durable acknowledgement tracking.
-- [ ] Implement ordered observed acknowledgements, reclaimable checkpoints, and
-  derived logical capacity.
+- [x] Implement ordered observed acknowledgements, reclaimable checkpoints, and
+  logical capacity admission.
 - [ ] Implement segment rotation, durable checkpoints, and recovery scanning.
-- [ ] Implement asynchronous deletion, physical-usage accounting, and hard-limit
-  admission.
+- [ ] Implement asynchronous deletion and physical-usage accounting.
 - [ ] Add internal metrics and actionable failure diagnostics.
 - [ ] Run model, MPSC ordering, cancellation, real-crash, and large-record tests.
 - [ ] Add an Antithesis scenario covering the safety and liveness invariants.
