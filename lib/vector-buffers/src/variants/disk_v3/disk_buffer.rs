@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use snafu::Snafu;
 
 use super::{
+    acknowledgement::{AcknowledgementError, AcknowledgementToken, AcknowledgementTracker},
     frame::PreparedFrame,
     logical_capacity::{
         LogicalCapacity, LogicalCapacityError, LogicalCapacityReservation, calculate_logical_bytes,
     },
     position::Position,
+    readable_segment::OwnedDecodedFrame,
     segmented_log_reader::{SegmentedLogReader, SegmentedLogReaderError, SegmentedRead},
     segmented_log_writer::{
         FilesystemSegmentStorage, SegmentedLogWriter, SegmentedLogWriterConfig,
@@ -20,6 +22,18 @@ pub(crate) struct DiskBuffer {
     writer: SegmentedLogWriter<FilesystemSegmentStorage>,
     reader: SegmentedLogReader,
     logical_capacity: LogicalCapacity,
+    acknowledgements: AcknowledgementTracker,
+}
+
+/// Result of reading from the high-level buffer.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum DiskBufferRead {
+    Frame {
+        frame: OwnedDecodedFrame,
+        acknowledgement: AcknowledgementToken,
+    },
+    EndOfAvailableData,
+    IncompleteTail,
 }
 
 impl DiskBuffer {
@@ -53,11 +67,13 @@ impl DiskBuffer {
                 .map_err(|source| DiskBufferError::Capacity { source })?;
         let logical_capacity = LogicalCapacity::new(max_logical_bytes, logical_bytes)
             .map_err(|source| DiskBufferError::Capacity { source })?;
+        let initial_reader_position = reader.read_position();
 
         Ok(Self {
             writer,
             reader,
             logical_capacity,
+            acknowledgements: AcknowledgementTracker::new(initial_reader_position),
         })
     }
 
@@ -96,12 +112,43 @@ impl DiskBuffer {
             .map_err(|source| DiskBufferError::Writer { source })
     }
 
-    /// Returns the next available frame without acknowledging it.
-    pub(crate) async fn next(&mut self) -> Result<SegmentedRead, DiskBufferError> {
-        self.reader
+    /// Returns the next available frame and its single-use acknowledgement token.
+    pub(crate) async fn next(&mut self) -> Result<DiskBufferRead, DiskBufferError> {
+        let read = self
+            .reader
             .read_next()
             .await
-            .map_err(|source| DiskBufferError::Reader { source })
+            .map_err(|source| DiskBufferError::Reader { source })?;
+
+        match read {
+            SegmentedRead::Frame { frame, position } => {
+                let acknowledgement = self
+                    .acknowledgements
+                    .track_read(position, frame.frame_len())
+                    .map_err(|source| DiskBufferError::Acknowledgement { source })?;
+
+                Ok(DiskBufferRead::Frame {
+                    frame,
+                    acknowledgement,
+                })
+            }
+            SegmentedRead::EndOfAvailableData => Ok(DiskBufferRead::EndOfAvailableData),
+            SegmentedRead::IncompleteTail => Ok(DiskBufferRead::IncompleteTail),
+        }
+    }
+
+    /// Records one downstream-finalized frame in original read order.
+    ///
+    /// This advances only the observed acknowledgement. A later checkpoint
+    /// operation must make this position durable before moving the reclaimable
+    /// position and subtracting the uncheckpointed bytes from logical size.
+    pub(crate) fn acknowledge(
+        &mut self,
+        acknowledgement: AcknowledgementToken,
+    ) -> Result<Position, DiskBufferError> {
+        self.acknowledgements
+            .acknowledge(acknowledgement)
+            .map_err(|source| DiskBufferError::Acknowledgement { source })
     }
 
     /// Returns admitted logical occupancy, including outstanding reservations.
@@ -125,6 +172,18 @@ impl DiskBuffer {
     pub(crate) const fn read_position(&self) -> Position {
         self.reader.read_position()
     }
+
+    /// Largest contiguous position whose downstream finalizers have completed.
+    #[must_use]
+    pub(crate) const fn observed_acknowledged_position(&self) -> Position {
+        self.acknowledgements.observed_position()
+    }
+
+    /// Durable acknowledged position through which capacity may be reused.
+    #[must_use]
+    pub(crate) const fn reclaimable_position(&self) -> Position {
+        self.acknowledgements.reclaimable_position()
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -137,4 +196,7 @@ pub(crate) enum DiskBufferError {
 
     #[snafu(display("persistent queue logical-capacity operation failed: {source}"))]
     Capacity { source: LogicalCapacityError },
+
+    #[snafu(display("persistent queue acknowledgement failed: {source}"))]
+    Acknowledgement { source: AcknowledgementError },
 }
