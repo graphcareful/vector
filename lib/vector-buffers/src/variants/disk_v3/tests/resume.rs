@@ -41,6 +41,10 @@ async fn writer_open_or_create_resumes_the_existing_active_segment() {
 
     let mut resumed = harness.open_writer(0, config).await;
     assert_eq!(resumed.committed(), first_end);
+    assert_eq!(
+        resumed.data_synced(),
+        Position::at_segment_start(first_end.segment_base_offset())
+    );
     for frame in &frames[3..] {
         resumed.append(frame.prepared().clone()).await.unwrap();
     }

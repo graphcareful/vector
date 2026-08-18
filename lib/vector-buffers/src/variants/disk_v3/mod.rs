@@ -1,4 +1,5 @@
 pub(crate) mod acknowledgement;
+pub(crate) mod checkpoint;
 pub(crate) mod disk_buffer;
 pub(crate) mod frame;
 pub(crate) mod logical_capacity;

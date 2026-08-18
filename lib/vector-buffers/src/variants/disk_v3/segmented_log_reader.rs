@@ -41,6 +41,17 @@ impl RecoveredLogTail {
 }
 
 impl SegmentedLogReader {
+    /// Returns the beginning of the earliest retained segment.
+    pub(crate) async fn earliest_position(
+        directory: &Path,
+    ) -> Result<Option<Position>, SegmentedLogReaderError> {
+        Ok(Self::list_segment_base_offsets(directory)
+            .await?
+            .first()
+            .copied()
+            .map(Position::at_segment_start))
+    }
+
     /// Validates every available frame and returns the active segment's tail.
     pub(crate) async fn recover_tail(
         directory: impl Into<PathBuf>,

@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 
 use snafu::Snafu;
+use tracing::warn;
 
 use super::{
     acknowledgement::{AcknowledgementError, AcknowledgementToken, AcknowledgementTracker},
+    checkpoint::{CheckpointDecodeError, CheckpointError, CheckpointLoad, ReaderCheckpoint},
     frame::PreparedFrame,
     logical_capacity::{
         LogicalCapacity, LogicalCapacityError, LogicalCapacityReservation, calculate_logical_bytes,
@@ -23,6 +25,7 @@ pub(crate) struct DiskBuffer {
     reader: SegmentedLogReader,
     logical_capacity: LogicalCapacity,
     acknowledgements: AcknowledgementTracker,
+    checkpoint: ReaderCheckpoint,
 }
 
 /// Result of reading from the high-level buffer.
@@ -39,25 +42,53 @@ pub(crate) enum DiskBufferRead {
 impl DiskBuffer {
     /// Opens or creates a persistent queue.
     ///
-    /// `reclaimable` is the durable consumer position from which reading should
-    /// resume. Initialization counts only complete bytes between that position
-    /// and the recovered writer position.
+    /// `initial` is used only when the directory contains no existing log. A
+    /// valid checkpoint selects the restart position; a missing or torn
+    /// checkpoint falls back to the earliest retained segment.
     pub(crate) async fn open(
         directory: impl Into<PathBuf>,
-        reclaimable: Position,
+        initial: Position,
         max_frame_len: usize,
         max_logical_bytes: u64,
         writer_config: SegmentedLogWriterConfig,
     ) -> Result<Self, DiskBufferError> {
         let directory = directory.into();
+        tokio::fs::create_dir_all(&directory)
+            .await
+            .map_err(|source| DiskBufferError::CreateDirectory { source })?;
+        let checkpoint = ReaderCheckpoint::open(&directory)
+            .await
+            .map_err(|source| DiskBufferError::Checkpoint { source })?;
+        let checkpoint_position = match checkpoint.load() {
+            Ok(CheckpointLoad::Uninitialized) => None,
+            Ok(CheckpointLoad::Position(position)) => Some(position),
+            Err(
+                source @ (CheckpointDecodeError::InvalidMagic { .. }
+                | CheckpointDecodeError::ChecksumMismatch { .. }),
+            ) => {
+                warn!(
+                    error = %source,
+                    "Ignoring an invalid disk buffer reader checkpoint and replaying from the earliest retained segment."
+                );
+                None
+            }
+            Err(source @ CheckpointDecodeError::UnsupportedVersion { .. }) => {
+                return Err(DiskBufferError::DecodeCheckpoint { source });
+            }
+        };
         let writer = SegmentedLogWriter::open_or_create(
             FilesystemSegmentStorage::new(&directory),
-            reclaimable.next_record_id(),
+            initial.next_record_id(),
             max_frame_len,
             writer_config,
         )
         .await
         .map_err(|source| DiskBufferError::Writer { source })?;
+        let earliest_position = SegmentedLogReader::earliest_position(&directory)
+            .await
+            .map_err(|source| DiskBufferError::Reader { source })?
+            .unwrap_or(initial);
+        let reclaimable = checkpoint_position.unwrap_or(earliest_position);
         let reader = SegmentedLogReader::open(&directory, reclaimable, max_frame_len)
             .await
             .map_err(|source| DiskBufferError::Reader { source })?;
@@ -74,6 +105,7 @@ impl DiskBuffer {
             reader,
             logical_capacity,
             acknowledgements: AcknowledgementTracker::new(initial_reader_position),
+            checkpoint,
         })
     }
 
@@ -141,7 +173,7 @@ impl DiskBuffer {
     ///
     /// This advances only the observed acknowledgement. A later checkpoint
     /// operation must make this position durable before moving the reclaimable
-    /// position and subtracting the uncheckpointed bytes from logical size.
+    /// position and releasing the uncheckpointed bytes from logical occupancy.
     pub(crate) fn acknowledge(
         &mut self,
         acknowledgement: AcknowledgementToken,
@@ -149,6 +181,31 @@ impl DiskBuffer {
         self.acknowledgements
             .acknowledge(acknowledgement)
             .map_err(|source| DiskBufferError::Acknowledgement { source })
+    }
+
+    /// Makes the largest contiguous observed acknowledgement durable.
+    ///
+    /// Log data is synchronized first so the checkpoint can never advance past
+    /// data that would disappear after a crash. Capacity is released only
+    /// after the checkpoint mmap has been synchronously flushed.
+    pub(crate) async fn checkpoint(&mut self) -> Result<Position, DiskBufferError> {
+        let Some(candidate) = self.acknowledgements.checkpoint_candidate() else {
+            return Ok(self.acknowledgements.reclaimable_position());
+        };
+
+        self.writer
+            .sync_all()
+            .await
+            .map_err(|source| DiskBufferError::Writer { source })?;
+        self.checkpoint
+            .persist(candidate.position())
+            .map_err(|source| DiskBufferError::Checkpoint { source })?;
+        self.logical_capacity
+            .release(candidate.bytes())
+            .map_err(|source| DiskBufferError::Capacity { source })?;
+        self.acknowledgements.mark_checkpointed(candidate);
+
+        Ok(candidate.position())
     }
 
     /// Returns admitted logical occupancy, including outstanding reservations.
@@ -188,6 +245,9 @@ impl DiskBuffer {
 
 #[derive(Debug, Snafu)]
 pub(crate) enum DiskBufferError {
+    #[snafu(display("failed to create the persistent queue directory: {source}"))]
+    CreateDirectory { source: std::io::Error },
+
     #[snafu(display("persistent queue writer failed: {source}"))]
     Writer { source: SegmentedLogWriterError },
 
@@ -199,4 +259,10 @@ pub(crate) enum DiskBufferError {
 
     #[snafu(display("persistent queue acknowledgement failed: {source}"))]
     Acknowledgement { source: AcknowledgementError },
+
+    #[snafu(display("persistent queue checkpoint failed: {source}"))]
+    Checkpoint { source: CheckpointError },
+
+    #[snafu(display("persistent queue reader checkpoint is incompatible: {source}"))]
+    DecodeCheckpoint { source: CheckpointDecodeError },
 }

@@ -183,6 +183,26 @@ struct DiskBuffer {
     writer: SegmentedLogWriter<FilesystemSegmentStorage>,
     reader: SegmentedLogReader,
     logical_size: Arc<LogicalBufferSize>,
+    acknowledgements: AcknowledgementTracker,
+}
+
+struct AcknowledgementTracker {
+    next_sequence: u64,
+    pending: VecDeque<PendingAcknowledgement>,
+    observed_position: Position,
+    reclaimable_position: Position,
+    uncheckpointed_bytes: u64,
+}
+
+struct AcknowledgementToken { /* opaque, single-use */ }
+
+enum DiskBufferRead {
+    Frame {
+        frame: OwnedDecodedFrame,
+        acknowledgement: AcknowledgementToken,
+    },
+    EndOfAvailableData,
+    IncompleteTail,
 }
 
 impl DiskBuffer {
@@ -194,18 +214,33 @@ impl DiskBuffer {
     ) -> Result<Self, DiskBufferError>;
 
     async fn append(&mut self, frame: PreparedFrame) -> Result<(), DiskBufferError>;
-    async fn next(&mut self) -> Result<SegmentedRead, DiskBufferError>;
+    async fn next(&mut self) -> Result<DiskBufferRead, DiskBufferError>;
+    fn acknowledge(
+        &mut self,
+        acknowledgement: AcknowledgementToken,
+    ) -> Result<Position, DiskBufferError>;
     async fn flush(&mut self) -> Result<Position, DiskBufferError>;
     async fn sync_all(&mut self) -> Result<Position, DiskBufferError>;
     fn logical_bytes(&self) -> u64;
 }
 ```
 
-`next` returns the next available frame without acknowledging it. A future
-acknowledgement API will persist the new reclaimable position before releasing
-its encoded bytes. The facade provides the correct initialization and ownership
-boundary now; the MPSC producer adapter and writer actor can later wrap or split
-this ownership without moving recovery logic back into the segmented writer.
+`next` returns each frame with an opaque acknowledgement token. The token is
+neither cloneable nor constructible by callers. The acknowledgement tracker
+retains the corresponding ending position and encoded byte length, so callers
+cannot forge either value. Vector has one reader owner per disk buffer, and that
+owner also owns the buffer's finalizer, so tokens never cross buffer ownership
+boundaries and need no separate runtime buffer identifier.
+
+Vector's existing `OrderedFinalizer<AcknowledgementToken>` carries these tokens
+through downstream finalization and emits them in original read order even when
+later records finish first. The finalizer consumer passes each completed token
+to `acknowledge`. This advances the in-memory observed acknowledgement only. A
+future checkpoint operation will persist that position before moving the
+reclaimable acknowledgement and releasing its encoded bytes from logical
+capacity. The facade provides the correct initialization and ownership boundary
+now; the MPSC producer adapter and writer actor can later wrap or split this
+ownership without moving recovery logic back into the segmented writer.
 
 ```rust
 struct DiskV3Sender<T> {
@@ -369,28 +404,30 @@ contiguous prefix. Writer failure is stream failure; graceful close becomes end
 of stream after the final committed position is consumed.
 
 ```rust
-struct CheckpointSnapshot {
-    generation: u64,
-    durable_writer: Position,
-    reclaimable_reader: Position,
-    segment_state: SegmentState,
+#[repr(C)]
+struct CheckpointRecord {
+    magic: [u8; 8],
+    version: u32,
+    checksum: u32,
+    segment_base_offset: u64,
+    segment_byte_offset: u64,
+    next_record_id: u64,
 }
 
-struct CheckpointStore<S> {
-    storage: S,
-    active_slot: CheckpointSlot,
+struct ReaderCheckpoint {
+    map: MmapMut,
+    position: Option<Position>,
 }
 
-impl<S: Storage> CheckpointStore<S> {
-    async fn load(&mut self) -> Result<CheckpointSnapshot, BufferError>;
-    async fn persist(&mut self, snapshot: &CheckpointSnapshot)
-        -> Result<(), BufferError>;
+impl ReaderCheckpoint {
+    async fn open(directory: &Path) -> Result<Self, CheckpointError>;
+    fn position(&self) -> Option<Position>;
+    fn persist(&mut self, position: Position) -> Result<(), CheckpointError>;
 }
 ```
 
-`CheckpointStore` implements the dual-slot format, generation selection, and
-synchronization protocol. It is contained by and called only from
-`WriterActor`.
+`ReaderCheckpoint` validates and synchronously flushes the single mmap record.
+It is contained by and called only from `DiskBuffer`.
 
 ```rust
 trait Storage: Clone + Send + Sync + 'static {
@@ -422,8 +459,8 @@ wrapper.
    aggregation buffer or segment rotation may publish it earlier.
 4. The reader observes that position, reads and decodes the frame, attaches an
    acknowledgement finalizer, and emits the record.
-5. The actor synchronizes committed data and a writer checkpoint, advances the
-   durable position, and resolves ingress durability finalizers.
+5. The actor synchronizes committed data, advances the durable position, and
+   resolves ingress durability finalizers.
 6. Downstream finalizers can complete out of order; the reader publishes only
    the largest contiguous observed acknowledgement.
 7. The actor persists that acknowledgement, advances the reclaimable position,
@@ -605,23 +642,20 @@ every record. A group synchronization follows this order:
 
 1. Complete all data writes through the selected committed position.
 2. Synchronize the data file.
-3. Persist the corresponding durable writer position in the checkpoint.
-4. Synchronize the checkpoint.
-5. Advance the runtime durable watermark.
-6. Resolve durability finalizers through that watermark.
+3. Advance the runtime durable watermark.
+4. Resolve durability finalizers through that watermark.
 
-This ordering prevents an acknowledgement from claiming durability beyond the
-durable checkpoint.
+Writer state is not checkpointed. Recovery derives the writer tail by scanning
+complete frames in the segment files.
 
 The first implementation preserves disk v2's 500 ms default synchronization
 interval for behavioral continuity. This is an opportunistic interval rather
 than a background timer: each manual flush compares the elapsed time with the
 interval. The first flush at or after the deadline synchronizes the active
-segment when it is dirty, persists and synchronizes the checkpoint, and then
-advances the durable watermark. Segment directory entries are already durable
-because the directory is synchronized immediately after every segment creation.
-Synchronizations cannot overlap because the actor awaits each flush command to
-completion.
+segment when it is dirty and then advances the durable watermark. Segment
+directory entries are already durable because the directory is synchronized
+immediately after every segment creation. Synchronizations cannot overlap
+because the actor awaits each flush command to completion.
 
 Only the active segment can require synchronization. The condition is derived
 from `committed > data_synced`; it does not need a separate dirty flag. Rotation
@@ -635,7 +669,7 @@ If traffic stops after a flush that did not reach the synchronization deadline,
 the final published data can remain unsynchronized until another flush or
 graceful shutdown. This matches disk v2's current behavior; the 500 ms setting
 is not a strict upper bound on the crash-loss window. Shutdown unconditionally
-publishes and synchronizes the remaining data and checkpoint. Durability
+publishes and synchronizes the remaining data. Durability
 acknowledgement is not a separate user-facing mode in the initial release:
 ingress finalizers are resolved only after the durable sequence above.
 
@@ -665,9 +699,11 @@ a normal synchronization condition.
 ## Consumer acknowledgements
 
 Although there is one consumer stream, downstream sink requests may complete
-out of order. The reader therefore retains an ordered acknowledgement tracker,
-such as Vector's existing `OrderedFinalizer<Position>`, and only submits the
-largest contiguous observed acknowledgement to the writer actor.
+out of order. Each emitted frame has an opaque `AcknowledgementToken`, and
+Vector's existing `OrderedFinalizer<AcknowledgementToken>` emits completed
+tokens in original read order. `AcknowledgementTracker` also verifies the
+token's sequence before advancing the largest contiguous observed
+acknowledgement.
 
 Here, acknowledged means that downstream finalization has completed, not only
 that the final status was `Delivered`. A permanently rejected or otherwise
@@ -676,12 +712,12 @@ reclaims it while recording its final status in the appropriate delivery and
 drop/error telemetry. Sink retry policy remains responsible for deciding when
 an error is terminal.
 
-The writer actor batches observed acknowledgements into checkpoint updates.
-Only after the acknowledgement checkpoint is synchronized does the actor
-advance the reclaimable acknowledgement, release logical capacity, and mark
-segments for deletion. A crash before that point may replay already finalized
-records, but cannot make the buffer delete or overwrite data whose
-acknowledgement was not durable.
+The buffer owner batches observed acknowledgements into checkpoint updates. It
+synchronizes log data before persisting a reader checkpoint. Only after the
+checkpoint mmap is synchronously flushed does it advance the reclaimable
+acknowledgement, release logical capacity, and mark segments for deletion. A
+crash before that point may replay already finalized records, but cannot make
+the buffer delete or overwrite data whose acknowledgement was not durable.
 
 ## On-disk format
 
@@ -699,8 +735,8 @@ leading zeroes except for `0.log`, alternate extension, or value outside
 
 Segment files contain frames starting at byte zero and have no segment header.
 The filename provides the segment's first record ID, each frame carries its own
-format version and record ID, and the checkpoint carries the buffer format and
-durable boundaries. New segments are opened with `create_new` so an existing
+format version and record ID, and the checkpoint carries the durable reader
+boundary. New segments are opened with `create_new` so an existing
 record range is never overwritten.
 
 An empty trailing segment can exist if Vector crashes immediately after file
@@ -755,31 +791,28 @@ egress finalizers are runtime state and are never serialized into the payload.
 
 ## Checkpoint format
 
-The checkpoint is explicitly encoded and versioned rather than memory-mapping a
-Rust structure. The writer actor is its only runtime owner and writer. It
-records at least:
+The reader checkpoint is one fixed-size memory-mapped `CheckpointRecord`. Its
+`repr(C)` layout contains magic bytes, a format version, the three `Position`
+fields, and a checksum. The file length is derived from the record type rather
+than maintained as a separate wire-layout table. Integer fields use little
+endian representation.
 
-- A generation number.
-- Durable writer position.
-- Durable acknowledged reader position.
-- Current reader and writer segment base record offsets and byte offsets.
-- Format version.
-- Checksum.
+The checkpoint has one slot. The buffer owner replaces the record and
+synchronously flushes the mmap. Startup validates its magic, version, and
+checksum. If the update was torn, recovery ignores the snapshot and resumes at
+the beginning of the earliest retained segment. This may replay acknowledged
+records, which is acceptable under the buffer's at-least-once contract.
 
-Disk v3 initially uses two checkpoint slots. The actor writes the inactive slot
-with the next generation, synchronizes it, and only then adopts that generation
-in memory. Startup validates both slots and selects the highest complete valid
-generation. This prevents a torn update from destroying the previous valid
-checkpoint without depending on cross-platform rename-replacement behavior.
+Decoding reports invalid magic, checksum mismatch, and unsupported version as
+typed errors. `DiskBuffer` applies the recovery policy: invalid magic and
+checksum errors produce a warning and fall back to the earliest retained
+segment, while an unsupported version fails startup.
 
-Both slots are created and the directory is synchronized during initialization.
-The implementation must specify the required file and directory
-synchronization ordering for segment creation, checkpoint initialization, and
-segment deletion on every supported platform.
-
-Combining the durable writer and reclaimable reader positions in one checkpoint
-is safe because only the writer actor updates it. The reader never writes a
-checkpoint independently; it sends acknowledgement progress to the actor.
+The backing file is sized and synchronized when first created, after which its
+directory entry is synchronized. Writer state, acknowledgement sequence
+numbers, logical size, and pending byte counts are not stored. Writer state is
+recovered from segment contents; the remaining values are process-local or
+derived during startup.
 
 ## Capacity management
 
@@ -855,7 +888,7 @@ Physical usage is tracked separately:
 ```text
 physical usage =
     segment file lengths
-    + checkpoint and temporary file lengths
+    + checkpoint file length
     + acknowledged files pending deletion
 ```
 
@@ -866,10 +899,9 @@ not assume one is always an upper bound for the other.
 
 The existing `max_size` setting continues to mean a hard upper bound on disk
 usage, not merely a logical-data target. Disk v3 derives a lower logical
-admission limit after reserving operational headroom for an active segment,
-both checkpoint slots, and deletion bookkeeping. Before an
-append or rotation, the actor enforces both the logical admission limit and the
-physical hard limit.
+admission limit after reserving operational headroom for an active segment, the
+checkpoint file, and deletion bookkeeping. Before an append or rotation, the
+actor enforces both the logical admission limit and the physical hard limit.
 
 Asynchronous deletion failures cannot be allowed to grow physical usage without
 bound. When pending deletions consume the reserved headroom, new writes block or
@@ -934,7 +966,8 @@ treated as segments.
 Startup recovery performs these steps:
 
 1. Acquire the exclusive directory lock.
-2. Load the newest valid checkpoint slot.
+2. Load and validate the reader checkpoint; if it is torn, use the earliest
+   retained segment.
 3. Enumerate canonical segment filenames and validate numeric ordering and
    gaps.
 4. Reconcile checkpoint references with present, deleted, and orphan segments.
@@ -1038,7 +1071,7 @@ or fail each operation. Required cases include:
 - Synchronization success and failure.
 - Segment creation and rotation failures.
 - Complete corruption and torn-tail recovery.
-- Checkpoint corruption and selection of the previous valid generation.
+- Checkpoint corruption and fallback to the earliest retained segment.
 - Asynchronous deletion failure and retry.
 - Deletion backlog reaching the physical hard limit.
 - Large frames spanning multiple underlying write-buffer operations.
@@ -1075,7 +1108,7 @@ operation.
 
 The deterministic filesystem validates state-machine behavior but cannot prove
 real kernel and filesystem synchronization ordering. Subprocess tests should
-kill a writer at each data-file, checkpoint-slot, segment-creation, and
+kill a writer at each data-file, checkpoint-record, segment-creation, and
 directory-synchronization boundary, then restart against the real filesystem.
 Run the checkpoint and recovery suite on Linux, macOS, and Windows and keep
 golden binary fixtures for every supported frame and checkpoint version.
@@ -1181,12 +1214,13 @@ are easier to validate against the on-disk log.
 - The initial payload codec is Vector's existing `Encodable` representation;
   `EventArray` uses its current Protocol Buffers encoding and metadata.
 - Complete corrupt frames fail recovery closed in the initial release.
-- Checkpoints use two generation-numbered slots owned by the writer actor.
+- Checkpoints use one fixed-size mmap record; a torn record falls back to the
+  earliest retained segment.
 - Observed acknowledgement does not release capacity until it is checkpointed
   and becomes reclaimable.
 - `max_size` remains a hard physical disk-usage limit.
-- Ingress durability finalizers are resolved only after data and checkpoint
-  synchronization; there is no separate durability mode initially.
+- Ingress durability finalizers are resolved only after data synchronization;
+  there is no separate durability mode initially.
 - Disk v3 is opt-in through a versioned configuration and directory.
 
 ## Plan of attack
@@ -1195,7 +1229,7 @@ are easier to validate against the on-disk log.
   sizing questions.
 - [ ] Prototype the MPSC adapter, actor lifecycle, reload, shutdown, and fanout
   flush integration.
-- [ ] Specify the segment, frame, payload-codec, and dual-slot checkpoint binary
+- [ ] Specify the segment, frame, payload-codec, and reader checkpoint binary
   formats with golden fixtures.
 - [ ] Build a deterministic filesystem and failure-injection test framework.
 - [ ] Implement the position types and a model-only MPSC admission and

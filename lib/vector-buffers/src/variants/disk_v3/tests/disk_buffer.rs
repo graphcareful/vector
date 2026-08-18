@@ -6,6 +6,7 @@ use vector_common::{finalization::BatchNotifier, finalizer::OrderedFinalizer};
 
 use crate::variants::disk_v3::{
     acknowledgement::AcknowledgementError,
+    checkpoint::CHECKPOINT_FILE_NAME,
     disk_buffer::{DiskBuffer, DiskBufferError, DiskBufferRead},
     position::Position,
 };
@@ -84,11 +85,17 @@ async fn high_level_buffer_initializes_appends_reads_and_resumes() {
         buffer.logical_bytes(),
         u64::try_from(frame_len * frames.len()).unwrap()
     );
+    assert_eq!(buffer.checkpoint().await.unwrap(), restart_position);
+    assert_eq!(buffer.reclaimable_position(), restart_position);
+    assert_eq!(
+        buffer.logical_bytes(),
+        u64::try_from(frame_len * (frames.len() - 1)).unwrap()
+    );
     drop(buffer);
 
     let mut resumed = DiskBuffer::open(
         harness.path(),
-        restart_position,
+        Position::at_segment_start(FIRST_RECORD_ID),
         MAX_FRAME_LEN,
         MAX_LOGICAL_BYTES,
         config,
@@ -263,4 +270,132 @@ async fn disk_buffer_rejects_acknowledgements_outside_read_order() {
     ));
     assert_eq!(buffer.observed_acknowledged_position(), initial);
     assert_eq!(buffer.reclaimable_position(), initial);
+}
+
+#[tokio::test]
+async fn logical_capacity_blocks_until_acknowledgement_is_checkpointed() {
+    let harness = DiskV3Harness::new("vector-disk-v3-capacity", MAX_FRAME_LEN);
+    let first = harness.frame(FIRST_RECORD_ID, NonZeroU32::MIN, 0, "same-length-record-0");
+    let second = harness.frame(
+        FIRST_RECORD_ID + 1,
+        NonZeroU32::MIN,
+        0,
+        "same-length-record-1",
+    );
+    assert_eq!(first.encoded_len(), second.encoded_len());
+    let frame_len = u64::try_from(first.encoded_len()).unwrap();
+    let config = writer_config(frame_len * 2, 4096);
+    let initial = Position::at_segment_start(FIRST_RECORD_ID);
+    let mut buffer = DiskBuffer::open(harness.path(), initial, MAX_FRAME_LEN, frame_len, config)
+        .await
+        .unwrap();
+
+    append(&mut buffer, &first).await;
+    buffer.sync_all().await.unwrap();
+    assert_eq!(buffer.capacity().occupied_bytes(), frame_len);
+
+    let capacity = buffer.capacity();
+    let second_len = second.encoded_len();
+    let waiting = tokio::spawn(async move { capacity.reserve(second_len).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(
+        !waiting.is_finished(),
+        "a full logical buffer must apply backpressure"
+    );
+
+    let DiskBufferRead::Frame {
+        acknowledgement, ..
+    } = buffer.next().await.unwrap()
+    else {
+        panic!("expected the first frame");
+    };
+    buffer.acknowledge(acknowledgement).unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(
+        !waiting.is_finished(),
+        "an in-memory acknowledgement must not release capacity"
+    );
+
+    buffer.checkpoint().await.unwrap();
+    let reservation = timeout(Duration::from_secs(1), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(buffer.logical_bytes(), frame_len);
+    assert_eq!(buffer.capacity().occupied_bytes(), frame_len);
+
+    buffer
+        .append(second.prepared().clone(), reservation)
+        .await
+        .unwrap();
+    assert_eq!(buffer.logical_bytes(), frame_len);
+    buffer.flush().await.unwrap();
+    assert_eq!(buffer.logical_bytes(), frame_len);
+}
+
+#[tokio::test]
+async fn torn_checkpoint_replays_from_the_earliest_retained_segment() {
+    let harness = DiskV3Harness::new("vector-disk-v3-torn-checkpoint", MAX_FRAME_LEN);
+    let frames = (0..2)
+        .map(|index| {
+            harness.frame(
+                FIRST_RECORD_ID + index,
+                NonZeroU32::MIN,
+                0,
+                format!("record-{index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let config = writer_config(1024, 4096);
+    let initial = Position::at_segment_start(FIRST_RECORD_ID);
+    let mut buffer = DiskBuffer::open(
+        harness.path(),
+        initial,
+        MAX_FRAME_LEN,
+        MAX_LOGICAL_BYTES,
+        config,
+    )
+    .await
+    .unwrap();
+    for frame in &frames {
+        append(&mut buffer, frame).await;
+    }
+    buffer.sync_all().await.unwrap();
+
+    let DiskBufferRead::Frame {
+        acknowledgement, ..
+    } = buffer.next().await.unwrap()
+    else {
+        panic!("expected the first frame");
+    };
+    buffer.acknowledge(acknowledgement).unwrap();
+    buffer.checkpoint().await.unwrap();
+    drop(buffer);
+
+    let checkpoint_path = harness.path().join(CHECKPOINT_FILE_NAME);
+    let mut checkpoint_bytes = tokio::fs::read(&checkpoint_path).await.unwrap();
+    checkpoint_bytes[0] ^= 0xff;
+    tokio::fs::write(checkpoint_path, checkpoint_bytes)
+        .await
+        .unwrap();
+
+    let mut resumed = DiskBuffer::open(
+        harness.path(),
+        initial,
+        MAX_FRAME_LEN,
+        MAX_LOGICAL_BYTES,
+        config,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed.reclaimable_position(), initial);
+    assert_eq!(
+        resumed.logical_bytes(),
+        u64::try_from(frames.iter().map(TestFrame::encoded_len).sum::<usize>()).unwrap()
+    );
+
+    let DiskBufferRead::Frame { frame, .. } = resumed.next().await.unwrap() else {
+        panic!("expected the first frame to be replayed");
+    };
+    assert_eq!(frame.record_id(), FIRST_RECORD_ID);
 }

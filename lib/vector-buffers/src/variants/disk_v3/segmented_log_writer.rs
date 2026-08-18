@@ -489,7 +489,11 @@ impl SegmentedLogWriter<FilesystemSegmentStorage> {
             storage,
             active_segment,
             committed: position,
-            data_synced: position,
+            // Recovery proves that these bytes are readable, but a prior
+            // process may have exited before synchronizing the active file.
+            // Keep the recovered active segment conservatively unsynchronized
+            // so a later checkpoint forces it to disk first.
+            data_synced: Position::at_segment_start(segment_base_offset),
             next_record_id: position.next_record_id(),
             batch: AggregationBuffer::new(config.batch_size),
             last_sync: Instant::now(),
