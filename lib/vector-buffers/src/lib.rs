@@ -24,6 +24,10 @@ use vector_config::configurable_component;
 
 pub mod encoding;
 
+#[cfg(feature = "disk-v3-cli")]
+#[doc(hidden)]
+pub mod disk_v3_cli;
+
 mod internal_events;
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ async-stream = "0.3.6"
 async-trait.workspace = true
 bytecheck = { version = "0.6.9", default-features = false, features = ["std"] }
 bytes.workspace = true
+clap = { workspace = true, optional = true }
 crc32fast = { version = "1.5.0", default-features = false }
 crossbeam-queue = { version = "0.3.12", default-features = false, features = ["std"] }
 crossbeam-utils.workspace = true
@@ -24,6 +25,7 @@ memmap2 = { version = "0.9.10", default-features = false }
 metrics.workspace = true
 num-traits = { version = "0.2.19", default-features = false }
 pastey.workspace = true
+rand = { workspace = true, optional = true }
 rkyv = { version = "0.7.46", default-features = false, features = ["size_32", "std", "strict", "validation"] }
 serde.workspace = true
 snafu.workspace = true
@@ -39,6 +41,7 @@ serde_json = { workspace = true, optional = true }
 
 [features]
 antithesis-disk-asserts = ["dep:antithesis_sdk", "dep:serde_json"]
+disk-v3-cli = ["dep:clap", "dep:rand", "dep:serde_json"]
 test = []
 
 [dev-dependencies]
@@ -61,6 +64,11 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "regis
 [[bench]]
 name = "sized_records"
 harness = false
+
+[[bin]]
+name = "disk-v3"
+path = "src/bin/disk_v3.rs"
+required-features = ["disk-v3-cli"]
 
 [[example]]
 name = "buffer_perf"
