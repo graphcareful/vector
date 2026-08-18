@@ -1,3 +1,4 @@
+pub(crate) mod disk_buffer;
 pub(crate) mod frame;
 pub(crate) mod logical_capacity;
 pub(crate) mod position;
