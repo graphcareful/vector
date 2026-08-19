@@ -10,7 +10,7 @@ use std::{
 };
 
 use snafu::Snafu;
-use tokio::{fs, sync::Notify};
+use tokio::fs;
 
 use super::{position::Position, writable_segment::parse_segment_file_name};
 
@@ -97,12 +97,13 @@ async fn calculate_bytes_through(
     Ok(bytes_through)
 }
 
-/// Cloneable producer-facing handle for logical byte admission.
+/// Cloneable producer-facing handle for soft logical byte admission.
 ///
-/// Occupancy includes both committed, non-reclaimable log bytes and outstanding
-/// frame reservations, including reservations waiting to be accepted. It does
-/// not include segment slack, checkpoint files, or acknowledged segments
-/// awaiting deletion.
+/// Occupancy includes committed, non-reclaimable log bytes and accepted frames
+/// queued or batched in memory. It does not include segment slack, checkpoint
+/// files, or acknowledged segments awaiting deletion. The limit is a high-water
+/// mark: one complete frame may take occupancy across it, after which admission
+/// stops until durable acknowledgement brings occupancy below it again.
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalCapacity {
     inner: Arc<LogicalCapacityInner>,
@@ -112,14 +113,13 @@ pub(crate) struct LogicalCapacity {
 struct LogicalCapacityInner {
     limit: u64,
     occupied: AtomicU64,
-    released: Notify,
 }
 
 impl LogicalCapacity {
     /// Creates capacity initialized with the logical bytes recovered from disk.
     ///
     /// Recovered occupancy may exceed a newly lowered limit. In that case no
-    /// new reservations are admitted until checkpoints release enough bytes.
+    /// new frames are admitted until checkpoints release enough bytes.
     pub(crate) fn new(limit: u64, recovered_bytes: u64) -> Result<Self, LogicalCapacityError> {
         if limit == 0 {
             return Err(LogicalCapacityError::ZeroLimit);
@@ -129,81 +129,42 @@ impl LogicalCapacity {
             inner: Arc::new(LogicalCapacityInner {
                 limit,
                 occupied: AtomicU64::new(recovered_bytes),
-                released: Notify::new(),
             }),
         })
     }
 
-    /// Waits until the requested logical bytes can be admitted.
-    ///
-    /// Cancelling this future before it returns does not consume capacity. If
-    /// the returned reservation is dropped before append accepts it, its bytes
-    /// are returned automatically.
-    pub(crate) async fn reserve(
-        &self,
-        bytes: usize,
-    ) -> Result<LogicalCapacityReservation, LogicalCapacityError> {
-        loop {
-            // Register before checking occupancy so a concurrent release
-            // cannot occur between the failed check and waiter registration.
-            let notified = self.inner.released.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            match self.try_reserve(bytes) {
-                Ok(reservation) => return Ok(reservation),
-                Err(LogicalCapacityError::Full { .. }) => notified.await,
-                Err(error) => return Err(error),
-            }
-        }
+    /// Whether another complete frame may cross the logical high-water mark.
+    #[must_use]
+    pub(crate) fn is_below_high_water(&self) -> bool {
+        self.occupied_bytes() < self.inner.limit
     }
 
-    /// Attempts admission without waiting for capacity to become available.
-    pub(crate) fn try_reserve(
-        &self,
-        bytes: usize,
-    ) -> Result<LogicalCapacityReservation, LogicalCapacityError> {
+    /// Atomically charges one complete frame if occupancy is below the logical
+    /// high-water mark.
+    pub(crate) fn try_acquire(&self, bytes: usize) -> Result<(), LogicalCapacityError> {
         let bytes = u64::try_from(bytes).map_err(|_| LogicalCapacityError::SizeOverflow)?;
         if bytes == 0 {
-            return Err(LogicalCapacityError::ZeroReservation);
-        }
-        if bytes > self.inner.limit {
-            return Err(LogicalCapacityError::RequestExceedsLimit {
-                requested: bytes,
-                limit: self.inner.limit,
-            });
+            return Err(LogicalCapacityError::ZeroFrameSize);
         }
 
-        self.inner
+        match self
+            .inner
             .occupied
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |occupied| {
-                occupied
-                    .checked_add(bytes)
-                    .filter(|updated| *updated <= self.inner.limit)
-            })
-            .map_err(|occupied| LogicalCapacityError::Full {
-                requested: bytes,
-                available: self.inner.limit.saturating_sub(occupied),
-            })?;
-
-        Ok(LogicalCapacityReservation {
-            capacity: self.clone(),
-            bytes,
-            release_on_drop: true,
-        })
+                if occupied < self.inner.limit {
+                    occupied.checked_add(bytes)
+                } else {
+                    None
+                }
+            }) {
+            Ok(_) => Ok(()),
+            Err(occupied) if occupied >= self.inner.limit => Err(LogicalCapacityError::Full),
+            Err(_) => Err(LogicalCapacityError::SizeOverflow),
+        }
     }
 
-    /// Releases occupied bytes and wakes producers waiting for admission.
-    ///
-    /// `DiskBuffer` uses this for accepted bytes only after their acknowledgement
-    /// checkpoint is durable. An unaccepted reservation uses it when dropped.
+    /// Releases accepted bytes after their acknowledgement checkpoint is durable.
     pub(crate) fn release(&self, bytes: u64) -> Result<(), LogicalCapacityError> {
-        self.release_inner(bytes)?;
-        self.inner.released.notify_waiters();
-        Ok(())
-    }
-
-    fn release_inner(&self, bytes: u64) -> Result<(), LogicalCapacityError> {
         self.inner
             .occupied
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |occupied| {
@@ -214,69 +175,8 @@ impl LogicalCapacity {
     }
 
     #[must_use]
-    pub(crate) fn limit(&self) -> u64 {
-        self.inner.limit
-    }
-
-    #[must_use]
     pub(crate) fn occupied_bytes(&self) -> u64 {
         self.inner.occupied.load(Ordering::Acquire)
-    }
-
-    #[must_use]
-    pub(crate) fn available_bytes(&self) -> u64 {
-        self.limit().saturating_sub(self.occupied_bytes())
-    }
-}
-
-/// Owned admission for one frame's exact encoded byte length.
-///
-/// This value is intentionally neither cloneable nor constructible by callers.
-/// It moves with the frame until `DiskBuffer` accepts both.
-#[derive(Debug)]
-#[must_use = "dropping an unaccepted capacity reservation returns its bytes"]
-pub(crate) struct LogicalCapacityReservation {
-    capacity: LogicalCapacity,
-    bytes: u64,
-    release_on_drop: bool,
-}
-
-impl LogicalCapacityReservation {
-    pub(super) fn validate(
-        &self,
-        capacity: &LogicalCapacity,
-        frame_bytes: usize,
-    ) -> Result<(), LogicalCapacityError> {
-        if !Arc::ptr_eq(&self.capacity.inner, &capacity.inner) {
-            return Err(LogicalCapacityError::WrongBuffer);
-        }
-
-        let frame_bytes =
-            u64::try_from(frame_bytes).map_err(|_| LogicalCapacityError::SizeOverflow)?;
-        if self.bytes != frame_bytes {
-            return Err(LogicalCapacityError::ReservationSizeMismatch {
-                reserved: self.bytes,
-                frame: frame_bytes,
-            });
-        }
-
-        Ok(())
-    }
-
-    pub(super) fn commit(mut self) {
-        // The reservation becomes part of buffer occupancy. Its bytes remain
-        // charged until a durable acknowledgement checkpoint releases them.
-        self.release_on_drop = false;
-    }
-}
-
-impl Drop for LogicalCapacityReservation {
-    fn drop(&mut self) {
-        if self.release_on_drop {
-            self.capacity
-                .release(self.bytes)
-                .expect("an outstanding capacity reservation cannot underflow occupancy");
-        }
     }
 }
 
@@ -312,16 +212,11 @@ pub(crate) enum LogicalCapacityError {
     #[snafu(display("logical capacity limit must be greater than zero"))]
     ZeroLimit,
 
-    #[snafu(display("cannot reserve zero logical bytes"))]
-    ZeroReservation,
+    #[snafu(display("cannot charge a zero-byte frame"))]
+    ZeroFrameSize,
 
-    #[snafu(display("a {requested}-byte frame exceeds the {limit}-byte logical capacity limit"))]
-    RequestExceedsLimit { requested: u64, limit: u64 },
-
-    #[snafu(display(
-        "logical capacity is full: requested {requested} bytes but only {available} are available"
-    ))]
-    Full { requested: u64, available: u64 },
+    #[snafu(display("logical capacity is at its high-water mark"))]
+    Full,
 
     #[snafu(display("logical capacity size overflowed u64"))]
     SizeOverflow,
@@ -330,21 +225,16 @@ pub(crate) enum LogicalCapacityError {
         "cannot release {bytes} bytes from {occupied} bytes of logical capacity occupancy"
     ))]
     ReleaseUnderflow { occupied: u64, bytes: u64 },
-
-    #[snafu(display("capacity reservation belongs to a different disk buffer"))]
-    WrongBuffer,
-
-    #[snafu(display(
-        "capacity reservation covers {reserved} bytes but the frame contains {frame} bytes"
-    ))]
-    ReservationSizeMismatch { reserved: u64, frame: u64 },
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, time::Duration};
+    use std::{
+        path::Path,
+        sync::{Arc, Barrier},
+    };
 
-    use tokio::{fs, time::timeout};
+    use tokio::fs;
 
     use super::*;
     use crate::variants::disk_v3::writable_segment::segment_file_name;
@@ -388,60 +278,64 @@ mod tests {
     }
 
     #[test]
-    fn dropping_an_unaccepted_reservation_returns_capacity() {
-        let capacity = LogicalCapacity::new(10, 0).unwrap();
-        let reservation = capacity.try_reserve(10).unwrap();
-        assert_eq!(capacity.occupied_bytes(), 10);
-
-        drop(reservation);
-
-        assert_eq!(capacity.occupied_bytes(), 0);
-        assert_eq!(capacity.available_bytes(), 10);
-    }
-
-    #[tokio::test]
-    async fn reservation_waits_for_durable_capacity_release() {
-        let capacity = LogicalCapacity::new(10, 10).unwrap();
-        let waiting_capacity = capacity.clone();
-        let waiter = tokio::spawn(async move { waiting_capacity.reserve(10).await.unwrap() });
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!waiter.is_finished());
-
-        capacity.release(10).unwrap();
-        let reservation = timeout(Duration::from_secs(1), waiter)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(capacity.occupied_bytes(), 10);
-        drop(reservation);
-        assert_eq!(capacity.occupied_bytes(), 0);
-    }
-
-    #[test]
     fn lowered_limit_blocks_until_recovered_occupancy_drains() {
         let capacity = LogicalCapacity::new(10, 15).unwrap();
         assert!(matches!(
-            capacity.try_reserve(1),
-            Err(LogicalCapacityError::Full { available: 0, .. })
+            capacity.try_acquire(1),
+            Err(LogicalCapacityError::Full)
         ));
 
         capacity.release(6).unwrap();
-        let reservation = capacity.try_reserve(1).unwrap();
-        reservation.commit();
+        capacity.try_acquire(1).unwrap();
         assert_eq!(capacity.occupied_bytes(), 10);
     }
 
     #[test]
-    fn oversized_request_is_rejected_instead_of_waiting_forever() {
-        let capacity = LogicalCapacity::new(10, 0).unwrap();
+    fn one_complete_frame_can_cross_the_soft_limit() {
+        let capacity = LogicalCapacity::new(10, 9).unwrap();
 
+        capacity.try_acquire(8).unwrap();
+        assert_eq!(capacity.occupied_bytes(), 17);
         assert!(matches!(
-            capacity.try_reserve(11),
-            Err(LogicalCapacityError::RequestExceedsLimit {
-                requested: 11,
-                limit: 10,
-            })
+            capacity.try_acquire(1),
+            Err(LogicalCapacityError::Full)
         ));
+
+        capacity.release(8).unwrap();
+        assert_eq!(capacity.occupied_bytes(), 9);
+
+        capacity.try_acquire(20).unwrap();
+        assert_eq!(capacity.occupied_bytes(), 29);
+        capacity.release(20).unwrap();
+        assert_eq!(capacity.occupied_bytes(), 9);
+    }
+
+    #[test]
+    fn concurrent_producers_admit_only_one_frame_across_the_limit() {
+        const PRODUCERS: usize = 8;
+
+        let capacity = LogicalCapacity::new(1, 0).unwrap();
+        let start = Arc::new(Barrier::new(PRODUCERS + 1));
+        let mut producers = Vec::with_capacity(PRODUCERS);
+
+        for _ in 0..PRODUCERS {
+            let capacity = capacity.clone();
+            let start = Arc::clone(&start);
+            producers.push(std::thread::spawn(move || {
+                start.wait();
+                capacity.try_acquire(10).is_ok()
+            }));
+        }
+
+        start.wait();
+
+        assert_eq!(
+            producers
+                .into_iter()
+                .map(|producer| producer.join().unwrap())
+                .filter(|acquired| *acquired)
+                .count(),
+            1
+        );
     }
 }

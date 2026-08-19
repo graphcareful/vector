@@ -39,7 +39,7 @@ watermark may have advanced.
 ### In scope
 
 - Multiple concurrent producers and exactly one consumer per buffer.
-- A bounded MPSC command queue with byte-aware capacity reservations.
+- A bounded MPSC command queue with byte-aware admission.
 - A dedicated writer actor that exclusively owns and awaits all write I/O.
 - An exclusive reader stream.
 - Append-only segment files with a versioned frame format.
@@ -134,8 +134,7 @@ channels and the writer command queue:
   with terminal failure or graceful-close state.
 - The reader submits the latest contiguous observed acknowledgement to the
   writer actor.
-- The writer publishes capacity progress or releases byte reservations after
-  acknowledgements become reclaimable.
+- The writer releases logical bytes after acknowledgements become reclaimable.
 
 Notifications are not progress themselves. A receiver always compares its
 local position with the latest retained state. Missing or coalescing a
@@ -148,105 +147,75 @@ The writer actor's receive order defines the log order and record-ID order.
 Ordering within one producer is preserved when that producer awaits each send
 in order.
 
-An append becomes accepted when ownership of the record and its capacity
-reservation has transferred irrevocably to the writer actor. Cancellation
-before that linearization point leaves the record unaccepted. Cancellation
-after it does not remove the command or stop its write; the actor continues even
-if the producer drops its response future.
+An append becomes accepted when ownership of the record has transferred
+irrevocably to the writer actor. Cancellation before that linearization point
+leaves the record unaccepted. Cancellation after it does not remove the command
+or stop its write; the actor continues even if the producer drops its response
+future.
 
-The producer prepares the record before queueing it so it can reserve exact
-capacity without assigning a record ID. The command contains:
+The producer prepares the record before queueing it so it can calculate its
+exact framed length without assigning a record ID. The command contains:
 
 - Its encoded payload and codec metadata.
-- Its event count and exact framed byte length.
+- Its event count.
 - Its ingress durability finalizers.
-- An owned capacity reservation.
 
+The producer first acquires a command-channel permit. It then atomically charges
+the frame's exact length and synchronously fills the permit, so there is no
+await or cancellation point between charging capacity and queueing the command.
 Successful insertion into the bounded queue is the acceptance linearization
-point: the reservation and prepared record transfer together. Cancelling the
-queue send before it completes leaves the command unqueued and releases the
-reservation. Record IDs are assigned only by the writer actor, in receive order.
-If a full or overflow result must return the original record after encoding, the
-producer adapter recovers it using the same encode/decode approach as disk v2
-and reattaches its finalizers.
+point. Record IDs are assigned only by the writer actor, in receive order. A
+blocking send waits while logical occupancy is at or above its high-water mark.
+A drop-newest send still awaits internal command-queue space, but consumes the
+record instead of waiting when logical admission is full.
 
 ## High-level components and interfaces
 
 The following Rust-like interfaces show ownership and communication boundaries.
 They are design sketches rather than final public APIs.
 
-The initial implementation has a single-owner `DiskBuffer` facade over the
+The initial implementation has an actor-backed `DiskBuffer` facade over the
 low-level reader, writer, and logical-capacity manager:
 
 ```rust
-struct DiskBuffer {
+struct WriterActor {
     writer: SegmentedLogWriter<FilesystemSegmentStorage>,
+    checkpoint: ReaderCheckpoint,
+    capacity: LogicalCapacity,
+    finalizations: BoxStream<(BatchStatus, AcknowledgementToken)>,
+    consumer_acknowledged: Position,
+    reclaimable: Position,
+}
+
+struct DiskBufferReceiver {
     reader: SegmentedLogReader,
-    logical_capacity: LogicalCapacity,
-    acknowledgements: AcknowledgementTracker,
+    writer_state: watch::Receiver<PublishedWriterState>,
+    finalizer: OrderedFinalizer<AcknowledgementToken>,
 }
 
-struct AcknowledgementTracker {
-    next_sequence: u64,
-    pending: VecDeque<PendingAcknowledgement>,
-    observed_position: Position,
-    reclaimable_position: Position,
-    uncheckpointed_bytes: u64,
+struct AcknowledgementToken {
+    end_position: Position,
+    frame_bytes: u64,
 }
 
-struct AcknowledgementToken { /* opaque, single-use */ }
-
-enum DiskBufferRead {
-    Frame {
-        frame: OwnedDecodedFrame,
-        acknowledgement: AcknowledgementToken,
-    },
-    EndOfAvailableData,
-    IncompleteTail,
+struct DiskBufferRead {
+    frame: OwnedDecodedFrame,
+    batch_notifier: BatchNotifier,
 }
 
-impl DiskBuffer {
-    async fn open(
-        directory: PathBuf,
-        reclaimable: Position,
-        max_frame_len: usize,
-        max_logical_bytes: u64,
-        writer_config: SegmentedLogWriterConfig,
-    ) -> Result<Self, DiskBufferError>;
-
-    fn capacity(&self) -> LogicalCapacity;
-    async fn append(
-        &mut self,
-        frame: PreparedFrame,
-        reservation: LogicalCapacityReservation,
-    ) -> Result<(), DiskBufferError>;
-    async fn next(&mut self) -> Result<DiskBufferRead, DiskBufferError>;
-    fn acknowledge(
-        &mut self,
-        acknowledgement: AcknowledgementToken,
-    ) -> Result<Position, DiskBufferError>;
-    async fn flush(&mut self) -> Result<Position, DiskBufferError>;
-    async fn sync_all(&mut self) -> Result<Position, DiskBufferError>;
-    fn logical_bytes(&self) -> u64;
+impl DiskBufferReceiver {
+    async fn next(&mut self) -> Result<Option<DiskBufferRead>, DiskBufferError>;
 }
 ```
 
-`next` returns each frame with an opaque acknowledgement token. The token is
-neither cloneable nor constructible by callers. The acknowledgement tracker
-retains the corresponding ending position and encoded byte length, so callers
-cannot forge either value. Vector has one reader owner per disk buffer, and that
-owner also owns the buffer's finalizer, so tokens never cross buffer ownership
-boundaries and need no separate runtime buffer identifier.
-
-Vector's existing `OrderedFinalizer<AcknowledgementToken>` carries these tokens
-through downstream finalization and emits them in original read order even when
-later records finish first. The finalizer consumer passes each completed token
-to `acknowledge`. This advances the in-memory observed acknowledgement only. A
-future checkpoint operation will persist that position before moving the
-reclaimable acknowledgement and releasing its encoded bytes from logical
-capacity. The facade provides the correct initialization and ownership boundary
-now; the MPSC producer adapter and writer actor can later wrap or split this
-ownership without moving recovery logic back into the segmented writer.
+`next` creates a batch notifier for each frame and registers its opaque token
+with Vector's existing `OrderedFinalizer<AcknowledgementToken>`. The future
+codec adapter attaches that notifier to the decoded events. Later records may
+finish first, but the ordered finalizer emits tokens to the actor only in
+original read order. For each emitted token, the actor synchronizes committed
+data, persists its ending position, releases its encoded bytes from logical
+capacity, and publishes the new reclaimable position. Checkpoint batching is a
+future optimization; it does not change this ownership boundary.
 
 ```rust
 struct DiskV3Sender<T> {
@@ -273,14 +242,12 @@ enum WriterCommand<T> {
 
 struct AppendCommand<T> {
     record: PreparedRecord<T>,
-    reservation: CapacityReservation,
 }
 
 struct PreparedRecord<T> {
     payload: Bytes,
     codec_metadata: u32,
     event_count: NonZeroUsize,
-    framed_len: usize,
     ingress_finalizers: EventFinalizerGroups,
     _record_type: PhantomData<T>,
 }
@@ -292,41 +259,32 @@ impl<T: Bufferable> RecordPreparer<T> {
     fn recover(&self, record: PreparedRecord<T>) -> Result<T, BufferError>;
 }
 
-struct CapacityHandle { /* shared byte permits */ }
-struct CapacityReservation { bytes: usize /* owned permit */ }
+struct CapacityHandle { /* shared logical occupancy */ }
 
 impl CapacityHandle {
-    async fn reserve(&self, bytes: usize)
-        -> Result<CapacityReservation, BufferError>;
-    fn try_reserve(&self, bytes: usize)
-        -> Result<CapacityReservation, CapacityFull>;
+    fn is_below_high_water(&self) -> bool;
+    fn try_acquire(&self, bytes: usize) -> Result<(), CapacityFull>;
+    fn release(&self, bytes: u64) -> Result<(), BufferError>;
 }
 ```
 
 `DiskV3Sender` is the cloneable MPSC producer interface used by topology
 transforms. It does not contain a file handle. It prepares the payload, reserves
-its exact framed length, and transfers both into the command queue atomically
-from the design's perspective. `send` completes when that transfer succeeds.
-`try_send` preserves the existing block, drop, and overflow behavior and
-recovers the original record if it cannot transfer the prepared record.
+one command-channel slot, atomically charges the exact framed length, and fills
+the slot synchronously. `send` completes when that transfer succeeds.
+`try_send` implements drop-newest: it may await the internal command queue but
+does not wait for logical capacity.
 `flush` queues a command behind that sender's preceding append and waits for the
 actor to publish all append commands ahead of it. Graceful shutdown still
 uses its dedicated control path rather than a producer operation.
 
-`CapacityReservation` moves with the prepared record. The actor retains its
-exact framed byte count in queued or batched accounting until publication moves
-those bytes into committed positional accounting. It releases the corresponding
-byte permits only when the reclaimable acknowledgement advances.
-
-The current single-owner implementation calls these types `LogicalCapacity`
-and `LogicalCapacityReservation`. A producer acquires a reservation before
-calling `DiskBuffer::append`. `append` validates that the reservation belongs to
-that buffer and matches the frame's exact encoded length. Dropping a reservation
-before successful append returns its bytes, while accepted bytes remain charged
-until a durable reader checkpoint releases them. Acquiring the reservation
-outside `append(&mut self, ...)` is essential: waiting while exclusively
-borrowing the buffer would prevent the same owner from reading, acknowledging,
-and checkpointing the data needed to free capacity.
+The current implementation calls the shared handle `LogicalCapacity`. The
+sender waits without holding a command-channel slot, then acquires a slot and
+atomically attempts to charge the exact framed length. If another producer won
+the race, it releases the slot and either waits again for blocking admission or
+returns drop-newest. Once charging succeeds, filling the reserved channel slot
+is synchronous, so a separate RAII capacity reservation is unnecessary.
+Accepted bytes remain charged until a durable reader checkpoint releases them.
 
 ```rust
 struct WriterActor<T, S> {
@@ -466,8 +424,8 @@ wrapper.
 
 ### Interaction summary
 
-1. A producer prepares a record, reserves its exact framed length, and sends the
-   reservation and `AppendCommand` together.
+1. A producer prepares a record, reserves a command-channel slot, atomically
+   charges its exact framed length, and synchronously fills the slot.
 2. Successful queue insertion accepts the record. The actor dequeues it,
    assigns its record ID, and adds it to the current batch.
 3. The producer's following flush command makes the log writer publish the
@@ -512,9 +470,9 @@ rotation does not by itself advance record progress.
 
 Disk v3 tracks these principal watermarks:
 
-- **Accepted**: ownership and an exact byte reservation have transferred from a
-  producer to the writer actor, but the actor may not have assigned a record ID
-  yet.
+- **Accepted**: ownership has transferred from a producer to the writer actor
+  and the exact frame bytes have been charged, but the actor may not have
+  assigned a record ID yet.
 - **Committed**: the complete filesystem write has succeeded and the reader may
   consume the frame.
 - **Data synchronized**: segment files and required directory metadata have
@@ -554,10 +512,10 @@ manual flush requests, checkpoint updates, acknowledgement persistence,
 deletion completion, shutdown, and terminal failure publication.
 
 The command channel is bounded independently from disk capacity so that a
-stalled writer cannot cause unbounded memory growth. Disk capacity is bounded
-in bytes and includes accepted commands, even while they are still queued in
-memory. `when_full: block`, `drop_newest`, and `overflow` continue to apply at
-the producer-facing adapter.
+stalled writer cannot cause unbounded memory growth. Logical occupancy includes
+accepted commands even while they are still queued in memory. The
+producer-facing adapter supports blocking admission and drop-newest; disk v3
+does not support overflow mode.
 
 The actor owns the authoritative runtime positions. Retained channels expose
 snapshots to the reader and producers, but no other task mutates those
@@ -616,8 +574,8 @@ Vector's fanout currently calls `send` followed by `flush` for every
 `EventArray`. Disk v3 deliberately uses that existing manual drive, matching
 disk v2:
 
-- **Admission completion**: the actor owns the record and its reservation. A
-  normal producer send may return.
+- **Admission completion**: the actor owns the record and its exact bytes have
+  been charged. A normal producer send may return.
 - **Flush completion**: the actor has written and published every append ahead
   of that flush command. Readers can consume through the returned committed
   position.
@@ -717,9 +675,8 @@ a normal synchronization condition.
 Although there is one consumer stream, downstream sink requests may complete
 out of order. Each emitted frame has an opaque `AcknowledgementToken`, and
 Vector's existing `OrderedFinalizer<AcknowledgementToken>` emits completed
-tokens in original read order. `AcknowledgementTracker` also verifies the
-token's sequence before advancing the largest contiguous observed
-acknowledgement.
+tokens in original read order. Tokens therefore need no sequence number or
+separate ordering tracker.
 
 Here, acknowledged means that downstream finalization has completed, not only
 that the final status was `Delivered`. A permanently rejected or otherwise
@@ -728,12 +685,13 @@ reclaims it while recording its final status in the appropriate delivery and
 drop/error telemetry. Sink retry policy remains responsible for deciding when
 an error is terminal.
 
-The buffer owner batches observed acknowledgements into checkpoint updates. It
-synchronizes log data before persisting a reader checkpoint. Only after the
-checkpoint mmap is synchronously flushed does it advance the reclaimable
-acknowledgement, release logical capacity, and mark segments for deletion. A
-crash before that point may replay already finalized records, but cannot make
-the buffer delete or overwrite data whose acknowledgement was not durable.
+The actor currently handles each ordered completion immediately. It synchronizes
+log data before persisting a reader checkpoint. Only after the checkpoint mmap
+is synchronously flushed does it advance the reclaimable acknowledgement,
+release logical capacity, and mark segments for deletion. A crash before that
+point may replay already finalized records, but cannot make the buffer delete
+or overwrite data whose acknowledgement was not durable. A future optimization
+may batch multiple ordered completions into one checkpoint update.
 
 ## On-disk format
 
@@ -825,10 +783,9 @@ checksum errors produce a warning and fall back to the earliest retained
 segment, while an unsupported version fails startup.
 
 The backing file is sized and synchronized when first created, after which its
-directory entry is synchronized. Writer state, acknowledgement sequence
-numbers, logical size, and pending byte counts are not stored. Writer state is
-recovered from segment contents; the remaining values are process-local or
-derived during startup.
+directory entry is synchronized. Writer state, logical size, and pending byte
+counts are not stored. Writer state is recovered from segment contents; the
+remaining values are process-local or derived during startup.
 
 ## Capacity management
 
@@ -855,15 +812,16 @@ plus `segment_byte_offset` bytes in the acknowledged segment. Bytes after the
 committed boundary normally do not exist, but subtracting a partial or otherwise
 unpublished active tail makes recovery accounting explicit. This calculation
 is needed only during startup. Normal operation maintains occupancy through
-reservation and reclaimable byte deltas.
+accepted-frame and reclaimable byte deltas.
 
 ### Logical-capacity accounting
 
 The first implementation uses a shared `LogicalCapacity` backed by one
-`AtomicU64` and a Tokio `Notify`. `DiskBuffer` retains the handle so durable
-checkpoints can release bytes, while producer-facing senders receive clones
-that can reserve bytes. All clones refer to the same occupancy counter; the
-writer neither owns nor updates capacity accounting.
+`AtomicU64`. `DiskBuffer` retains the handle so durable checkpoints can release
+bytes, while producer-facing senders receive clones that can charge bytes. All
+clones refer to the same occupancy counter; producers charge accepted frames
+and the writer releases durable acknowledged frames. Each release is followed
+by publishing writer state, whose retained `watch` update wakes blocked senders.
 
 On startup, `DiskBuffer` recovers the writer and opens the reader at the durable
 reclaimable position. One calculation totals bytes through the committed writer
@@ -871,28 +829,32 @@ position, and a second totals bytes through the actual reader position. Checked
 subtraction produces the initial logical size. Bytes before the reader and a
 physical tail after the writer are therefore excluded. `DiskBuffer` initializes
 capacity occupancy with this value; no segment collection is retained. There
-are no in-flight reservations to recover after process restart.
+are no in-flight commands to recover after process restart.
 
 Normal operation uses exact byte deltas rather than positions:
 
-- Acquiring a reservation adds the frame's exact encoded length.
-- Dropping an unaccepted reservation subtracts that length automatically.
-- Accepting or publishing the frame does not change occupancy; it only changes
-  the frame's lifecycle state.
+- Accepting a frame atomically adds its exact encoded length immediately before
+  the prepared record is inserted into its reserved command-channel slot.
+- Publishing the frame does not change occupancy; it only changes the frame's
+  lifecycle state.
 - After acknowledgement progress is durable, the checkpoint owner subtracts
-  the encoded bytes that became reclaimable and wakes blocked producers.
+  the encoded bytes that became reclaimable and publishes writer state to wake
+  blocked producers.
 
 Rotation, segment sealing, and segment deletion do not change the logical byte
 count. Fully acknowledged segments already stopped contributing when their
 bytes became reclaimable, regardless of when their files are deleted.
 
-The producer-facing adapter reserves the exact framed length before reporting
-acceptance. Capacity occupancy remains unchanged when a batch commits: the
+The producer-facing adapter atomically charges the exact framed length before
+reporting acceptance. Capacity occupancy remains unchanged when a batch commits: the
 bytes merely move from an in-flight lifecycle state to a committed on-disk
-lifecycle state. Reservations prevent concurrent producers, flushes, and
-acknowledgements from admitting more logical data than configured. A future
-committed-byte metric, if needed, is observability state rather than a second
-admission counter.
+lifecycle state. The configured limit is a soft high-water mark. When occupancy
+is below it, one producer atomically charges its complete frame even if that
+takes occupancy above the mark. Further producers block or drop-newest until a
+durable acknowledgement brings occupancy below the mark again. Atomic charging
+keeps this overshoot bounded by one maximum-sized frame under normal operation.
+A future committed-byte metric, if needed, is observability state rather than a
+second admission counter.
 
 Using observed but non-durable acknowledgement for admission is unsafe. A
 writer could reuse capacity released by an in-memory acknowledgement, crash
@@ -913,13 +875,13 @@ queued records can make logical occupancy larger, while acknowledged segments
 pending deletion can make physical usage larger. Metrics and assertions must
 not assume one is always an upper bound for the other.
 
-For disk v3, `max_size` is the logical admission limit. It covers committed
-non-reclaimable frame bytes plus exact reservations for queued and batched
-frames. It does not reserve space for segment slack, rotation, the checkpoint
-file, or acknowledged files pending deletion. A single frame larger than the
-limit is rejected immediately; otherwise a full buffer blocks or follows the
-configured overflow policy until a durable acknowledgement checkpoint releases
-enough logical bytes.
+For disk v3, `max_size` is a soft logical high-water mark. It covers committed
+non-reclaimable frame bytes plus accepted queued and batched frames. It does not
+reserve space for segment slack, rotation, the checkpoint file, or acknowledged
+files pending deletion. A frame may be larger than the mark, provided it
+satisfies the hard frame and segment limits. Admission stops after that complete
+frame takes occupancy to or above the mark and resumes only after a durable
+acknowledgement checkpoint lowers occupancy below it.
 
 Physical usage and pending-delete bytes remain separately observable. Segment
 reclamation is still required to prevent stale files from accumulating, and an
@@ -1101,14 +1063,14 @@ and that each accepted frame is written at most once.
 MPSC tests must run several producers concurrently and verify that actor receive
 order defines one gap-free record-ID sequence, each producer's awaited send
 order is preserved, and cancellation cannot remove another producer's record.
-They must also verify `block`, `drop_newest`, and `overflow` behavior without
-losing or duplicating finalizers.
+They must also verify blocking and drop-newest behavior without losing or
+duplicating finalizers.
 
 ### Model testing
 
 A reference model should track:
 
-- Accepted commands and reservations.
+- Accepted commands and their charged bytes.
 - Pending records.
 - Committed records.
 - Durable records.
@@ -1139,7 +1101,8 @@ that disk buffers do not promise. It should cover:
 - No duplicate record IDs within one recovered log history.
 - No record-ID regression.
 - No frame crossing a segment boundary.
-- Logical occupancy never exceeds admitted capacity.
+- Logical occupancy can cross the soft high-water mark by at most one
+  maximum-sized frame during normal admission.
 - Physical usage is reported independently from logical occupancy.
 - A retryable deletion failure does not prevent acknowledgement progress and
   resumes deletion when the fault clears.
@@ -1205,8 +1168,9 @@ Frame-boundary positions and the segment catalog remain the recovery authority,
 but rescanning files for every admission decision would make a hot producer path
 perform directory and metadata I/O. Disk v3 instead derives the initial value at
 startup, then maintains checked atomic counters with exact frame-byte deltas.
-RAII reservations cover cancellation before acceptance, and restart scanning
-repairs any process-local accounting after a crash.
+Reserving a channel slot before charging removes the cancellation point between
+those operations, and restart scanning repairs any process-local accounting
+after a crash.
 
 ## Remaining implementation work
 
@@ -1221,30 +1185,25 @@ remaining work, in priority order, is:
    deletion failure must be retryable without rolling back the durable
    checkpoint. Until this exists, logical capacity can be released but physical
    segment files accumulate forever.
-2. **Drive acknowledgements and checkpoints automatically.** The finalizer
-   consumer must pass completed tokens to `acknowledge`, then batch calls to
-   `checkpoint` according to manual flushes, an acknowledged-byte threshold,
-   and graceful shutdown. Without this owner, acknowledged progress can remain
-   in memory indefinitely and be replayed after restart.
-3. **Harden crash recovery.** Recovery must preserve every complete valid
+2. **Harden crash recovery.** Recovery must preserve every complete valid
    frame, truncate an incomplete frame in the newest segment, remove logically
    later orphan segments, and reopen the last valid boundary for append.
    Complete frame corruption continues to fail closed. Startup must also obtain
    an exclusive directory lock and validate that a loaded reader checkpoint is
    within the recovered log.
-4. **Complete capacity integration in the MPSC adapter.** `DiskBuffer` now
+3. **Complete capacity integration in the MPSC adapter.** `DiskBuffer` now
    initializes logical admission from recovered committed non-reclaimable bytes,
-   requires an exact frame reservation on append, returns abandoned
-   reservations through RAII, and releases accepted capacity only after a
-   durable acknowledgement checkpoint. The topology adapter must acquire and
-   transfer those reservations with queued frames and map full admission to its
-   block, drop, and overflow policies.
-5. **Add the Vector-facing adapter.** The adapter needs cloneable MPSC senders,
+   atomically charges each accepted frame before queue insertion, and releases
+   accepted capacity only after a durable acknowledgement checkpoint. The
+   topology adapter must map full admission to its blocking and drop-newest
+   policies.
+4. **Add the Vector-facing adapter.** The adapter needs cloneable MPSC senders,
    one task owning `DiskBuffer`, the existing `BufferSender` and
-   `BufferReceiver` interfaces, ordered-finalizer completion handling, flush
-   and shutdown wiring, and the real `EventArray` codec. Disk v3 also needs an
-   opt-in configuration path before it can replace disk v2.
-6. **Complete production validation.** Add metrics and failure diagnostics,
+   `BufferReceiver` interfaces, attaching the disk buffer's batch notifier to
+   the real decoded `EventArray`, flush and shutdown wiring, and the real codec.
+   Disk v3 also needs an opt-in configuration path before it can replace disk
+   v2.
+5. **Complete production validation.** Add metrics and failure diagnostics,
    deterministic failure injection, subprocess crash tests, golden frame and
    checkpoint fixtures, an Antithesis scenario, migration guidance, and
    benchmarks against disk v2.
@@ -1259,8 +1218,6 @@ integration is added.
   interval?
 - What exact topology API owns the writer actor's shutdown handle and waits for
   its drain result during reload and graceful shutdown?
-- How should a full or overflow result recover an encoded record without adding
-  an avoidable clone on the common path?
 - How should users drain or inspect a failed disk-v3 buffer?
 - Is an automatic disk-v2 importer worth supporting after the initial release?
 
@@ -1281,8 +1238,9 @@ integration is added.
   earliest retained segment.
 - Observed acknowledgement does not release capacity until it is checkpointed
   and becomes reclaimable.
-- `max_size` is a logical byte limit over committed non-reclaimable frames and
-  accepted in-flight reservations; physical disk usage is separate.
+- `max_size` is a soft logical high-water mark over committed non-reclaimable
+  frames and accepted in-flight frames. One complete frame may cross the
+  mark; physical disk usage is separate.
 - Ingress durability finalizers are resolved only after data synchronization;
   there is no separate durability mode initially.
 - Disk v3 is opt-in through a versioned configuration and directory.

@@ -29,6 +29,21 @@ pub(crate) trait SegmentStorage: Clone + Send + Sync + 'static {
     async fn sync_directory(&self) -> io::Result<()>;
 }
 
+/// Receives monotonic notifications when the writer advances its durable log
+/// position. Callbacks run synchronously on the writer owner's task.
+pub(crate) trait DurabilityObserver: Send + 'static {
+    type Pending: Send + 'static;
+
+    /// Associates one accepted item with the writer's current pending boundary.
+    fn register(&mut self, next_record_id: u64, pending: Self::Pending);
+
+    /// Reports that every accepted item through `through` is durable.
+    fn on_data_synced(&mut self, through: Position);
+
+    /// Reports that the writer owner has entered a terminal failure state.
+    fn on_failure(&mut self);
+}
+
 /// Production segment storage rooted at one exclusively owned buffer
 /// directory.
 #[derive(Clone, Debug)]
@@ -190,14 +205,16 @@ impl AggregationBuffer {
 /// The owning actor must await each method to completion. Producer
 /// cancellation cannot cancel these operations because producers communicate
 /// with the actor through the MPSC command queue.
-pub(crate) struct SegmentedLogWriter<S>
+pub(crate) struct SegmentedLogWriter<S, P = ()>
 where
     S: SegmentStorage,
+    P: Send + 'static,
 {
     storage: S,
     active_segment: WritableSegment<S::File>,
     committed: Position,
     data_synced: Position,
+    durability_observer: Option<Box<dyn DurabilityObserver<Pending = P>>>,
     next_record_id: u64,
     batch: AggregationBuffer,
     last_sync: Instant,
@@ -234,6 +251,7 @@ where
             active_segment,
             committed: position,
             data_synced: position,
+            durability_observer: None,
             next_record_id: first_record_id,
             batch: AggregationBuffer::new(config.batch_size),
             last_sync: Instant::now(),
@@ -241,6 +259,35 @@ where
         })
     }
 
+    /// Installs an optional durability integration on an otherwise complete
+    /// segmented-log writer.
+    #[must_use]
+    pub(crate) fn with_durability_observer<O>(
+        self,
+        durability_observer: O,
+    ) -> SegmentedLogWriter<S, O::Pending>
+    where
+        O: DurabilityObserver,
+    {
+        SegmentedLogWriter {
+            storage: self.storage,
+            active_segment: self.active_segment,
+            committed: self.committed,
+            data_synced: self.data_synced,
+            durability_observer: Some(Box::new(durability_observer)),
+            next_record_id: self.next_record_id,
+            batch: self.batch,
+            last_sync: self.last_sync,
+            config: self.config,
+        }
+    }
+}
+
+impl<S, P> SegmentedLogWriter<S, P>
+where
+    S: SegmentStorage,
+    P: Send + 'static,
+{
     #[must_use]
     pub(crate) const fn committed(&self) -> Position {
         self.committed
@@ -249,6 +296,20 @@ where
     #[must_use]
     pub(crate) const fn data_synced(&self) -> Position {
         self.data_synced
+    }
+
+    /// Associates an accepted item with the current pending writer boundary.
+    pub(crate) fn register_durability(&mut self, pending: P) {
+        if let Some(observer) = self.durability_observer.as_mut() {
+            observer.register(self.next_record_id, pending);
+        }
+    }
+
+    /// Notifies the observer that the writer owner encountered a terminal error.
+    pub(crate) fn notify_durability_failure(&mut self) {
+        if let Some(observer) = self.durability_observer.as_mut() {
+            observer.on_failure();
+        }
     }
 
     /// Returns the record ID that will be assigned to the next appended frame.
@@ -439,6 +500,9 @@ where
             })?;
 
         self.data_synced = through;
+        if let Some(observer) = self.durability_observer.as_mut() {
+            observer.on_data_synced(through);
+        }
         Ok(())
     }
 
@@ -510,6 +574,7 @@ impl SegmentedLogWriter<FilesystemSegmentStorage> {
             // Keep the recovered active segment conservatively unsynchronized
             // so a later checkpoint forces it to disk first.
             data_synced: Position::at_segment_start(segment_base_offset),
+            durability_observer: None,
             next_record_id: position.next_record_id(),
             batch: AggregationBuffer::new(config.batch_size),
             last_sync: Instant::now(),
@@ -712,6 +777,23 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingDurabilityObserver {
+        positions: Arc<Mutex<Vec<Position>>>,
+    }
+
+    impl DurabilityObserver for RecordingDurabilityObserver {
+        type Pending = ();
+
+        fn register(&mut self, _next_record_id: u64, _pending: ()) {}
+
+        fn on_data_synced(&mut self, through: Position) {
+            self.positions.lock().unwrap().push(through);
+        }
+
+        fn on_failure(&mut self) {}
+    }
+
     fn config(segment_size: u64) -> SegmentedLogWriterConfig {
         SegmentedLogWriterConfig {
             segment_size,
@@ -833,6 +915,31 @@ mod tests {
         assert_eq!(*storage.state.synced.lock().unwrap(), vec![0]);
         assert_eq!(writer.data_synced().segment_byte_offset(), 3);
         assert_eq!(*storage.state.directory_syncs.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn rotation_notifies_the_durability_observer() {
+        let storage = TestStorage::new(usize::MAX);
+        let observer = RecordingDurabilityObserver::default();
+        let callback_positions = Arc::clone(&observer.positions);
+        let mut writer = SegmentedLogWriter::create(storage, 0, config(3))
+            .await
+            .unwrap()
+            .with_durability_observer(observer);
+        writer
+            .append(PreparedFrame::from_test_bytes(Bytes::from_static(b"abc")))
+            .await
+            .unwrap();
+
+        writer
+            .append(PreparedFrame::from_test_bytes(Bytes::from_static(b"def")))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *callback_positions.lock().unwrap(),
+            vec![Position::new(0, 3, 1)]
+        );
     }
 
     #[tokio::test]
