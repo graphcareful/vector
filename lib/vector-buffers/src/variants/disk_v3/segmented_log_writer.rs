@@ -251,6 +251,16 @@ where
         self.data_synced
     }
 
+    /// Returns the record ID that will be assigned to the next appended frame.
+    ///
+    /// Unlike [`Self::committed`], this includes frames currently held in the
+    /// aggregation buffer. The writer actor uses it to assign record IDs after
+    /// concurrent producers have been serialized through its command queue.
+    #[must_use]
+    pub(crate) const fn next_record_id(&self) -> u64 {
+        self.next_record_id
+    }
+
     /// Accepts one complete frame, rotating first when it cannot fit in the
     /// active segment. Reaching the batch byte limit publishes the complete batch.
     pub(crate) async fn append(
@@ -432,7 +442,13 @@ where
         Ok(())
     }
 
-    async fn sync_committed(&mut self) -> Result<(), SegmentedLogWriterError> {
+    /// Synchronizes bytes that have already been published without publishing
+    /// the current aggregation batch.
+    ///
+    /// This is driven by the writer actor's periodic durability timer. Keeping
+    /// it separate from [`Self::sync_all`] preserves the explicit-flush policy
+    /// for partial batches.
+    pub(crate) async fn sync_committed(&mut self) -> Result<(), SegmentedLogWriterError> {
         self.sync_data(self.committed).await?;
         self.last_sync = Instant::now();
         Ok(())

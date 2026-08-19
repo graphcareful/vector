@@ -8,6 +8,7 @@ pub(crate) mod readable_segment;
 pub(crate) mod segmented_log_reader;
 pub(crate) mod segmented_log_writer;
 pub(crate) mod writable_segment;
+pub(crate) mod writer_actor;
 
 #[cfg(test)]
 mod tests;
