@@ -12,7 +12,7 @@ use std::{
 use snafu::Snafu;
 use tokio::fs;
 
-use super::{position::Position, writable_segment::parse_segment_file_name};
+use super::{position::Position, segment_files::parse_segment_file_name};
 
 /// Calculates the initial logical occupancy from durable log boundaries.
 pub(crate) async fn calculate_logical_bytes(
@@ -237,7 +237,7 @@ mod tests {
     use tokio::fs;
 
     use super::*;
-    use crate::variants::disk_v3::writable_segment::segment_file_name;
+    use crate::variants::disk_v3::segment_files::segment_file_name;
 
     async fn write_segment(directory: &Path, base_offset: u64, len: usize) {
         fs::write(

@@ -1,4 +1,4 @@
-use std::{ffi::OsStr, io};
+use std::io;
 
 use snafu::Snafu;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -235,44 +235,6 @@ pub(crate) enum WritableSegmentError {
     RecordIdRegression { start: u64, end: u64 },
 }
 
-/// Returns the canonical file name for a segment whose first record ID is
-/// `base_offset`.
-#[must_use]
-pub(crate) fn segment_file_name(base_offset: u64) -> String {
-    format!("{base_offset}.log")
-}
-
-/// Parses a canonical `<base_offset>.log` segment file name.
-pub(crate) fn parse_segment_file_name(name: &OsStr) -> Result<u64, SegmentFileNameError> {
-    let name = name.to_str().ok_or(SegmentFileNameError::NonUtf8)?;
-    let offset = name
-        .strip_suffix(".log")
-        .ok_or(SegmentFileNameError::InvalidExtension)?;
-
-    if offset.is_empty()
-        || !offset.bytes().all(|byte| byte.is_ascii_digit())
-        || (offset.len() > 1 && offset.starts_with('0'))
-    {
-        return Err(SegmentFileNameError::InvalidOffset);
-    }
-
-    offset
-        .parse()
-        .map_err(|_| SegmentFileNameError::InvalidOffset)
-}
-
-#[derive(Debug, Snafu)]
-pub(crate) enum SegmentFileNameError {
-    #[snafu(display("segment file name is not valid UTF-8"))]
-    NonUtf8,
-
-    #[snafu(display("segment file name must end with '.log'"))]
-    InvalidExtension,
-
-    #[snafu(display("segment file name must contain a canonical u64 record base offset"))]
-    InvalidOffset,
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -287,9 +249,9 @@ mod tests {
 
     use tokio::io::AsyncWrite;
 
-    use super::{
-        SegmentEnd, SegmentFileNameError, WritableSegment, WritableSegmentError,
-        parse_segment_file_name, segment_file_name,
+    use super::{SegmentEnd, WritableSegment, WritableSegmentError};
+    use crate::variants::disk_v3::segment_files::{
+        SegmentFileNameError, parse_segment_file_name, segment_file_name,
     };
 
     #[derive(Default)]

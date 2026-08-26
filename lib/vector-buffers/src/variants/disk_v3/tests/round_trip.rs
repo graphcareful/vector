@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, ffi::OsString, num::NonZeroU32};
 
 use crate::variants::disk_v3::{
-    position::Position, segmented_log_reader::SegmentedRead, writable_segment::segment_file_name,
+    position::Position, segment_files::segment_file_name, segmented_log_reader::SegmentedRead,
 };
 
 use super::harness::{DiskV3Harness, TestFrame, writer_config};

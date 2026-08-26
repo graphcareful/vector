@@ -12,10 +12,9 @@ use tokio::{fs::OpenOptions, io::AsyncWrite};
 use super::{
     frame::PreparedFrame,
     position::Position,
+    segment_files::segment_file_name,
     segmented_log_reader::{SegmentedLogReader, SegmentedLogReaderError},
-    writable_segment::{
-        SealedSegment, SegmentEnd, WritableSegment, WritableSegmentError, segment_file_name,
-    },
+    writable_segment::{SealedSegment, SegmentEnd, WritableSegment, WritableSegmentError},
 };
 
 pub(crate) const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_millis(500);

@@ -5,12 +5,12 @@ use tokio::fs;
 use crate::variants::disk_v3::{
     frame::{PreparedFrame, encode_frame},
     position::Position,
+    segment_files::segment_file_name,
     segmented_log_reader::SegmentedLogReader,
     segmented_log_writer::{
         DEFAULT_SYNC_INTERVAL, FilesystemSegmentStorage, SegmentedLogWriter,
         SegmentedLogWriterConfig,
     },
-    writable_segment::segment_file_name,
 };
 
 pub(super) struct DiskV3Harness {

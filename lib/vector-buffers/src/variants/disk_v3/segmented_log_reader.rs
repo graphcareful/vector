@@ -1,6 +1,4 @@
 use std::{
-    collections::BTreeSet,
-    ffi::OsString,
     io,
     ops::Bound::{Excluded, Unbounded},
     path::{Path, PathBuf},
@@ -8,13 +6,13 @@ use std::{
 };
 
 use snafu::Snafu;
-use tokio::fs::{self, File};
+use tokio::fs::File;
 use tracing::warn;
 
 use super::{
     position::Position,
     readable_segment::{OwnedDecodedFrame, ReadableSegment, ReadableSegmentError, SegmentRead},
-    writable_segment::{parse_segment_file_name, segment_file_name},
+    segment_files::{SegmentFileError, list_segment_base_offsets, segment_file_name},
 };
 
 /// Reads complete frames across record-base-offset-named segment files.
@@ -45,8 +43,9 @@ impl SegmentedLogReader {
     pub(crate) async fn earliest_position(
         directory: &Path,
     ) -> Result<Option<Position>, SegmentedLogReaderError> {
-        Ok(Self::list_segment_base_offsets(directory)
-            .await?
+        Ok(list_segment_base_offsets(directory)
+            .await
+            .map_err(|source| SegmentedLogReaderError::SegmentFiles { source })?
             .first()
             .copied()
             .map(Position::at_segment_start))
@@ -58,7 +57,9 @@ impl SegmentedLogReader {
         max_frame_len: usize,
     ) -> Result<Option<RecoveredLogTail>, SegmentedLogReaderError> {
         let directory = directory.into();
-        let segment_base_offsets = Self::list_segment_base_offsets(&directory).await?;
+        let segment_base_offsets = list_segment_base_offsets(&directory)
+            .await
+            .map_err(|source| SegmentedLogReaderError::SegmentFiles { source })?;
         let Some(first_segment_base_offset) = segment_base_offsets.first().copied() else {
             return Ok(None);
         };
@@ -298,43 +299,13 @@ impl SegmentedLogReader {
         directory: &Path,
         after: u64,
     ) -> Result<Option<u64>, SegmentedLogReaderError> {
-        let base_offsets = Self::list_segment_base_offsets(directory).await?;
+        let base_offsets = list_segment_base_offsets(directory)
+            .await
+            .map_err(|source| SegmentedLogReaderError::SegmentFiles { source })?;
         Ok(base_offsets
             .range((Excluded(after), Unbounded))
             .next()
             .copied())
-    }
-
-    /// Lists the unique base offsets encoded in segment file names.
-    async fn list_segment_base_offsets(
-        directory: &Path,
-    ) -> Result<BTreeSet<u64>, SegmentedLogReaderError> {
-        let mut entries = fs::read_dir(directory)
-            .await
-            .map_err(|source| SegmentedLogReaderError::ListDirectory { source })?;
-        let mut base_offsets = BTreeSet::new();
-
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|source| SegmentedLogReaderError::ListDirectory { source })?
-        {
-            if entry
-                .path()
-                .extension()
-                .is_none_or(|extension| extension != "log")
-            {
-                continue;
-            }
-
-            let name = entry.file_name();
-            let base_offset = parse_segment_file_name(&name).map_err(|_| {
-                SegmentedLogReaderError::InvalidSegmentFileName { name: name.clone() }
-            })?;
-            base_offsets.insert(base_offset);
-        }
-
-        Ok(base_offsets)
     }
 }
 
@@ -359,11 +330,8 @@ pub(crate) enum SegmentedLogReaderError {
     #[snafu(display("segment {segment_base_offset}.log does not exist"))]
     MissingSegment { segment_base_offset: u64 },
 
-    #[snafu(display("failed to list the segment directory: {source}"))]
-    ListDirectory { source: io::Error },
-
-    #[snafu(display("invalid segment file name {name:?}"))]
-    InvalidSegmentFileName { name: OsString },
+    #[snafu(display("failed to inspect segment files: {source}"))]
+    SegmentFiles { source: SegmentFileError },
 
     #[snafu(display("segment {segment_base_offset}.log could not be read: {source}"))]
     Segment {
@@ -408,7 +376,7 @@ pub(crate) enum SegmentedLogReaderError {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::{collections::BTreeSet, num::NonZeroU32};
 
     use bytes::Bytes;
     use tokio::fs;
@@ -448,9 +416,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            SegmentedLogReader::list_segment_base_offsets(directory.path())
-                .await
-                .unwrap(),
+            list_segment_base_offsets(directory.path()).await.unwrap(),
             BTreeSet::from([10, 50, 90])
         );
         assert_eq!(
