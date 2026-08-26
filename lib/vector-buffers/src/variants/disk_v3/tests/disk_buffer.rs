@@ -13,6 +13,7 @@ use crate::variants::disk_v3::{
         TrySendOutcome, WriterStatus,
     },
     position::Position,
+    segment_files::segment_file_name,
 };
 
 use super::harness::{DiskV3Harness, TestFrame, writer_config};
@@ -85,6 +86,107 @@ async fn wait_for_reclaimable(receiver: &DiskBufferReceiver, position: Position)
     })
     .await
     .expect("finalized frame should be checkpointed");
+}
+
+async fn segment_exists(harness: &DiskV3Harness, segment_base_offset: u64) -> bool {
+    let path = harness.path().join(segment_file_name(segment_base_offset));
+    match tokio::fs::metadata(path).await {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => panic!("failed to inspect segment {segment_base_offset}.log: {error}"),
+    }
+}
+
+async fn wait_for_segment_removal(harness: &DiskV3Harness, segment_base_offset: u64) {
+    timeout(Duration::from_secs(1), async {
+        while segment_exists(harness, segment_base_offset).await {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("reclaimable segment should be removed");
+}
+
+#[tokio::test]
+async fn durable_checkpoint_reclaims_sealed_segments_and_retries_at_startup() {
+    let harness = DiskV3Harness::new("vector-disk-v3-reclamation", MAX_FRAME_LEN);
+    let frames = (0..3)
+        .map(|index| {
+            harness.frame(
+                FIRST_RECORD_ID + index,
+                NonZeroU32::MIN,
+                0,
+                format!("record-{index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let frame_len = frames[0].encoded_len();
+    assert!(frames.iter().all(|frame| frame.encoded_len() == frame_len));
+    let buffer_config = config(
+        &harness,
+        MAX_LOGICAL_BYTES,
+        u64::try_from(frame_len).unwrap(),
+        4096,
+    );
+
+    let (sender, mut receiver) = DiskBuffer::open(buffer_config.clone()).await.unwrap();
+    for frame in &frames {
+        append(&sender, frame).await;
+    }
+    sender.sync().await.unwrap();
+
+    let first_segment_bytes = harness.segment_bytes(FIRST_RECORD_ID).await;
+    for segment_base_offset in FIRST_RECORD_ID..FIRST_RECORD_ID + 3 {
+        assert!(segment_exists(&harness, segment_base_offset).await);
+    }
+
+    let first = receiver
+        .next()
+        .await
+        .unwrap()
+        .expect("expected first frame");
+    let first_position = receiver.read_position();
+    finalize_and_wait(&receiver, first, first_position).await;
+    sleep(Duration::from_millis(20)).await;
+    assert!(
+        segment_exists(&harness, FIRST_RECORD_ID).await,
+        "the segment containing the durable checkpoint must be retained"
+    );
+
+    let second = receiver
+        .next()
+        .await
+        .unwrap()
+        .expect("expected second frame");
+    let second_position = receiver.read_position();
+    assert_eq!(second_position.segment_base_offset(), FIRST_RECORD_ID + 1);
+    sleep(Duration::from_millis(20)).await;
+    assert!(
+        segment_exists(&harness, FIRST_RECORD_ID).await,
+        "reading the next segment without acknowledging it must not reclaim data"
+    );
+
+    finalize_and_wait(&receiver, second, second_position).await;
+    wait_for_segment_removal(&harness, FIRST_RECORD_ID).await;
+    assert!(segment_exists(&harness, FIRST_RECORD_ID + 1).await);
+    assert!(segment_exists(&harness, FIRST_RECORD_ID + 2).await);
+
+    sender.shutdown().await.unwrap();
+    drop(sender);
+    drop(receiver);
+
+    // Model a deletion that was not durable across a crash. The checkpoint is
+    // already in the next segment, so the reclaimer's initial watch value must
+    // remove the reappearing older segment without another acknowledgement.
+    tokio::fs::write(
+        harness.path().join(segment_file_name(FIRST_RECORD_ID)),
+        first_segment_bytes,
+    )
+    .await
+    .unwrap();
+    let (resumed_sender, _resumed_receiver) = DiskBuffer::open(buffer_config).await.unwrap();
+    wait_for_segment_removal(&harness, FIRST_RECORD_ID).await;
+    resumed_sender.shutdown().await.unwrap();
 }
 
 #[tokio::test]

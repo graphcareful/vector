@@ -74,6 +74,7 @@ pub(super) struct WriterActor {
     finalizations: BoxStream<'static, (BatchStatus, AcknowledgementToken)>,
     consumer_acknowledged: Position,
     reclaimable: Position,
+    reclaimable_segment_tx: watch::Sender<u64>,
     commands: mpsc::Receiver<WriterCommand>,
     state: watch::Sender<PublishedWriterState>,
     config: WriterActorConfig,
@@ -85,17 +86,22 @@ pub(super) struct WriterActorConfig {
     pub(super) max_frame_len: usize,
 }
 
+pub(super) struct WriterActorChannels {
+    pub(super) reclaimable_segment: watch::Sender<u64>,
+    pub(super) commands: mpsc::Receiver<WriterCommand>,
+    pub(super) state: watch::Sender<PublishedWriterState>,
+}
+
 impl WriterActor {
     pub(super) fn new(
         writer: SegmentedLogWriter<FilesystemSegmentStorage>,
         checkpoint: ReaderCheckpoint,
         capacity: LogicalCapacity,
         finalizations: BoxStream<'static, (BatchStatus, AcknowledgementToken)>,
-        commands: mpsc::Receiver<WriterCommand>,
-        state: watch::Sender<PublishedWriterState>,
+        channels: WriterActorChannels,
         config: WriterActorConfig,
     ) -> Self {
-        let reclaimable = state.borrow().reclaimable;
+        let reclaimable = channels.state.borrow().reclaimable;
         let finalizers = IngressFinalizerTracker::new(writer.data_synced());
         let writer = writer.with_durability_observer(finalizers);
         Self {
@@ -105,8 +111,9 @@ impl WriterActor {
             finalizations,
             consumer_acknowledged: reclaimable,
             reclaimable,
-            commands,
-            state,
+            reclaimable_segment_tx: channels.reclaimable_segment,
+            commands: channels.commands,
+            state: channels.state,
             config,
         }
     }
@@ -253,10 +260,19 @@ impl WriterActor {
         self.checkpoint
             .persist(position)
             .map_err(|source| DiskBufferError::Checkpoint { source })?;
+        self.reclaimable = position;
+        let next_reclaimable_segment = position.segment_base_offset();
+        self.reclaimable_segment_tx.send_if_modified(|current| {
+            if *current == next_reclaimable_segment {
+                false
+            } else {
+                *current = next_reclaimable_segment;
+                true
+            }
+        });
         self.capacity
             .release(frame_bytes)
             .map_err(|source| DiskBufferError::Capacity { source })?;
-        self.reclaimable = position;
         Ok(position)
     }
 

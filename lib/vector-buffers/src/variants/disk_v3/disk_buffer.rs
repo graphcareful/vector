@@ -18,12 +18,13 @@ use super::{
     logical_capacity::{LogicalCapacity, LogicalCapacityError, calculate_logical_bytes},
     position::Position,
     readable_segment::OwnedDecodedFrame,
+    reclaimer::SegmentReclaimer,
     segmented_log_reader::{SegmentedLogReader, SegmentedLogReaderError, SegmentedRead},
     segmented_log_writer::{
         FilesystemSegmentStorage, SegmentedLogWriter, SegmentedLogWriterConfig,
         SegmentedLogWriterError,
     },
-    writer_actor::{WriterActor, WriterActorConfig, WriterCommand},
+    writer_actor::{WriterActor, WriterActorChannels, WriterActorConfig, WriterCommand},
 };
 
 pub(crate) const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 128;
@@ -184,6 +185,8 @@ impl DiskBuffer {
             status: WriterStatus::Running,
         };
         let (state_tx, state_rx) = watch::channel(initial_state);
+        let (reclaimable_segment_tx, reclaimable_segment_rx) =
+            watch::channel(reclaimable.segment_base_offset());
         let (command_tx, command_rx) = mpsc::channel(config.command_queue_capacity);
         let (finalizer, finalizations) = OrderedFinalizer::new(None);
         let actor = WriterActor::new(
@@ -191,14 +194,20 @@ impl DiskBuffer {
             checkpoint,
             logical_capacity.clone(),
             finalizations,
-            command_rx,
-            state_tx,
+            WriterActorChannels {
+                reclaimable_segment: reclaimable_segment_tx,
+                commands: command_rx,
+                state: state_tx,
+            },
             WriterActorConfig {
                 sync_interval: config.writer.sync_interval,
                 max_frame_len: config.max_frame_len,
             },
         );
+        let reclaimer =
+            SegmentReclaimer::new(Arc::new(config.directory.clone()), reclaimable_segment_rx);
         crate::spawn_named(actor.run(), "disk-v3-writer");
+        crate::spawn_named(reclaimer.run(), "disk-v3-reclaimer");
 
         let sender = DiskBufferSender {
             commands: command_tx.clone(),
