@@ -143,12 +143,10 @@ where
             }
         };
 
-        let header = decode_frame_header(&header_bytes, self.max_frame_len).map_err(|source| {
-            ReadableSegmentError::Frame {
-                segment_byte_offset: self.position.segment_byte_offset(),
-                source,
-            }
-        })?;
+        let header = match decode_frame_header(&header_bytes, self.max_frame_len) {
+            Ok(header) => header,
+            Err(source) => return Err(self.restore_after_frame_error(source).await),
+        };
         let frame_len = header.frame_len();
 
         let mut frame_bytes = BytesMut::with_capacity(frame_len);
@@ -172,12 +170,9 @@ where
             }
         }
 
-        header
-            .validate_payload(&frame_bytes[FRAME_HEADER_LEN..])
-            .map_err(|source| ReadableSegmentError::Frame {
-                segment_byte_offset: self.position.segment_byte_offset(),
-                source,
-            })?;
+        if let Err(source) = header.validate_payload(&frame_bytes[FRAME_HEADER_LEN..]) {
+            return Err(self.restore_after_frame_error(source).await);
+        }
         let frame_len_u64 =
             u64::try_from(frame_len).map_err(|_| ReadableSegmentError::OffsetOverflow)?;
         let next_segment_byte_offset = self
@@ -214,6 +209,24 @@ where
         ReadableSegmentError::Io {
             segment_byte_offset: self.position.segment_byte_offset(),
             source,
+        }
+    }
+
+    async fn restore_after_frame_error(
+        &mut self,
+        frame_error: FrameDecodeError,
+    ) -> ReadableSegmentError {
+        let segment_byte_offset = self.position.segment_byte_offset();
+        match self.file.seek(SeekFrom::Start(segment_byte_offset)).await {
+            Ok(_) => ReadableSegmentError::Frame {
+                segment_byte_offset,
+                source: frame_error,
+            },
+            Err(source) => ReadableSegmentError::FramePositionRestore {
+                segment_byte_offset,
+                frame_error,
+                source,
+            },
         }
     }
 }
@@ -329,6 +342,15 @@ pub(crate) enum ReadableSegmentError {
     Frame {
         segment_byte_offset: u64,
         source: FrameDecodeError,
+    },
+
+    #[snafu(display(
+        "invalid frame in segment at byte {segment_byte_offset}: {frame_error}; failed to restore the read position: {source}"
+    ))]
+    FramePositionRestore {
+        segment_byte_offset: u64,
+        frame_error: FrameDecodeError,
+        source: io::Error,
     },
 
     #[snafu(display("segment read offset overflowed"))]
@@ -546,10 +568,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_frame_does_not_advance_the_read_position() {
-        let mut frame = encoded_frame(0, 1, b"payload").to_vec();
-        *frame.last_mut().unwrap() ^= 0xff;
-        let reader = GrowingReader::new(&frame, usize::MAX);
+    async fn invalid_header_restores_the_read_position() {
+        let first = encoded_frame(0, 1, b"first");
+        let mut corrupt = encoded_frame(1, 1, b"corrupt").to_vec();
+        corrupt[0] ^= 0xff;
+        let mut bytes = first.to_vec();
+        bytes.extend_from_slice(&corrupt);
+        let reader = GrowingReader::new(&bytes, usize::MAX);
+        let reader_position = reader.clone();
         let mut segment =
             ReadableSegment::new(reader, Position::at_segment_start(0), MAX_FRAME_LEN)
                 .await
@@ -557,11 +583,53 @@ mod tests {
 
         assert!(matches!(
             segment.read_next().await,
-            Err(ReadableSegmentError::Frame {
-                segment_byte_offset: 0,
-                source: FrameDecodeError::ChecksumMismatch { .. },
-            })
+            Ok(SegmentRead::Frame(frame)) if frame.record_id() == 0
         ));
-        assert_eq!(segment.position(), Position::at_segment_start(0));
+        let expected_position = Position::new(0, u64::try_from(first.len()).unwrap(), 1);
+
+        for _ in 0..2 {
+            assert!(matches!(
+                segment.read_next().await,
+                Err(ReadableSegmentError::Frame {
+                    segment_byte_offset,
+                    source: FrameDecodeError::InvalidMagic { .. },
+                }) if segment_byte_offset == u64::try_from(first.len()).unwrap()
+            ));
+            assert_eq!(segment.position(), expected_position);
+            assert_eq!(reader_position.position(), first.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn checksum_mismatch_restores_the_read_position() {
+        let first = encoded_frame(0, 1, b"first");
+        let mut corrupt = encoded_frame(1, 1, b"corrupt").to_vec();
+        *corrupt.last_mut().unwrap() ^= 0xff;
+        let mut bytes = first.to_vec();
+        bytes.extend_from_slice(&corrupt);
+        let reader = GrowingReader::new(&bytes, usize::MAX);
+        let reader_position = reader.clone();
+        let mut segment =
+            ReadableSegment::new(reader, Position::at_segment_start(0), MAX_FRAME_LEN)
+                .await
+                .unwrap();
+
+        assert!(matches!(
+            segment.read_next().await,
+            Ok(SegmentRead::Frame(frame)) if frame.record_id() == 0
+        ));
+        let expected_position = Position::new(0, u64::try_from(first.len()).unwrap(), 1);
+
+        for _ in 0..2 {
+            assert!(matches!(
+                segment.read_next().await,
+                Err(ReadableSegmentError::Frame {
+                    segment_byte_offset,
+                    source: FrameDecodeError::ChecksumMismatch { .. },
+                }) if segment_byte_offset == u64::try_from(first.len()).unwrap()
+            ));
+            assert_eq!(segment.position(), expected_position);
+            assert_eq!(reader_position.position(), first.len());
+        }
     }
 }
