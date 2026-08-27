@@ -8,12 +8,12 @@ use tokio::{
 use vector_common::finalization::{BatchStatus, EventFinalizerGroups, EventStatus};
 
 use super::{
-    acknowledgement::AcknowledgementToken,
     checkpoint::ReaderCheckpoint,
     disk_buffer::{DiskBufferError, PreparedRecord},
     frame::encode_frame,
     logical_capacity::LogicalCapacity,
     position::Position,
+    read_progress::ReadProgressToken,
     segmented_log_writer::{DurabilityObserver, FilesystemSegmentStorage, SegmentedLogWriter},
 };
 
@@ -71,7 +71,7 @@ pub(super) struct WriterActor {
     writer: SegmentedLogWriter<FilesystemSegmentStorage, EventFinalizerGroups>,
     checkpoint: ReaderCheckpoint,
     capacity: LogicalCapacity,
-    finalizations: BoxStream<'static, (BatchStatus, AcknowledgementToken)>,
+    finalizations: BoxStream<'static, (BatchStatus, ReadProgressToken)>,
     consumer_acknowledged: Position,
     reclaimable: Position,
     reclaimable_segment_tx: watch::Sender<u64>,
@@ -97,7 +97,7 @@ impl WriterActor {
         writer: SegmentedLogWriter<FilesystemSegmentStorage>,
         checkpoint: ReaderCheckpoint,
         capacity: LogicalCapacity,
-        finalizations: BoxStream<'static, (BatchStatus, AcknowledgementToken)>,
+        finalizations: BoxStream<'static, (BatchStatus, ReadProgressToken)>,
         channels: WriterActorChannels,
         config: WriterActorConfig,
     ) -> Self {
@@ -135,13 +135,13 @@ impl WriterActor {
                     self.publish(WriterStatus::Running);
                 }
                 finalized = self.finalizations.next(), if finalizations_open => {
-                    let Some((_status, acknowledgement)) = finalized else {
+                    let Some((_status, progress)) = finalized else {
                         finalizations_open = false;
                         continue;
                     };
                     // Any terminal downstream status consumes the frame, as in
                     // disk v2. Sink retry policy decides when an error is final.
-                    if let Err(error) = self.checkpoint_acknowledgement(acknowledgement).await {
+                    if let Err(error) = self.checkpoint_read_progress(progress).await {
                         self.fail(&error);
                         return;
                     }
@@ -246,11 +246,11 @@ impl WriterActor {
         Ok(())
     }
 
-    async fn checkpoint_acknowledgement(
+    async fn checkpoint_read_progress(
         &mut self,
-        acknowledgement: AcknowledgementToken,
+        progress: ReadProgressToken,
     ) -> Result<Position, DiskBufferError> {
-        let (position, frame_bytes) = acknowledgement.into_parts();
+        let (position, logical_bytes) = progress.into_parts();
         self.consumer_acknowledged = position;
 
         self.writer
@@ -271,7 +271,7 @@ impl WriterActor {
             }
         });
         self.capacity
-            .release(frame_bytes)
+            .release(logical_bytes)
             .map_err(|source| DiskBufferError::Capacity { source })?;
         Ok(position)
     }

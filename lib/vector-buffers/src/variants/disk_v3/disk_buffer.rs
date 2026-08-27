@@ -14,11 +14,11 @@ use crate::{Bufferable, encoding::AsMetadata, finalization::FinalizerGuard};
 pub(crate) use super::writer_actor::{PublishedWriterState, WriterStatus};
 
 use super::{
-    acknowledgement::{AcknowledgementError, AcknowledgementToken},
     checkpoint::{CheckpointDecodeError, CheckpointError, CheckpointLoad, ReaderCheckpoint},
     frame::{FRAME_HEADER_LEN, FrameEncodeError},
     logical_capacity::{LogicalCapacity, LogicalCapacityError, calculate_logical_bytes},
     position::Position,
+    read_progress::{ReadProgressError, ReadProgressToken},
     readable_segment::OwnedDecodedFrame,
     reclaimer::SegmentReclaimer,
     segmented_log_reader::{SegmentedLogReader, SegmentedLogReaderError, SegmentedRead},
@@ -610,7 +610,7 @@ enum WriterRequest {
 pub(crate) struct DiskBufferReceiver<T> {
     reader: SegmentedLogReader,
     state: watch::Receiver<PublishedWriterState>,
-    finalizer: OrderedFinalizer<AcknowledgementToken>,
+    finalizer: OrderedFinalizer<ReadProgressToken>,
     failed: bool,
     _record: PhantomData<fn() -> T>,
 }
@@ -730,10 +730,10 @@ impl<T> DiskBufferReceiver<T> {
         &self,
         read: &PendingAcknowledgement,
     ) -> Result<BatchNotifier, DiskBufferError> {
-        let acknowledgement = AcknowledgementToken::new(read.position, read.frame.frame_len())
-            .map_err(|source| DiskBufferError::Acknowledgement { source })?;
+        let progress = ReadProgressToken::for_frame(read.position, read.frame.frame_len())
+            .map_err(|source| DiskBufferError::ReadProgress { source })?;
         let (batch_notifier, finalization) = BatchNotifier::new_with_receiver();
-        self.finalizer.add(acknowledgement, finalization);
+        self.finalizer.add(progress, finalization);
         Ok(batch_notifier)
     }
 
@@ -824,8 +824,8 @@ pub(crate) enum DiskBufferError {
     #[snafu(display("persistent queue logical-capacity operation failed: {source}"))]
     Capacity { source: LogicalCapacityError },
 
-    #[snafu(display("persistent queue acknowledgement failed: {source}"))]
-    Acknowledgement { source: AcknowledgementError },
+    #[snafu(display("persistent queue reader progress failed: {source}"))]
+    ReadProgress { source: ReadProgressError },
 
     #[snafu(display("persistent queue checkpoint failed: {source}"))]
     Checkpoint { source: CheckpointError },

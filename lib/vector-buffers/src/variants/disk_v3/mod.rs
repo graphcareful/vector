@@ -1,9 +1,9 @@
-pub(crate) mod acknowledgement;
 pub(crate) mod checkpoint;
 pub(crate) mod disk_buffer;
 pub(crate) mod frame;
 pub(crate) mod logical_capacity;
 pub(crate) mod position;
+pub(crate) mod read_progress;
 pub(crate) mod readable_segment;
 pub(crate) mod reclaimer;
 pub(crate) mod segment_files;
