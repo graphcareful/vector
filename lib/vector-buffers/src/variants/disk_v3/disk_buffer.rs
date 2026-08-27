@@ -1,6 +1,6 @@
-use std::{num::NonZeroU32, path::PathBuf, sync::Arc};
+use std::{any::type_name, marker::PhantomData, num::NonZeroU32, path::PathBuf, sync::Arc};
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use snafu::Snafu;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::warn;
@@ -8,6 +8,8 @@ use vector_common::{
     finalization::{BatchNotifier, EventFinalizerGroups, EventStatus},
     finalizer::OrderedFinalizer,
 };
+
+use crate::{Bufferable, encoding::AsMetadata, finalization::FinalizerGuard};
 
 pub(crate) use super::writer_actor::{PublishedWriterState, WriterStatus};
 
@@ -104,6 +106,11 @@ impl PreparedRecord {
         std::mem::take(&mut self.ingress_finalizers)
     }
 
+    fn restore_ingress_finalizers(&mut self, finalizers: EventFinalizerGroups) {
+        debug_assert!(self.ingress_finalizers.is_empty());
+        self.ingress_finalizers = finalizers;
+    }
+
     pub(super) fn mark_errored(&self) {
         self.ingress_finalizers.update_status(EventStatus::Errored);
     }
@@ -133,9 +140,31 @@ pub(crate) struct DiskBuffer;
 impl DiskBuffer {
     /// Recovers the log, starts its single writer actor, and returns its MPSC
     /// producer and exclusive consumer endpoints.
-    pub(crate) async fn open(
+    pub(crate) async fn open<T>(
         config: DiskBufferConfig,
-    ) -> Result<(DiskBufferSender, DiskBufferReceiver), DiskBufferError> {
+    ) -> Result<(DiskBufferSender<T>, DiskBufferReceiver<T>), DiskBufferError>
+    where
+        T: Bufferable,
+    {
+        Self::open_inner(config).await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn open_raw(
+        config: DiskBufferConfig,
+    ) -> Result<
+        (
+            DiskBufferSender<PreparedRecord>,
+            DiskBufferReceiver<PreparedRecord>,
+        ),
+        DiskBufferError,
+    > {
+        Self::open_inner(config).await
+    }
+
+    async fn open_inner<T>(
+        config: DiskBufferConfig,
+    ) -> Result<(DiskBufferSender<T>, DiskBufferReceiver<T>), DiskBufferError> {
         if config.command_queue_capacity == 0 {
             return Err(DiskBufferError::ZeroCommandQueueCapacity);
         }
@@ -215,15 +244,70 @@ impl DiskBuffer {
             capacity: logical_capacity,
             max_frame_len: config.max_frame_len,
             max_segment_len: config.writer.segment_size,
+            _record: PhantomData,
         };
         let receiver = DiskBufferReceiver {
             reader,
             state: state_rx,
             finalizer,
+            failed: false,
+            _record: PhantomData,
         };
 
         Ok((sender, receiver))
     }
+}
+
+fn prepare_record<T>(
+    mut record: T,
+    max_frame_len: usize,
+) -> Result<Option<PreparedRecord>, DiskBufferError>
+where
+    T: Bufferable,
+{
+    let event_count = record.event_count();
+    let ingress_finalizers = FinalizerGuard::new(record.take_finalizer_groups());
+    let Some(event_count_u32) = u32::try_from(event_count).ok().and_then(NonZeroU32::new) else {
+        return Err(DiskBufferError::InvalidEventCount {
+            record_type: type_name::<T>(),
+            event_count,
+        });
+    };
+    let codec_metadata = T::get_metadata().into_u32();
+    let max_payload_len = max_frame_len.saturating_sub(FRAME_HEADER_LEN);
+    let encoded_size = record.encoded_size();
+    if encoded_size.is_some_and(|encoded_size| encoded_size > max_payload_len) {
+        warn!(
+            record_type = type_name::<T>(),
+            ?encoded_size,
+            max_payload_len,
+            "Record cannot fit in a disk-v3 frame; dropping it."
+        );
+        ingress_finalizers.disarm();
+        return Ok(None);
+    }
+    let initial_capacity = encoded_size.unwrap_or_default();
+    let mut payload = BytesMut::with_capacity(initial_capacity);
+    let encode_result = {
+        let mut limited_payload = (&mut payload).limit(max_payload_len);
+        record.encode(&mut limited_payload)
+    };
+    if let Err(source) = encode_result {
+        warn!(
+            record_type = type_name::<T>(),
+            error = %source,
+            "Record could not be encoded for disk-v3; dropping it."
+        );
+        ingress_finalizers.disarm();
+        return Ok(None);
+    }
+
+    Ok(Some(PreparedRecord::new(
+        payload.freeze(),
+        event_count_u32,
+        codec_metadata,
+        ingress_finalizers.into_inner(),
+    )))
 }
 
 fn load_checkpoint(checkpoint: &ReaderCheckpoint) -> Result<Option<Position>, DiskBufferError> {
@@ -246,28 +330,95 @@ fn load_checkpoint(checkpoint: &ReaderCheckpoint) -> Result<Option<Position>, Di
     }
 }
 
-/// Cloneable MPSC producer endpoint for one disk buffer.
-#[derive(Clone, Debug)]
-pub(crate) struct DiskBufferSender {
+/// Cloneable, typed MPSC producer endpoint for one disk buffer.
+pub(crate) struct DiskBufferSender<T> {
     commands: mpsc::Sender<WriterCommand>,
     state: watch::Receiver<PublishedWriterState>,
     capacity: LogicalCapacity,
     max_frame_len: usize,
     max_segment_len: u64,
+    _record: PhantomData<fn(T)>,
 }
 
-impl DiskBufferSender {
-    /// Waits for logical and command-queue capacity, then transfers ownership
-    /// of the record to the writer actor.
-    pub(crate) async fn send(
+impl<T> Clone for DiskBufferSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            commands: self.commands.clone(),
+            state: self.state.clone(),
+            capacity: self.capacity.clone(),
+            max_frame_len: self.max_frame_len,
+            max_segment_len: self.max_segment_len,
+            _record: PhantomData,
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for DiskBufferSender<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DiskBufferSender")
+            .field("state", &self.state)
+            .field("capacity", &self.capacity)
+            .field("max_frame_len", &self.max_frame_len)
+            .field("max_segment_len", &self.max_segment_len)
+            .field("record_type", &type_name::<T>())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> DiskBufferSender<T>
+where
+    T: Bufferable,
+{
+    /// Waits for logical capacity and transfers the encoded record to the
+    /// single writer actor.
+    pub(crate) async fn send(&self, record: T) -> Result<SendOutcome, DiskBufferError> {
+        let Some(record) = prepare_record(record, self.max_frame_len)? else {
+            return Ok(SendOutcome::DroppedUnwritable);
+        };
+        self.send_prepared_record(record).await
+    }
+
+    /// Attempts admission without waiting for logical capacity. A full buffer
+    /// intentionally drops the record; disk-v3 does not support overflow stages.
+    pub(crate) async fn try_send(&self, record: T) -> Result<TrySendOutcome, DiskBufferError> {
+        let Some(record) = prepare_record(record, self.max_frame_len)? else {
+            return Ok(TrySendOutcome::DroppedUnwritable);
+        };
+        self.try_send_prepared_record(record).await
+    }
+}
+
+impl<T> DiskBufferSender<T> {
+    #[cfg(test)]
+    pub(crate) async fn send_prepared(
         &self,
         record: PreparedRecord,
     ) -> Result<SendOutcome, DiskBufferError> {
+        self.send_prepared_record(record).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn try_send_prepared(
+        &self,
+        record: PreparedRecord,
+    ) -> Result<TrySendOutcome, DiskBufferError> {
+        self.try_send_prepared_record(record).await
+    }
+
+    /// Waits for logical and command-queue capacity, then transfers ownership
+    /// of the record to the writer actor.
+    async fn send_prepared_record(
+        &self,
+        mut record: PreparedRecord,
+    ) -> Result<SendOutcome, DiskBufferError> {
+        let finalizers = FinalizerGuard::new(record.take_ingress_finalizers());
         let Some(frame_len) = self.admissible_frame_len(&record)? else {
+            finalizers.disarm();
             return Ok(SendOutcome::DroppedUnwritable);
         };
         let outcome = self
-            .enqueue_append_while_running(record, frame_len, WhenLogicalFull::Block)
+            .enqueue_append_while_running(record, finalizers, frame_len, WhenLogicalFull::Block)
             .await?;
         debug_assert_eq!(outcome, EnqueueOutcome::Accepted);
         Ok(SendOutcome::Accepted)
@@ -276,15 +427,22 @@ impl DiskBufferSender {
     /// Waits for command-queue space, then attempts a send without waiting for
     /// logical capacity. A full logical buffer intentionally drops the
     /// prepared record.
-    pub(crate) async fn try_send(
+    async fn try_send_prepared_record(
         &self,
-        record: PreparedRecord,
+        mut record: PreparedRecord,
     ) -> Result<TrySendOutcome, DiskBufferError> {
+        let finalizers = FinalizerGuard::new(record.take_ingress_finalizers());
         let Some(frame_len) = self.admissible_frame_len(&record)? else {
+            finalizers.disarm();
             return Ok(TrySendOutcome::DroppedUnwritable);
         };
         match self
-            .enqueue_append_while_running(record, frame_len, WhenLogicalFull::DropNewest)
+            .enqueue_append_while_running(
+                record,
+                finalizers,
+                frame_len,
+                WhenLogicalFull::DropNewest,
+            )
             .await?
         {
             EnqueueOutcome::Accepted => Ok(TrySendOutcome::Accepted),
@@ -337,7 +495,8 @@ impl DiskBufferSender {
 
     async fn enqueue_append_while_running(
         &self,
-        record: PreparedRecord,
+        mut record: PreparedRecord,
+        finalizers: FinalizerGuard,
         frame_len: usize,
         when_full: WhenLogicalFull,
     ) -> Result<EnqueueOutcome, DiskBufferError> {
@@ -346,6 +505,7 @@ impl DiskBufferSender {
             Self::ensure_status_running(&state.borrow().status)?;
             if !self.capacity.is_below_high_water() {
                 if when_full == WhenLogicalFull::DropNewest {
+                    finalizers.disarm();
                     return Ok(EnqueueOutcome::Full);
                 }
                 // Every capacity release is followed by a writer-state
@@ -374,6 +534,7 @@ impl DiskBufferSender {
                 Ok(()) => {
                     // Filling a reserved channel slot is synchronous, so there
                     // is no cancellation point after capacity is charged.
+                    record.restore_ingress_finalizers(finalizers.into_inner());
                     permit.send(WriterCommand::Append { record });
                     return Ok(EnqueueOutcome::Accepted);
                 }
@@ -381,6 +542,7 @@ impl DiskBufferSender {
                 // the permit returns the unused command-channel slot.
                 Err(LogicalCapacityError::Full) => {
                     if when_full == WhenLogicalFull::DropNewest {
+                        finalizers.disarm();
                         return Ok(EnqueueOutcome::Full);
                     }
                 }
@@ -444,21 +606,88 @@ enum WriterRequest {
     Shutdown,
 }
 
-/// Exclusive consumer endpoint for one disk buffer.
-pub(crate) struct DiskBufferReceiver {
+/// Exclusive, typed consumer endpoint for one disk buffer.
+pub(crate) struct DiskBufferReceiver<T> {
     reader: SegmentedLogReader,
     state: watch::Receiver<PublishedWriterState>,
     finalizer: OrderedFinalizer<AcknowledgementToken>,
+    failed: bool,
+    _record: PhantomData<fn() -> T>,
 }
 
-impl DiskBufferReceiver {
+impl<T> std::fmt::Debug for DiskBufferReceiver<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DiskBufferReceiver")
+            .field("record_type", &type_name::<T>())
+            .field("read_position", &self.read_position())
+            .field("failed", &self.failed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> DiskBufferReceiver<T>
+where
+    T: Bufferable,
+{
+    /// Waits for and decodes the next committed record.
+    ///
+    /// Decode failure is terminal for this receiver. The failed frame is not
+    /// registered as acknowledged, so its durable checkpoint cannot advance.
+    pub(crate) async fn next(&mut self) -> Result<Option<T>, DiskBufferError> {
+        if self.failed {
+            return Err(DiskBufferError::TypedReceiverFailed {
+                record_type: type_name::<T>(),
+            });
+        }
+
+        let read = match self.read_next_committed().await {
+            Ok(read) => read,
+            Err(error) => {
+                self.failed = true;
+                return Err(error);
+            }
+        };
+        let Some(read) = read else {
+            return Ok(None);
+        };
+
+        match decode_record::<T>(&read.frame) {
+            Ok(mut record) => {
+                let batch_notifier = self.register_acknowledgement(&read)?;
+                record.add_batch_notifier(batch_notifier);
+                Ok(Some(record))
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl<T> DiskBufferReceiver<T> {
     /// Waits for the next committed frame.
     ///
     /// The returned batch notifier must be attached to every event decoded
     /// from the frame. Downstream completion then advances the reader
     /// checkpoint automatically in frame order. `None` is returned only after
     /// the actor has closed and every committed frame has been consumed.
-    pub(crate) async fn next(&mut self) -> Result<Option<DiskBufferRead>, DiskBufferError> {
+    #[cfg(test)]
+    pub(crate) async fn next_frame(&mut self) -> Result<Option<DiskBufferRead>, DiskBufferError> {
+        let Some(read) = self.read_next_committed().await? else {
+            return Ok(None);
+        };
+        let batch_notifier = self.register_acknowledgement(&read)?;
+        Ok(Some(DiskBufferRead {
+            frame: read.frame,
+            batch_notifier,
+        }))
+    }
+
+    async fn read_next_committed(
+        &mut self,
+    ) -> Result<Option<PendingAcknowledgement>, DiskBufferError> {
         loop {
             let writer_state = self.state.borrow().clone();
             let read_position = self.reader.read_position();
@@ -474,14 +703,7 @@ impl DiskBufferReceiver {
                         committed: writer_state.committed,
                     });
                 };
-                let acknowledgement = AcknowledgementToken::new(position, frame.frame_len())
-                    .map_err(|source| DiskBufferError::Acknowledgement { source })?;
-                let (batch_notifier, finalization) = BatchNotifier::new_with_receiver();
-                self.finalizer.add(acknowledgement, finalization);
-                return Ok(Some(DiskBufferRead {
-                    frame,
-                    batch_notifier,
-                }));
+                return Ok(Some(PendingAcknowledgement { frame, position }));
             }
             if read_position.next_record_id() > writer_state.committed.next_record_id() {
                 return Err(DiskBufferError::ReaderBeyondCommitted {
@@ -504,6 +726,17 @@ impl DiskBufferReceiver {
         }
     }
 
+    fn register_acknowledgement(
+        &self,
+        read: &PendingAcknowledgement,
+    ) -> Result<BatchNotifier, DiskBufferError> {
+        let acknowledgement = AcknowledgementToken::new(read.position, read.frame.frame_len())
+            .map_err(|source| DiskBufferError::Acknowledgement { source })?;
+        let (batch_notifier, finalization) = BatchNotifier::new_with_receiver();
+        self.finalizer.add(acknowledgement, finalization);
+        Ok(batch_notifier)
+    }
+
     #[must_use]
     pub(crate) const fn read_position(&self) -> Position {
         self.reader.read_position()
@@ -522,6 +755,47 @@ impl DiskBufferReceiver {
             },
         }
     }
+}
+
+struct PendingAcknowledgement {
+    frame: OwnedDecodedFrame,
+    position: Position,
+}
+
+fn decode_record<T>(frame: &OwnedDecodedFrame) -> Result<T, DiskBufferError>
+where
+    T: Bufferable,
+{
+    let codec_metadata = frame.codec_metadata();
+    let metadata =
+        T::Metadata::from_u32(codec_metadata).ok_or(DiskBufferError::InvalidCodecMetadata {
+            record_type: type_name::<T>(),
+            codec_metadata,
+        })?;
+    if !T::can_decode(metadata) {
+        return Err(DiskBufferError::UnsupportedCodecMetadata {
+            record_type: type_name::<T>(),
+            codec_metadata,
+        });
+    }
+
+    let record = T::decode(metadata, frame.payload().clone()).map_err(|source| {
+        DiskBufferError::DecodeRecord {
+            record_type: type_name::<T>(),
+            reason: source.to_string(),
+        }
+    })?;
+    let actual_event_count = record.event_count();
+    let expected_event_count = frame.event_count().get();
+    if actual_event_count != expected_event_count as usize {
+        return Err(DiskBufferError::DecodedEventCountMismatch {
+            record_type: type_name::<T>(),
+            expected: expected_event_count,
+            actual: actual_event_count,
+        });
+    }
+
+    Ok(record)
 }
 
 /// One decoded frame and the notifier that tracks its downstream finalization.
@@ -558,6 +832,46 @@ pub(crate) enum DiskBufferError {
 
     #[snafu(display("persistent queue reader checkpoint is incompatible: {source}"))]
     DecodeCheckpoint { source: CheckpointDecodeError },
+
+    #[snafu(display("{record_type} reported unsupported disk buffer event count {event_count}"))]
+    InvalidEventCount {
+        record_type: &'static str,
+        event_count: usize,
+    },
+
+    #[snafu(display(
+        "disk buffer codec metadata {codec_metadata:#034b} is invalid for {record_type}"
+    ))]
+    InvalidCodecMetadata {
+        record_type: &'static str,
+        codec_metadata: u32,
+    },
+
+    #[snafu(display(
+        "disk buffer codec metadata {codec_metadata:#034b} is unsupported by {record_type}"
+    ))]
+    UnsupportedCodecMetadata {
+        record_type: &'static str,
+        codec_metadata: u32,
+    },
+
+    #[snafu(display("failed to decode disk buffer record {record_type}: {reason}"))]
+    DecodeRecord {
+        record_type: &'static str,
+        reason: String,
+    },
+
+    #[snafu(display(
+        "decoded disk buffer record {record_type} contains {actual} events but its frame declares {expected}"
+    ))]
+    DecodedEventCountMismatch {
+        record_type: &'static str,
+        expected: u32,
+        actual: usize,
+    },
+
+    #[snafu(display("typed disk buffer receiver for {record_type} has already failed"))]
+    TypedReceiverFailed { record_type: &'static str },
 
     #[snafu(display("disk buffer command queue capacity must be greater than zero"))]
     ZeroCommandQueueCapacity,

@@ -2,18 +2,23 @@ use std::{collections::BTreeSet, num::NonZeroU32, time::Duration};
 
 use tokio::time::{sleep, timeout};
 use vector_common::finalization::{
-    BatchNotifier, BatchStatus, EventFinalizer, EventFinalizerGroups, EventFinalizers,
+    AddBatchNotifier, BatchNotifier, BatchStatus, EventFinalizer, EventFinalizerGroups,
+    EventFinalizers,
 };
 
-use crate::variants::disk_v3::{
-    checkpoint::CHECKPOINT_FILE_NAME,
-    disk_buffer::{
-        DEFAULT_COMMAND_QUEUE_CAPACITY, DiskBuffer, DiskBufferConfig, DiskBufferError,
-        DiskBufferRead, DiskBufferReceiver, DiskBufferSender, PreparedRecord, SendOutcome,
-        TrySendOutcome, WriterStatus,
+use crate::{
+    test::{SizedRecord, UndecodableRecord},
+    variants::disk_v3::{
+        checkpoint::CHECKPOINT_FILE_NAME,
+        disk_buffer::{
+            DEFAULT_COMMAND_QUEUE_CAPACITY, DiskBuffer, DiskBufferConfig, DiskBufferError,
+            DiskBufferRead, DiskBufferReceiver, DiskBufferSender, PreparedRecord, SendOutcome,
+            TrySendOutcome, WriterStatus,
+        },
+        frame::FRAME_HEADER_LEN,
+        position::Position,
+        segment_files::segment_file_name,
     },
-    position::Position,
-    segment_files::segment_file_name,
 };
 
 use super::harness::{DiskV3Harness, TestFrame, writer_config};
@@ -21,6 +26,9 @@ use super::harness::{DiskV3Harness, TestFrame, writer_config};
 const FIRST_RECORD_ID: u64 = 100;
 const MAX_FRAME_LEN: usize = 1024;
 const MAX_LOGICAL_BYTES: u64 = 1024 * 1024;
+
+type RawSender = DiskBufferSender<PreparedRecord>;
+type RawReceiver = DiskBufferReceiver<PreparedRecord>;
 
 fn config(
     harness: &DiskV3Harness,
@@ -46,23 +54,27 @@ fn record(frame: &TestFrame) -> PreparedRecord {
     )
 }
 
-async fn append(sender: &DiskBufferSender, frame: &TestFrame) {
+async fn append(sender: &RawSender, frame: &TestFrame) {
     assert_eq!(
-        sender.send(record(frame)).await.unwrap(),
+        sender.send_prepared(record(frame)).await.unwrap(),
         SendOutcome::Accepted
     );
 }
 
 async fn read_and_finalize(
-    receiver: &mut DiskBufferReceiver,
+    receiver: &mut RawReceiver,
 ) -> crate::variants::disk_v3::readable_segment::OwnedDecodedFrame {
-    let read = receiver.next().await.unwrap().expect("expected a frame");
+    let read = receiver
+        .next_frame()
+        .await
+        .unwrap()
+        .expect("expected a frame");
     let position = receiver.read_position();
     finalize_and_wait(receiver, read, position).await
 }
 
 async fn finalize_and_wait(
-    receiver: &DiskBufferReceiver,
+    receiver: &RawReceiver,
     read: DiskBufferRead,
     position: Position,
 ) -> crate::variants::disk_v3::readable_segment::OwnedDecodedFrame {
@@ -75,7 +87,7 @@ async fn finalize_and_wait(
     frame
 }
 
-async fn wait_for_reclaimable(receiver: &DiskBufferReceiver, position: Position) {
+async fn wait_for_reclaimable(receiver: &RawReceiver, position: Position) {
     timeout(Duration::from_secs(1), async {
         loop {
             if receiver.state().reclaimable == position {
@@ -86,6 +98,22 @@ async fn wait_for_reclaimable(receiver: &DiskBufferReceiver, position: Position)
     })
     .await
     .expect("finalized frame should be checkpointed");
+}
+
+async fn wait_for_typed_reclaimable<T>(receiver: &DiskBufferReceiver<T>, position: Position)
+where
+    T: crate::Bufferable,
+{
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if receiver.state().reclaimable == position {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("finalized typed record should be checkpointed");
 }
 
 async fn segment_exists(harness: &DiskV3Harness, segment_base_offset: u64) -> bool {
@@ -105,6 +133,129 @@ async fn wait_for_segment_removal(harness: &DiskV3Harness, segment_base_offset: 
     })
     .await
     .expect("reclaimable segment should be removed");
+}
+
+#[tokio::test]
+async fn typed_endpoints_encode_decode_and_preserve_finalization_boundaries() {
+    let harness = DiskV3Harness::new("vector-disk-v3-typed-round-trip", MAX_FRAME_LEN);
+    let mut buffer_config = config(&harness, MAX_LOGICAL_BYTES, 4096, 4096);
+    buffer_config.writer.sync_interval = Duration::from_mins(1);
+    let (sender, mut receiver): (
+        DiskBufferSender<SizedRecord>,
+        DiskBufferReceiver<SizedRecord>,
+    ) = DiskBuffer::open(buffer_config).await.unwrap();
+
+    let mut input = SizedRecord::new(12);
+    let (ingress_batch, ingress_status) = BatchNotifier::new_with_receiver();
+    input.add_batch_notifier(ingress_batch);
+    assert_eq!(sender.send(input).await.unwrap(), SendOutcome::Accepted);
+
+    sender.flush().await.unwrap();
+    tokio::pin!(ingress_status);
+    assert!(
+        timeout(Duration::from_millis(20), &mut ingress_status)
+            .await
+            .is_err()
+    );
+    sender.sync().await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(1), &mut ingress_status)
+            .await
+            .unwrap(),
+        BatchStatus::Delivered
+    );
+
+    let output = receiver.next().await.unwrap().expect("expected a record");
+    assert_eq!(output.0, 12);
+    let position = receiver.read_position();
+    drop(output);
+    wait_for_typed_reclaimable(&receiver, position).await;
+    sender.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn typed_drop_newest_consumes_the_original_record() {
+    let harness = DiskV3Harness::new("vector-disk-v3-typed-drop-newest", MAX_FRAME_LEN);
+    let payload_len = usize::try_from(8_u32).unwrap() + size_of::<u32>();
+    let frame_len = u64::try_from(FRAME_HEADER_LEN + payload_len).unwrap();
+    let (sender, mut receiver): (
+        DiskBufferSender<SizedRecord>,
+        DiskBufferReceiver<SizedRecord>,
+    ) = DiskBuffer::open(config(
+        &harness,
+        frame_len,
+        frame_len * 2,
+        usize::try_from(frame_len * 2).unwrap(),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        sender.send(SizedRecord::new(8)).await.unwrap(),
+        SendOutcome::Accepted
+    );
+    let mut dropped = SizedRecord::new(8);
+    let (batch, status) = BatchNotifier::new_with_receiver();
+    dropped.add_batch_notifier(batch);
+    assert_eq!(
+        sender.try_send(dropped).await.unwrap(),
+        TrySendOutcome::DroppedNewest
+    );
+    assert_eq!(status.await, BatchStatus::Delivered);
+    assert_eq!(sender.logical_bytes(), frame_len);
+
+    sender.flush().await.unwrap();
+    let output = receiver.next().await.unwrap().expect("expected a record");
+    let position = receiver.read_position();
+    drop(output);
+    wait_for_typed_reclaimable(&receiver, position).await;
+    sender.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn typed_send_after_shutdown_marks_ingress_finalizers_errored() {
+    let harness = DiskV3Harness::new("vector-disk-v3-typed-closed-send", MAX_FRAME_LEN);
+    let (sender, _receiver) =
+        DiskBuffer::open::<SizedRecord>(config(&harness, MAX_LOGICAL_BYTES, 4096, 4096))
+            .await
+            .unwrap();
+    sender.shutdown().await.unwrap();
+
+    let mut record = SizedRecord::new(8);
+    let (batch, status) = BatchNotifier::new_with_receiver();
+    record.add_batch_notifier(batch);
+    assert!(matches!(
+        sender.send(record).await,
+        Err(DiskBufferError::ActorClosed)
+    ));
+    assert_eq!(status.await, BatchStatus::Errored);
+}
+
+#[tokio::test]
+async fn typed_decode_failure_is_terminal_and_does_not_acknowledge_the_frame() {
+    let harness = DiskV3Harness::new("vector-disk-v3-typed-decode-failure", MAX_FRAME_LEN);
+    let (sender, mut receiver) =
+        DiskBuffer::open::<UndecodableRecord>(config(&harness, MAX_LOGICAL_BYTES, 4096, 4096))
+            .await
+            .unwrap();
+    let initial_reclaimable = receiver.state().reclaimable;
+
+    assert_eq!(
+        sender.send(UndecodableRecord).await.unwrap(),
+        SendOutcome::Accepted
+    );
+    sender.flush().await.unwrap();
+    assert!(matches!(
+        receiver.next().await,
+        Err(DiskBufferError::DecodeRecord { .. })
+    ));
+    assert_eq!(receiver.state().reclaimable, initial_reclaimable);
+    assert!(matches!(
+        receiver.next().await,
+        Err(DiskBufferError::TypedReceiverFailed { .. })
+    ));
+    assert_eq!(receiver.state().reclaimable, initial_reclaimable);
+    sender.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -129,7 +280,7 @@ async fn durable_checkpoint_reclaims_sealed_segments_and_retries_at_startup() {
         4096,
     );
 
-    let (sender, mut receiver) = DiskBuffer::open(buffer_config.clone()).await.unwrap();
+    let (sender, mut receiver) = DiskBuffer::open_raw(buffer_config.clone()).await.unwrap();
     for frame in &frames {
         append(&sender, frame).await;
     }
@@ -141,7 +292,7 @@ async fn durable_checkpoint_reclaims_sealed_segments_and_retries_at_startup() {
     }
 
     let first = receiver
-        .next()
+        .next_frame()
         .await
         .unwrap()
         .expect("expected first frame");
@@ -154,7 +305,7 @@ async fn durable_checkpoint_reclaims_sealed_segments_and_retries_at_startup() {
     );
 
     let second = receiver
-        .next()
+        .next_frame()
         .await
         .unwrap()
         .expect("expected second frame");
@@ -184,7 +335,7 @@ async fn durable_checkpoint_reclaims_sealed_segments_and_retries_at_startup() {
     )
     .await
     .unwrap();
-    let (resumed_sender, _resumed_receiver) = DiskBuffer::open(buffer_config).await.unwrap();
+    let (resumed_sender, _resumed_receiver) = DiskBuffer::open_raw(buffer_config).await.unwrap();
     wait_for_segment_removal(&harness, FIRST_RECORD_ID).await;
     resumed_sender.shutdown().await.unwrap();
 }
@@ -211,7 +362,7 @@ async fn actor_backed_buffer_initializes_sends_reads_and_resumes() {
         4096,
     );
 
-    let (sender, mut receiver) = DiskBuffer::open(buffer_config.clone()).await.unwrap();
+    let (sender, mut receiver) = DiskBuffer::open_raw(buffer_config.clone()).await.unwrap();
     assert_eq!(sender.logical_bytes(), 0);
 
     for frame in &frames {
@@ -224,7 +375,7 @@ async fn actor_backed_buffer_initializes_sends_reads_and_resumes() {
     );
 
     let first = receiver
-        .next()
+        .next_frame()
         .await
         .unwrap()
         .expect("expected first frame");
@@ -241,7 +392,7 @@ async fn actor_backed_buffer_initializes_sends_reads_and_resumes() {
     drop(sender);
     drop(receiver);
 
-    let (resumed_sender, mut resumed_receiver) = DiskBuffer::open(buffer_config).await.unwrap();
+    let (resumed_sender, mut resumed_receiver) = DiskBuffer::open_raw(buffer_config).await.unwrap();
     assert_eq!(
         resumed_sender.logical_bytes(),
         u64::try_from(frame_len * (frames.len() - 1)).unwrap()
@@ -262,14 +413,14 @@ async fn actor_backed_buffer_initializes_sends_reads_and_resumes() {
         assert_eq!(actual.payload().as_ref(), expected.payload());
     }
     resumed_sender.shutdown().await.unwrap();
-    assert!(resumed_receiver.next().await.unwrap().is_none());
+    assert!(resumed_receiver.next_frame().await.unwrap().is_none());
 }
 
 #[tokio::test]
 async fn cloned_senders_are_serialized_into_contiguous_actor_assigned_record_ids() {
     let harness = DiskV3Harness::new("vector-disk-v3-mpsc", MAX_FRAME_LEN);
     let buffer_config = config(&harness, MAX_LOGICAL_BYTES, 4096, 4096);
-    let (sender, mut receiver) = DiskBuffer::open(buffer_config).await.unwrap();
+    let (sender, mut receiver) = DiskBuffer::open_raw(buffer_config).await.unwrap();
 
     let mut tasks = Vec::new();
     for producer in 0..16_u64 {
@@ -277,7 +428,7 @@ async fn cloned_senders_are_serialized_into_contiguous_actor_assigned_record_ids
         tasks.push(tokio::spawn(async move {
             let record =
                 PreparedRecord::for_test(format!("producer-{producer}"), NonZeroU32::MIN, 7);
-            sender.send(record).await.unwrap()
+            sender.send_prepared(record).await.unwrap()
         }));
     }
     for task in tasks {
@@ -303,7 +454,7 @@ async fn drop_newest_consumes_the_record_without_reconstructing_it() {
     let first = harness.frame(FIRST_RECORD_ID, NonZeroU32::MIN, 0, "same-sized-record");
     let second = harness.frame(FIRST_RECORD_ID + 1, NonZeroU32::MIN, 0, "same-sized-record");
     let frame_len = u64::try_from(first.encoded_len()).unwrap();
-    let (sender, mut receiver) = DiskBuffer::open(config(
+    let (sender, mut receiver) = DiskBuffer::open_raw(config(
         &harness,
         frame_len,
         frame_len * 2,
@@ -323,7 +474,7 @@ async fn drop_newest_consumes_the_record_without_reconstructing_it() {
         finalizers,
     );
     assert_eq!(
-        sender.try_send(second).await.unwrap(),
+        sender.try_send_prepared(second).await.unwrap(),
         TrySendOutcome::DroppedNewest
     );
     assert_eq!(status.await, BatchStatus::Delivered);
@@ -350,7 +501,7 @@ async fn soft_capacity_admits_one_complete_frame_across_the_limit() {
         .collect::<Vec<_>>();
     let frame_len = u64::try_from(frames[0].encoded_len()).unwrap();
     let logical_high_water_mark = frame_len + 1;
-    let (sender, mut receiver) = DiskBuffer::open(config(
+    let (sender, mut receiver) = DiskBuffer::open_raw(config(
         &harness,
         logical_high_water_mark,
         frame_len * 3,
@@ -361,14 +512,14 @@ async fn soft_capacity_admits_one_complete_frame_across_the_limit() {
 
     append(&sender, &frames[0]).await;
     assert_eq!(
-        sender.try_send(record(&frames[1])).await.unwrap(),
+        sender.try_send_prepared(record(&frames[1])).await.unwrap(),
         TrySendOutcome::Accepted
     );
     assert_eq!(sender.logical_bytes(), frame_len * 2);
     assert!(sender.logical_bytes() > logical_high_water_mark);
 
     assert_eq!(
-        sender.try_send(record(&frames[2])).await.unwrap(),
+        sender.try_send_prepared(record(&frames[2])).await.unwrap(),
         TrySendOutcome::DroppedNewest
     );
 
@@ -384,13 +535,14 @@ async fn soft_capacity_admits_one_complete_frame_across_the_limit() {
 async fn partial_batch_is_invisible_until_flush_command_reaches_the_actor() {
     let harness = DiskV3Harness::new("vector-disk-v3-visibility", MAX_FRAME_LEN);
     let frame = harness.frame(FIRST_RECORD_ID, NonZeroU32::MIN, 0, "record");
-    let (sender, mut receiver) = DiskBuffer::open(config(&harness, MAX_LOGICAL_BYTES, 4096, 4096))
-        .await
-        .unwrap();
+    let (sender, mut receiver) =
+        DiskBuffer::open_raw(config(&harness, MAX_LOGICAL_BYTES, 4096, 4096))
+            .await
+            .unwrap();
     append(&sender, &frame).await;
 
     let read = {
-        let next = receiver.next();
+        let next = receiver.next_frame();
         tokio::pin!(next);
         assert!(timeout(Duration::from_millis(20), &mut next).await.is_err());
         sender.flush().await.unwrap();
@@ -411,7 +563,7 @@ async fn ingress_finalizers_wait_for_their_frame_to_be_durable() {
     let frame = harness.frame(FIRST_RECORD_ID, NonZeroU32::MIN, 0, "record");
     let mut buffer_config = config(&harness, MAX_LOGICAL_BYTES, 4096, 4096);
     buffer_config.writer.sync_interval = Duration::from_mins(1);
-    let (sender, mut receiver) = DiskBuffer::open(buffer_config).await.unwrap();
+    let (sender, mut receiver) = DiskBuffer::open_raw(buffer_config).await.unwrap();
 
     let (batch, status) = BatchNotifier::new_with_receiver();
     let finalizers =
@@ -422,7 +574,10 @@ async fn ingress_finalizers_wait_for_their_frame_to_be_durable() {
         frame.codec_metadata(),
         finalizers,
     );
-    assert_eq!(sender.send(record).await.unwrap(), SendOutcome::Accepted);
+    assert_eq!(
+        sender.send_prepared(record).await.unwrap(),
+        SendOutcome::Accepted
+    );
 
     // Flush is an actor ordering barrier and makes the frame readable, but the
     // long sync interval ensures it does not make the frame durable.
@@ -440,7 +595,11 @@ async fn ingress_finalizers_wait_for_their_frame_to_be_durable() {
         BatchStatus::Delivered
     );
 
-    let read = receiver.next().await.unwrap().expect("expected a frame");
+    let read = receiver
+        .next_frame()
+        .await
+        .unwrap()
+        .expect("expected a frame");
     let position = receiver.read_position();
     finalize_and_wait(&receiver, read, position).await;
     sender.shutdown().await.unwrap();
@@ -453,12 +612,12 @@ async fn acknowledgement_does_not_publish_an_unrelated_partial_batch() {
     let second = harness.frame(FIRST_RECORD_ID + 1, NonZeroU32::MIN, 0, "record-1");
     let mut buffer_config = config(&harness, MAX_LOGICAL_BYTES, 4096, 4096);
     buffer_config.writer.sync_interval = Duration::from_mins(1);
-    let (sender, mut receiver) = DiskBuffer::open(buffer_config).await.unwrap();
+    let (sender, mut receiver) = DiskBuffer::open_raw(buffer_config).await.unwrap();
 
     append(&sender, &first).await;
     sender.flush().await.unwrap();
     let first = receiver
-        .next()
+        .next_frame()
         .await
         .unwrap()
         .expect("expected first frame");
@@ -469,7 +628,7 @@ async fn acknowledgement_does_not_publish_an_unrelated_partial_batch() {
     let position = receiver.read_position();
     finalize_and_wait(&receiver, first, position).await;
     assert!(
-        timeout(Duration::from_millis(20), receiver.next())
+        timeout(Duration::from_millis(20), receiver.next_frame())
             .await
             .is_err(),
         "acknowledging a committed frame must not publish a partial batch"
@@ -493,7 +652,7 @@ async fn blocking_send_wakes_only_after_acknowledgement_is_checkpointed() {
     );
     assert_eq!(first.encoded_len(), second.encoded_len());
     let frame_len = u64::try_from(first.encoded_len()).unwrap();
-    let (sender, mut receiver) = DiskBuffer::open(config(
+    let (sender, mut receiver) = DiskBuffer::open_raw(config(
         &harness,
         frame_len,
         frame_len * 2,
@@ -505,12 +664,12 @@ async fn blocking_send_wakes_only_after_acknowledgement_is_checkpointed() {
     append(&sender, &first).await;
     sender.flush().await.unwrap();
     let waiting_sender = sender.clone();
-    let waiting = tokio::spawn(async move { waiting_sender.send(record(&second)).await });
+    let waiting = tokio::spawn(async move { waiting_sender.send_prepared(record(&second)).await });
     sleep(Duration::from_millis(20)).await;
     assert!(!waiting.is_finished(), "a full logical buffer must block");
 
     let read = receiver
-        .next()
+        .next_frame()
         .await
         .unwrap()
         .expect("expected first frame");
@@ -547,22 +706,23 @@ async fn ordered_finalizer_waits_for_earlier_frames() {
             )
         })
         .collect::<Vec<_>>();
-    let (sender, mut receiver) = DiskBuffer::open(config(&harness, MAX_LOGICAL_BYTES, 4096, 4096))
-        .await
-        .unwrap();
+    let (sender, mut receiver) =
+        DiskBuffer::open_raw(config(&harness, MAX_LOGICAL_BYTES, 4096, 4096))
+            .await
+            .unwrap();
     for frame in &frames {
         append(&sender, frame).await;
     }
     sender.flush().await.unwrap();
 
     let first = receiver
-        .next()
+        .next_frame()
         .await
         .unwrap()
         .expect("expected first frame");
     let first_position = receiver.read_position();
     let second = receiver
-        .next()
+        .next_frame()
         .await
         .unwrap()
         .expect("expected second frame");
@@ -590,7 +750,7 @@ async fn periodic_sync_advances_durability_without_publishing_partial_batches() 
     let frame = harness.frame(FIRST_RECORD_ID, NonZeroU32::MIN, 0, "record");
     let mut buffer_config = config(&harness, MAX_LOGICAL_BYTES, 4096, frame.encoded_len());
     buffer_config.writer.sync_interval = Duration::from_millis(20);
-    let (sender, mut receiver) = DiskBuffer::open(buffer_config).await.unwrap();
+    let (sender, mut receiver) = DiskBuffer::open_raw(buffer_config).await.unwrap();
 
     append(&sender, &frame).await;
     sender.flush().await.unwrap();
@@ -622,7 +782,7 @@ async fn shutdown_wakes_a_producer_blocked_on_logical_capacity() {
         "same-length-record-1",
     );
     let frame_len = u64::try_from(first.encoded_len()).unwrap();
-    let (sender, receiver) = DiskBuffer::open(config(
+    let (sender, receiver) = DiskBuffer::open_raw(config(
         &harness,
         frame_len,
         frame_len * 2,
@@ -633,7 +793,7 @@ async fn shutdown_wakes_a_producer_blocked_on_logical_capacity() {
     append(&sender, &first).await;
 
     let waiting_sender = sender.clone();
-    let waiting = tokio::spawn(async move { waiting_sender.send(record(&second)).await });
+    let waiting = tokio::spawn(async move { waiting_sender.send_prepared(record(&second)).await });
     sleep(Duration::from_millis(20)).await;
     assert!(!waiting.is_finished());
 
@@ -652,14 +812,14 @@ async fn shutdown_wakes_a_producer_blocked_on_logical_capacity() {
 async fn blocking_send_rejects_an_already_closed_actor() {
     let harness = DiskV3Harness::new("vector-disk-v3-send-after-shutdown", MAX_FRAME_LEN);
     let frame = harness.frame(FIRST_RECORD_ID, NonZeroU32::MIN, 0, "record");
-    let (sender, _receiver) = DiskBuffer::open(config(&harness, MAX_LOGICAL_BYTES, 4096, 4096))
+    let (sender, _receiver) = DiskBuffer::open_raw(config(&harness, MAX_LOGICAL_BYTES, 4096, 4096))
         .await
         .unwrap();
 
     sender.shutdown().await.unwrap();
 
     assert!(matches!(
-        sender.send(record(&frame)).await,
+        sender.send_prepared(record(&frame)).await,
         Err(DiskBufferError::ActorClosed)
     ));
     assert_eq!(sender.logical_bytes(), 0);
@@ -679,13 +839,13 @@ async fn torn_checkpoint_replays_from_the_earliest_retained_segment() {
         })
         .collect::<Vec<_>>();
     let buffer_config = config(&harness, MAX_LOGICAL_BYTES, 4096, 4096);
-    let (sender, mut receiver) = DiskBuffer::open(buffer_config.clone()).await.unwrap();
+    let (sender, mut receiver) = DiskBuffer::open_raw(buffer_config.clone()).await.unwrap();
     for frame in &frames {
         append(&sender, frame).await;
     }
     sender.sync().await.unwrap();
     let first = receiver
-        .next()
+        .next_frame()
         .await
         .unwrap()
         .expect("expected first frame");
@@ -702,13 +862,13 @@ async fn torn_checkpoint_replays_from_the_earliest_retained_segment() {
         .await
         .unwrap();
 
-    let (resumed_sender, mut resumed_receiver) = DiskBuffer::open(buffer_config).await.unwrap();
+    let (resumed_sender, mut resumed_receiver) = DiskBuffer::open_raw(buffer_config).await.unwrap();
     assert_eq!(
         resumed_sender.state().reclaimable,
         Position::at_segment_start(FIRST_RECORD_ID)
     );
     let first = resumed_receiver
-        .next()
+        .next_frame()
         .await
         .unwrap()
         .expect("expected replayed frame");
