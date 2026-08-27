@@ -33,14 +33,13 @@ use super::{
 use crate::{
     Bufferable,
     encoding::{AsMetadata, Encodable},
+    finalization::FinalizerGuard,
     variants::disk_v2::{
         io::AsyncFile,
         reader::decode_record_payload,
         record::{RECORD_HEADER_LEN, try_as_record_archive},
     },
 };
-use vector_common::finalization::{EventFinalizerGroups, EventStatus};
-
 /// Error that occurred during calls to [`BufferWriter`].
 #[derive(Debug, Snafu)]
 pub enum WriterError<T>
@@ -250,47 +249,6 @@ pub enum TryWriteOutcome<T> {
     /// `BatchStatus::Delivered`), so acking sources ack/checkpoint rather than redelivering
     /// a record that can never be written.
     Dropped,
-}
-
-/// RAII guard that resolves finalizers as [`EventStatus::Errored`] on drop unless explicitly
-/// disarmed.
-///
-/// Used in `try_write_record_inner` so that every `?` exit automatically notifies acking sources
-/// to nack / withhold checkpoints for any record that did not reach durable storage.
-struct FinalizerGuard {
-    finalizers: EventFinalizerGroups,
-    error_on_drop: bool,
-}
-
-impl FinalizerGuard {
-    fn new(finalizers: EventFinalizerGroups) -> Self {
-        Self {
-            finalizers,
-            error_on_drop: true,
-        }
-    }
-
-    /// Releases the guard without marking finalizers as errored.
-    ///
-    /// Call when the record was intentionally dropped (unwritable) or successfully flushed to
-    /// disk — both cases where the upstream source should ack rather than retry.
-    fn disarm(mut self) {
-        self.error_on_drop = false;
-    }
-
-    /// Returns the finalizers for reattachment to the recovered record on buffer-full retry.
-    fn into_inner(mut self) -> EventFinalizerGroups {
-        self.error_on_drop = false;
-        std::mem::take(&mut self.finalizers)
-    }
-}
-
-impl Drop for FinalizerGuard {
-    fn drop(&mut self) {
-        if self.error_on_drop {
-            self.finalizers.update_status(EventStatus::Errored);
-        }
-    }
 }
 
 #[derive(Debug)]

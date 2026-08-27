@@ -15,6 +15,7 @@
 extern crate tracing;
 
 mod buffer_usage_data;
+mod finalization;
 
 pub mod config;
 pub use config::{BufferConfig, BufferType, MemoryBufferSize};
