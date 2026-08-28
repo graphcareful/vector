@@ -62,14 +62,14 @@ async fn writer_open_or_create_resumes_the_existing_active_segment() {
         .open_reader(Position::at_segment_start(FIRST_RECORD_ID))
         .await;
     for expected in &frames {
-        let SegmentedRead::Frame { frame, .. } = reader.read_next().await.unwrap() else {
+        let SegmentedRead::Frame { frame, .. } = reader.read_next(final_end).await.unwrap() else {
             panic!("expected record {}", expected.record_id());
         };
         assert_eq!(frame.record_id(), expected.record_id());
         assert_eq!(frame.payload().as_ref(), expected.payload());
     }
     assert_eq!(
-        reader.read_next().await.unwrap(),
-        SegmentedRead::EndOfAvailableData
+        reader.read_next(final_end).await.unwrap(),
+        SegmentedRead::CaughtUp
     );
 }

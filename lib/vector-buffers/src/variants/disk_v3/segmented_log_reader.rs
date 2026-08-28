@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     io,
     ops::Bound::{Excluded, Unbounded},
     path::{Path, PathBuf},
@@ -23,6 +24,7 @@ use super::{
 pub(crate) struct SegmentedLogReader {
     directory: Arc<PathBuf>,
     active_segment: ReadableSegment<File>,
+    sealed_segment_end_offset: Option<u64>,
     max_frame_len: usize,
 }
 
@@ -71,20 +73,43 @@ impl SegmentedLogReader {
         .await?;
 
         loop {
-            match reader.read_next().await? {
-                SegmentedRead::Frame { .. } => {}
-                SegmentedRead::EndOfAvailableData => {
-                    return Ok(Some(RecoveredLogTail {
-                        position: reader.read_position(),
-                    }));
+            let segment_base_offset = reader.active_segment.position().segment_base_offset();
+            let segment_byte_limit =
+                reader.active_segment.end_offset().await.map_err(|source| {
+                    SegmentedLogReaderError::Segment {
+                        segment_base_offset,
+                        source,
+                    }
+                })?;
+
+            loop {
+                let expected_position = reader.active_segment.position();
+                match reader
+                    .active_segment
+                    .read_next(segment_byte_limit)
+                    .await
+                    .map_err(|source| SegmentedLogReaderError::Segment {
+                        segment_base_offset,
+                        source,
+                    })? {
+                    SegmentRead::Frame(frame) => {
+                        reader.finish_frame(frame, expected_position, None).await?;
+                    }
+                    SegmentRead::EndOfAvailableData => break,
+                    SegmentRead::IncompleteTail => {
+                        let position = reader.read_position();
+                        return Err(SegmentedLogReaderError::IncompleteTail {
+                            segment_base_offset: position.segment_base_offset(),
+                            segment_byte_offset: position.segment_byte_offset(),
+                        });
+                    }
                 }
-                SegmentedRead::IncompleteTail => {
-                    let position = reader.read_position();
-                    return Err(SegmentedLogReaderError::IncompleteTail {
-                        segment_base_offset: position.segment_base_offset(),
-                        segment_byte_offset: position.segment_byte_offset(),
-                    });
-                }
+            }
+
+            if !reader.advance_segment().await? {
+                return Ok(Some(RecoveredLogTail {
+                    position: reader.read_position(),
+                }));
             }
         }
     }
@@ -106,6 +131,7 @@ impl SegmentedLogReader {
         Ok(Self {
             directory,
             active_segment,
+            sealed_segment_end_offset: None,
             max_frame_len,
         })
     }
@@ -116,43 +142,112 @@ impl SegmentedLogReader {
         self.active_segment.position()
     }
 
-    /// Reads the next frame, moving to the next higher segment base offset when
-    /// the current segment ends.
-    pub(crate) async fn read_next(&mut self) -> Result<SegmentedRead, SegmentedLogReaderError> {
+    /// Reads the next frame without advancing beyond `committed`.
+    ///
+    /// The reader moves to the next higher segment when necessary and reports
+    /// [`SegmentedRead::CaughtUp`] without performing I/O when its logical
+    /// record position has reached the committed position.
+    pub(crate) async fn read_next(
+        &mut self,
+        committed: Position,
+    ) -> Result<SegmentedRead, SegmentedLogReaderError> {
         loop {
             let expected_position = self.active_segment.position();
+            match expected_position
+                .next_record_id()
+                .cmp(&committed.next_record_id())
+            {
+                Ordering::Equal => return Ok(SegmentedRead::CaughtUp),
+                Ordering::Greater => {
+                    return Err(SegmentedLogReaderError::ReaderBeyondCommitted {
+                        read_position: expected_position,
+                        committed,
+                    });
+                }
+                Ordering::Less => {}
+            }
+            if expected_position.segment_base_offset() > committed.segment_base_offset() {
+                return Err(SegmentedLogReaderError::ReaderBeyondCommitted {
+                    read_position: expected_position,
+                    committed,
+                });
+            }
+
             let segment_base_offset = expected_position.segment_base_offset();
-            match self.active_segment.read_next().await.map_err(|source| {
-                SegmentedLogReaderError::Segment {
+            let segment_byte_limit =
+                if committed.segment_base_offset() == expected_position.segment_base_offset() {
+                    committed.segment_byte_offset()
+                } else {
+                    self.end_offset_of_sealed_segment().await?
+                };
+            match self
+                .active_segment
+                .read_next(segment_byte_limit)
+                .await
+                .map_err(|source| SegmentedLogReaderError::Segment {
                     segment_base_offset,
                     source,
+                })? {
+                SegmentRead::Frame(frame) => {
+                    return self
+                        .finish_frame(frame, expected_position, Some(committed))
+                        .await;
                 }
-            })? {
-                SegmentRead::Frame(frame) => return self.finish_frame(frame, expected_position),
                 SegmentRead::EndOfAvailableData => {
+                    if segment_base_offset == committed.segment_base_offset() {
+                        return Err(SegmentedLogReaderError::CommittedDataUnavailable {
+                            read_position: expected_position,
+                            committed,
+                        });
+                    }
                     if !self.advance_segment().await? {
-                        return Ok(SegmentedRead::EndOfAvailableData);
+                        return Err(SegmentedLogReaderError::CommittedDataUnavailable {
+                            read_position: expected_position,
+                            committed,
+                        });
                     }
                 }
-                SegmentRead::IncompleteTail => return Ok(SegmentedRead::IncompleteTail),
+                SegmentRead::IncompleteTail => {
+                    return Err(SegmentedLogReaderError::CommittedDataUnavailable {
+                        read_position: expected_position,
+                        committed,
+                    });
+                }
             }
         }
     }
 
-    fn finish_frame(
-        &self,
+    async fn finish_frame(
+        &mut self,
         frame: OwnedDecodedFrame,
         expected_position: Position,
+        committed: Option<Position>,
     ) -> Result<SegmentedRead, SegmentedLogReaderError> {
         let actual = frame.record_id();
         let expected = expected_position.next_record_id();
         if actual < expected {
-            return Err(SegmentedLogReaderError::RecordIdRegression {
+            let error = SegmentedLogReaderError::RecordIdRegression {
                 segment_base_offset: expected_position.segment_base_offset(),
                 segment_byte_offset: frame.segment_byte_offset(),
                 expected,
                 actual,
-            });
+            };
+            return Err(self
+                .restore_after_position_error(expected_position, error)
+                .await);
+        }
+
+        let position = self.active_segment.position();
+        if let Some(committed) =
+            committed.filter(|committed| position.next_record_id() > committed.next_record_id())
+        {
+            let error = SegmentedLogReaderError::ReaderBeyondCommitted {
+                read_position: position,
+                committed,
+            };
+            return Err(self
+                .restore_after_position_error(expected_position, error)
+                .await);
         }
         if actual > expected {
             warn!(
@@ -165,10 +260,23 @@ impl SegmentedLogReader {
             );
         }
 
-        Ok(SegmentedRead::Frame {
-            frame,
-            position: self.active_segment.position(),
-        })
+        Ok(SegmentedRead::Frame { frame, position })
+    }
+
+    async fn restore_after_position_error(
+        &mut self,
+        position: Position,
+        error: SegmentedLogReaderError,
+    ) -> SegmentedLogReaderError {
+        match self.active_segment.seek_to(position).await {
+            Ok(()) => error,
+            Err(source) => SegmentedLogReaderError::PositionRestore {
+                segment_base_offset: position.segment_base_offset(),
+                segment_byte_offset: position.segment_byte_offset(),
+                read_error: error.to_string(),
+                source,
+            },
+        }
     }
 
     async fn advance_segment(&mut self) -> Result<bool, SegmentedLogReaderError> {
@@ -202,7 +310,25 @@ impl SegmentedLogReader {
             })?;
 
         self.active_segment = next_segment;
+        self.sealed_segment_end_offset = None;
         Ok(true)
+    }
+
+    /// Returns the stable physical end offset of the active sealed segment.
+    async fn end_offset_of_sealed_segment(&mut self) -> Result<u64, SegmentedLogReaderError> {
+        if let Some(end_offset) = self.sealed_segment_end_offset {
+            return Ok(end_offset);
+        }
+
+        let segment_base_offset = self.active_segment.position().segment_base_offset();
+        let end_offset = self.active_segment.end_offset().await.map_err(|source| {
+            SegmentedLogReaderError::Segment {
+                segment_base_offset,
+                source,
+            }
+        })?;
+        self.sealed_segment_end_offset = Some(end_offset);
+        Ok(end_offset)
     }
 
     /// Opens the requested segment, or the segment with the smallest greater
@@ -261,13 +387,23 @@ impl SegmentedLogReader {
                 segment_base_offset,
                 source,
             })?;
+        let segment_byte_limit =
+            segment
+                .end_offset()
+                .await
+                .map_err(|source| SegmentedLogReaderError::Segment {
+                    segment_base_offset,
+                    source,
+                })?;
 
-        if let Some(actual) = segment.peek_next_record_id().await.map_err(|source| {
-            SegmentedLogReaderError::Segment {
+        if let Some(actual) = segment
+            .peek_next_record_id(segment_byte_limit)
+            .await
+            .map_err(|source| SegmentedLogReaderError::Segment {
                 segment_base_offset,
                 source,
-            }
-        })? {
+            })?
+        {
             if position.segment_byte_offset() == 0 && actual != segment_base_offset {
                 return Err(SegmentedLogReaderError::SegmentBaseOffsetMismatch {
                     segment_base_offset,
@@ -315,8 +451,7 @@ pub(crate) enum SegmentedRead {
         frame: OwnedDecodedFrame,
         position: Position,
     },
-    EndOfAvailableData,
-    IncompleteTail,
+    CaughtUp,
 }
 
 #[derive(Debug, Snafu)]
@@ -371,6 +506,32 @@ pub(crate) enum SegmentedLogReaderError {
     IncompleteTail {
         segment_base_offset: u64,
         segment_byte_offset: u64,
+    },
+
+    #[snafu(display(
+        "reader at {read_position:?} could not read data committed through {committed:?}"
+    ))]
+    CommittedDataUnavailable {
+        read_position: Position,
+        committed: Position,
+    },
+
+    #[snafu(display(
+        "reader position {read_position:?} advanced beyond committed position {committed:?}"
+    ))]
+    ReaderBeyondCommitted {
+        read_position: Position,
+        committed: Position,
+    },
+
+    #[snafu(display(
+        "failed to restore segment {segment_base_offset}.log to byte {segment_byte_offset} after {read_error}: {source}"
+    ))]
+    PositionRestore {
+        segment_base_offset: u64,
+        segment_byte_offset: u64,
+        read_error: String,
+        source: ReadableSegmentError,
     },
 }
 
@@ -448,14 +609,16 @@ mod tests {
         write_segment(directory.path(), 12, &second).await;
 
         let initial = Position::at_segment_start(10);
+        let committed = Position::new(12, u64::try_from(second.len()).unwrap(), 13);
         let mut reader = SegmentedLogReader::open(directory.path(), initial, MAX_FRAME_LEN)
             .await
             .unwrap();
+        assert_eq!(reader.sealed_segment_end_offset, None);
 
         let SegmentedRead::Frame {
             frame,
             position: first_position,
-        } = reader.read_next().await.unwrap()
+        } = reader.read_next(committed).await.unwrap()
         else {
             panic!("expected first frame");
         };
@@ -465,11 +628,15 @@ mod tests {
             Position::new(10, u64::try_from(first.len()).unwrap(), 12)
         );
         assert_eq!(reader.read_position(), first_position);
+        assert_eq!(
+            reader.sealed_segment_end_offset,
+            Some(u64::try_from(first.len()).unwrap())
+        );
 
         let SegmentedRead::Frame {
             frame,
             position: second_position,
-        } = reader.read_next().await.unwrap()
+        } = reader.read_next(committed).await.unwrap()
         else {
             panic!("expected second frame");
         };
@@ -479,10 +646,101 @@ mod tests {
             Position::new(12, u64::try_from(second.len()).unwrap(), 13)
         );
         assert_eq!(reader.read_position(), second_position);
+        assert_eq!(reader.sealed_segment_end_offset, None);
         assert_eq!(
-            reader.read_next().await.unwrap(),
-            SegmentedRead::EndOfAvailableData
+            reader.read_next(committed).await.unwrap(),
+            SegmentedRead::CaughtUp
         );
+    }
+
+    #[tokio::test]
+    async fn committed_position_controls_read_availability() {
+        let directory = temp_dir::TempDir::with_prefix("vector-disk-v3-committed").unwrap();
+        write_segment(directory.path(), 10, &Bytes::new()).await;
+        let initial = Position::at_segment_start(10);
+        let mut reader = SegmentedLogReader::open(directory.path(), initial, MAX_FRAME_LEN)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reader.read_next(initial).await.unwrap(),
+            SegmentedRead::CaughtUp
+        );
+
+        let committed = Position::new(10, 1, 11);
+        assert!(matches!(
+            reader.read_next(committed).await,
+            Err(SegmentedLogReaderError::CommittedDataUnavailable {
+                read_position,
+                committed: actual,
+            }) if read_position == initial && actual == committed
+        ));
+        assert_eq!(reader.read_position(), initial);
+    }
+
+    #[tokio::test]
+    async fn missing_committed_bytes_are_not_skipped_when_a_later_segment_exists() {
+        let directory = temp_dir::TempDir::with_prefix("vector-disk-v3-missing-committed").unwrap();
+        write_segment(directory.path(), 10, &Bytes::new()).await;
+        write_segment(directory.path(), 12, &Bytes::new()).await;
+        let initial = Position::at_segment_start(10);
+        let committed = Position::new(10, 100, 12);
+        let mut reader = SegmentedLogReader::open(directory.path(), initial, MAX_FRAME_LEN)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            reader.read_next(committed).await,
+            Err(SegmentedLogReaderError::CommittedDataUnavailable {
+                read_position,
+                committed: actual,
+            }) if read_position == initial && actual == committed
+        ));
+        assert_eq!(reader.read_position(), initial);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_reader_logically_beyond_committed() {
+        let directory = temp_dir::TempDir::with_prefix("vector-disk-v3-beyond-committed").unwrap();
+        write_segment(directory.path(), 10, &Bytes::new()).await;
+        let initial = Position::at_segment_start(10);
+        let committed = Position::at_segment_start(9);
+        let mut reader = SegmentedLogReader::open(directory.path(), initial, MAX_FRAME_LEN)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            reader.read_next(committed).await,
+            Err(SegmentedLogReaderError::ReaderBeyondCommitted {
+                read_position,
+                committed: actual,
+            }) if read_position == initial && actual == committed
+        ));
+        assert_eq!(reader.read_position(), initial);
+    }
+
+    #[tokio::test]
+    async fn frame_beyond_committed_restores_the_read_position() {
+        let directory = temp_dir::TempDir::with_prefix("vector-disk-v3-frame-beyond").unwrap();
+        let frame = frame(10, 2, b"crosses-watermark");
+        write_segment(directory.path(), 10, &frame).await;
+        let initial = Position::at_segment_start(10);
+        let committed = Position::new(10, u64::try_from(frame.len()).unwrap(), 11);
+        let frame_end = Position::new(10, u64::try_from(frame.len()).unwrap(), 12);
+        let mut reader = SegmentedLogReader::open(directory.path(), initial, MAX_FRAME_LEN)
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            assert!(matches!(
+                reader.read_next(committed).await,
+                Err(SegmentedLogReaderError::ReaderBeyondCommitted {
+                    read_position,
+                    committed: actual,
+                }) if read_position == frame_end && actual == committed
+            ));
+            assert_eq!(reader.read_position(), initial);
+        }
     }
 
     #[tokio::test]
@@ -495,10 +753,11 @@ mod tests {
         write_segment(directory.path(), 12, &second).await;
 
         let position = Position::new(10, first_len, 12);
+        let committed = Position::new(12, u64::try_from(second.len()).unwrap(), 13);
         let mut reader = SegmentedLogReader::open(directory.path(), position, MAX_FRAME_LEN)
             .await
             .unwrap();
-        let SegmentedRead::Frame { frame, .. } = reader.read_next().await.unwrap() else {
+        let SegmentedRead::Frame { frame, .. } = reader.read_next(committed).await.unwrap() else {
             panic!("expected frame from the next segment");
         };
         assert_eq!(frame.record_id(), 12);
@@ -549,17 +808,20 @@ mod tests {
         let after_gap = frame(12, 1, b"first-after-corruption");
         let mut bytes = Vec::from(first.as_ref());
         bytes.extend_from_slice(&after_gap);
-        write_segment(directory.path(), 10, &Bytes::from(bytes)).await;
+        let bytes = Bytes::from(bytes);
+        write_segment(directory.path(), 10, &bytes).await;
 
         let initial = Position::at_segment_start(10);
+        let committed = Position::new(10, u64::try_from(bytes.len()).unwrap(), 13);
         let mut reader = SegmentedLogReader::open(directory.path(), initial, MAX_FRAME_LEN)
             .await
             .unwrap();
         assert!(matches!(
-            reader.read_next().await.unwrap(),
+            reader.read_next(committed).await.unwrap(),
             SegmentedRead::Frame { frame, .. } if frame.record_id() == 10
         ));
-        let SegmentedRead::Frame { frame, position } = reader.read_next().await.unwrap() else {
+        let SegmentedRead::Frame { frame, position } = reader.read_next(committed).await.unwrap()
+        else {
             panic!("expected frame after record ID gap");
         };
         assert_eq!(frame.record_id(), 12);
@@ -576,15 +838,17 @@ mod tests {
         write_segment(directory.path(), 15, &after_gap).await;
 
         let initial = Position::at_segment_start(10);
+        let committed = Position::new(15, u64::try_from(after_gap.len()).unwrap(), 16);
         let mut reader = SegmentedLogReader::open(directory.path(), initial, MAX_FRAME_LEN)
             .await
             .unwrap();
         assert!(matches!(
-            reader.read_next().await.unwrap(),
+            reader.read_next(committed).await.unwrap(),
             SegmentedRead::Frame { frame, .. } if frame.record_id() == 10
         ));
 
-        let SegmentedRead::Frame { frame, position } = reader.read_next().await.unwrap() else {
+        let SegmentedRead::Frame { frame, position } = reader.read_next(committed).await.unwrap()
+        else {
             panic!("expected frame after missing segment");
         };
         assert_eq!(frame.record_id(), 15);

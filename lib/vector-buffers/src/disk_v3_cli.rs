@@ -209,6 +209,15 @@ async fn read(args: ReadArgs) -> ToolResult<()> {
         args.segment_byte_offset,
         args.next_record_id,
     );
+    let committed = SegmentedLogReader::recover_tail(&args.data_dir, args.max_frame_size.get())
+        .await?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "the data directory contains no disk-v3 segments",
+            )
+        })?
+        .position();
     let mut reader =
         SegmentedLogReader::open(&args.data_dir, initial, args.max_frame_size.get()).await?;
     let mut frames_read = 0_u64;
@@ -218,7 +227,7 @@ async fn read(args: ReadArgs) -> ToolResult<()> {
             break;
         }
 
-        match reader.read_next().await? {
+        match reader.read_next(committed).await? {
             SegmentedRead::Frame { frame, position } => {
                 let event: Value = serde_json::from_slice(frame.payload())?;
                 let output = if args.with_positions {
@@ -240,14 +249,7 @@ async fn read(args: ReadArgs) -> ToolResult<()> {
                 write_json(&output, args.pretty)?;
                 frames_read += 1;
             }
-            SegmentedRead::EndOfAvailableData => break,
-            SegmentedRead::IncompleteTail => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "the active segment ends with an incomplete frame",
-                )
-                .into());
-            }
+            SegmentedRead::CaughtUp => break,
         }
     }
 

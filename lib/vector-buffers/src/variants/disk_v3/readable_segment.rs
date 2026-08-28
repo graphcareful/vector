@@ -2,7 +2,10 @@ use std::{io, io::SeekFrom, num::NonZeroU32};
 
 use bytes::{Bytes, BytesMut};
 use snafu::Snafu;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
+use tokio::{
+    fs::File,
+    io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt},
+};
 
 use super::{
     frame::{FRAME_HEADER_LEN, FrameDecodeError, decode_frame_header},
@@ -12,8 +15,8 @@ use super::{
 /// A single segment file positioned at the next unread frame.
 ///
 /// The position advances only after a complete frame has passed all format and
-/// checksum validation. Bytes from an incomplete tail are discarded; the
-/// caller must truncate or reject the segment according to its recovery policy.
+/// checksum validation. An incomplete tail is reported with the cursor restored
+/// to the last frame boundary; the caller must repair or reject the segment.
 #[derive(Debug)]
 pub(crate) struct ReadableSegment<F> {
     file: F,
@@ -95,8 +98,26 @@ where
     /// [`Self::read_next`] distinguishes a clean end from an incomplete tail.
     pub(crate) async fn peek_next_record_id(
         &mut self,
+        segment_byte_limit: u64,
     ) -> Result<Option<u64>, ReadableSegmentError> {
         if self.incomplete_tail {
+            return Ok(None);
+        }
+
+        let segment_byte_offset = self.position.segment_byte_offset();
+        if segment_byte_offset > segment_byte_limit {
+            return Err(ReadableSegmentError::ReadLimitBeforePosition {
+                segment_byte_offset,
+                limit: segment_byte_limit,
+            });
+        }
+        let header_end = segment_byte_offset
+            .checked_add(
+                u64::try_from(FRAME_HEADER_LEN)
+                    .map_err(|_| ReadableSegmentError::OffsetOverflow)?,
+            )
+            .ok_or(ReadableSegmentError::OffsetOverflow)?;
+        if header_end > segment_byte_limit {
             return Ok(None);
         }
 
@@ -127,8 +148,31 @@ where
 
     /// Reads and validates the next frame without decoding its payload into the
     /// application record type.
-    pub(crate) async fn read_next(&mut self) -> Result<SegmentRead, ReadableSegmentError> {
+    pub(crate) async fn read_next(
+        &mut self,
+        segment_byte_limit: u64,
+    ) -> Result<SegmentRead, ReadableSegmentError> {
         if self.incomplete_tail {
+            return Ok(SegmentRead::IncompleteTail);
+        }
+        let segment_byte_offset = self.position.segment_byte_offset();
+        if segment_byte_offset > segment_byte_limit {
+            return Err(ReadableSegmentError::ReadLimitBeforePosition {
+                segment_byte_offset,
+                limit: segment_byte_limit,
+            });
+        }
+        if segment_byte_offset == segment_byte_limit {
+            return Ok(SegmentRead::EndOfAvailableData);
+        }
+        let header_end = segment_byte_offset
+            .checked_add(
+                u64::try_from(FRAME_HEADER_LEN)
+                    .map_err(|_| ReadableSegmentError::OffsetOverflow)?,
+            )
+            .ok_or(ReadableSegmentError::OffsetOverflow)?;
+        if header_end > segment_byte_limit {
+            self.incomplete_tail = true;
             return Ok(SegmentRead::IncompleteTail);
         }
         let header_bytes = match read_header(&mut self.file)
@@ -138,8 +182,7 @@ where
             HeaderRead::Complete(header_bytes) => header_bytes,
             HeaderRead::EndOfAvailableData => return Ok(SegmentRead::EndOfAvailableData),
             HeaderRead::IncompleteTail => {
-                self.incomplete_tail = true;
-                return Ok(SegmentRead::IncompleteTail);
+                return self.restore_after_incomplete_tail().await;
             }
         };
 
@@ -148,6 +191,14 @@ where
             Err(source) => return Err(self.restore_after_frame_error(source).await),
         };
         let frame_len = header.frame_len();
+        let frame_len_u64 =
+            u64::try_from(frame_len).map_err(|_| ReadableSegmentError::OffsetOverflow)?;
+        let next_segment_byte_offset = segment_byte_offset
+            .checked_add(frame_len_u64)
+            .ok_or(ReadableSegmentError::OffsetOverflow)?;
+        if next_segment_byte_offset > segment_byte_limit {
+            return self.restore_after_incomplete_tail().await;
+        }
 
         let mut frame_bytes = BytesMut::with_capacity(frame_len);
         frame_bytes.extend_from_slice(&header_bytes);
@@ -159,8 +210,7 @@ where
         {
             Ok(_) => {}
             Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => {
-                self.incomplete_tail = true;
-                return Ok(SegmentRead::IncompleteTail);
+                return self.restore_after_incomplete_tail().await;
             }
             Err(source) => {
                 return Err(ReadableSegmentError::Io {
@@ -173,13 +223,6 @@ where
         if let Err(source) = header.validate_payload(&frame_bytes[FRAME_HEADER_LEN..]) {
             return Err(self.restore_after_frame_error(source).await);
         }
-        let frame_len_u64 =
-            u64::try_from(frame_len).map_err(|_| ReadableSegmentError::OffsetOverflow)?;
-        let next_segment_byte_offset = self
-            .position
-            .segment_byte_offset()
-            .checked_add(frame_len_u64)
-            .ok_or(ReadableSegmentError::OffsetOverflow)?;
         let record_id = header.record_id();
         let event_count = header.event_count();
         let next_record_id = record_id
@@ -229,6 +272,28 @@ where
             },
         }
     }
+
+    async fn restore_after_incomplete_tail(&mut self) -> Result<SegmentRead, ReadableSegmentError> {
+        let segment_byte_offset = self.position.segment_byte_offset();
+        self.file
+            .seek(SeekFrom::Start(segment_byte_offset))
+            .await
+            .map_err(|source| self.io_error(source))?;
+        self.incomplete_tail = true;
+        Ok(SegmentRead::IncompleteTail)
+    }
+}
+
+impl ReadableSegment<File> {
+    /// Returns the current physical end of the segment without moving the file
+    /// cursor.
+    pub(crate) async fn end_offset(&self) -> Result<u64, ReadableSegmentError> {
+        self.file
+            .metadata()
+            .await
+            .map(|metadata| metadata.len())
+            .map_err(|source| self.io_error(source))
+    }
 }
 
 enum HeaderRead {
@@ -275,7 +340,7 @@ pub(crate) enum SegmentRead {
     /// grow later, so this does not imply that the segment is permanently done.
     EndOfAvailableData,
     /// EOF occurred after part of the next frame. The partial bytes have been
-    /// discarded and this segment cannot resume without being repositioned.
+    /// left unread and this segment cannot resume without being repositioned.
     IncompleteTail,
 }
 
@@ -356,6 +421,12 @@ pub(crate) enum ReadableSegmentError {
     #[snafu(display("segment read offset overflowed"))]
     OffsetOverflow,
 
+    #[snafu(display("segment read position {segment_byte_offset} is beyond byte limit {limit}"))]
+    ReadLimitBeforePosition {
+        segment_byte_offset: u64,
+        limit: u64,
+    },
+
     #[snafu(display(
         "cannot seek to segment byte {segment_byte_offset}: file contains only {file_len} bytes"
     ))]
@@ -374,6 +445,7 @@ pub(crate) enum ReadableSegmentError {
 mod tests {
     use std::{
         cmp,
+        mem::size_of,
         pin::Pin,
         sync::{Arc, Mutex},
         task::{Context, Poll},
@@ -477,6 +549,7 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&first);
         bytes.extend_from_slice(&second);
+        let segment_end = u64::try_from(bytes.len()).unwrap();
         let reader = GrowingReader::new(&bytes, 3);
         let reader_position = reader.clone();
         let mut segment =
@@ -484,11 +557,17 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert_eq!(segment.peek_next_record_id().await.unwrap(), Some(10));
+        assert_eq!(
+            segment.peek_next_record_id(segment_end).await.unwrap(),
+            Some(10)
+        );
         assert_eq!(reader_position.position(), 0);
-        assert_eq!(segment.peek_next_record_id().await.unwrap(), Some(10));
+        assert_eq!(
+            segment.peek_next_record_id(segment_end).await.unwrap(),
+            Some(10)
+        );
         assert_eq!(reader_position.position(), 0);
-        let SegmentRead::Frame(first_read) = segment.read_next().await.unwrap() else {
+        let SegmentRead::Frame(first_read) = segment.read_next(segment_end).await.unwrap() else {
             panic!("expected first frame");
         };
         assert_eq!(first_read.segment_byte_offset(), 0);
@@ -501,9 +580,12 @@ mod tests {
             Position::new(10, u64::try_from(first.len()).unwrap(), 12)
         );
 
-        assert_eq!(segment.peek_next_record_id().await.unwrap(), Some(12));
+        assert_eq!(
+            segment.peek_next_record_id(segment_end).await.unwrap(),
+            Some(12)
+        );
         assert_eq!(reader_position.position(), first.len());
-        let SegmentRead::Frame(second_read) = segment.read_next().await.unwrap() else {
+        let SegmentRead::Frame(second_read) = segment.read_next(segment_end).await.unwrap() else {
             panic!("expected second frame");
         };
         assert_eq!(
@@ -516,55 +598,94 @@ mod tests {
             segment.position(),
             Position::new(10, u64::try_from(first.len() + second.len()).unwrap(), 13,)
         );
-        assert_eq!(segment.peek_next_record_id().await.unwrap(), None);
         assert_eq!(
-            segment.read_next().await.unwrap(),
+            segment.peek_next_record_id(segment_end).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            segment.read_next(segment_end).await.unwrap(),
             SegmentRead::EndOfAvailableData
         );
     }
 
     #[tokio::test]
-    async fn incomplete_header_is_discarded() {
+    async fn incomplete_header_does_not_advance() {
         let frame = encoded_frame(0, 1, b"payload");
         let split = 10;
+        let segment_end = u64::try_from(split).unwrap();
         let reader = GrowingReader::new(&frame[..split], usize::MAX);
         let mut segment =
             ReadableSegment::new(reader, Position::at_segment_start(0), MAX_FRAME_LEN)
                 .await
                 .unwrap();
 
-        assert_eq!(segment.peek_next_record_id().await.unwrap(), None);
         assert_eq!(
-            segment.read_next().await.unwrap(),
+            segment.peek_next_record_id(segment_end).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            segment.read_next(segment_end).await.unwrap(),
             SegmentRead::IncompleteTail
         );
         assert_eq!(segment.position(), Position::at_segment_start(0));
         assert_eq!(
-            segment.read_next().await.unwrap(),
+            segment.read_next(segment_end).await.unwrap(),
             SegmentRead::IncompleteTail
         );
     }
 
     #[tokio::test]
-    async fn incomplete_payload_is_discarded() {
+    async fn incomplete_payload_does_not_advance() {
         let frame = encoded_frame(0, 1, b"payload");
         let split = FRAME_HEADER_LEN + 2;
+        let segment_end = u64::try_from(split).unwrap();
         let reader = GrowingReader::new(&frame[..split], usize::MAX);
         let mut segment =
             ReadableSegment::new(reader, Position::at_segment_start(0), MAX_FRAME_LEN)
                 .await
                 .unwrap();
 
-        assert_eq!(segment.peek_next_record_id().await.unwrap(), Some(0));
         assert_eq!(
-            segment.read_next().await.unwrap(),
+            segment.peek_next_record_id(segment_end).await.unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            segment.read_next(segment_end).await.unwrap(),
             SegmentRead::IncompleteTail
         );
         assert_eq!(segment.position(), Position::at_segment_start(0));
         assert_eq!(
-            segment.read_next().await.unwrap(),
+            segment.read_next(segment_end).await.unwrap(),
             SegmentRead::IncompleteTail
         );
+    }
+
+    #[tokio::test]
+    async fn declared_frame_length_cannot_cross_the_read_limit() {
+        let mut committed = encoded_frame(0, 1, b"committed").to_vec();
+        let committed_len = committed.len();
+        let declared_payload_len = u32::try_from(committed_len).unwrap() + 1;
+        committed[FRAME_HEADER_LEN - size_of::<u32>()..FRAME_HEADER_LEN]
+            .copy_from_slice(&declared_payload_len.to_be_bytes());
+        let unpublished = encoded_frame(1, 1, b"unpublished");
+        let mut bytes = committed;
+        bytes.extend_from_slice(&unpublished);
+        let reader = GrowingReader::new(&bytes, usize::MAX);
+        let reader_position = reader.clone();
+        let mut segment =
+            ReadableSegment::new(reader, Position::at_segment_start(0), MAX_FRAME_LEN)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            segment
+                .read_next(u64::try_from(committed_len).unwrap())
+                .await
+                .unwrap(),
+            SegmentRead::IncompleteTail
+        );
+        assert_eq!(segment.position(), Position::at_segment_start(0));
+        assert_eq!(reader_position.position(), 0);
     }
 
     #[tokio::test]
@@ -574,6 +695,7 @@ mod tests {
         corrupt[0] ^= 0xff;
         let mut bytes = first.to_vec();
         bytes.extend_from_slice(&corrupt);
+        let segment_end = u64::try_from(bytes.len()).unwrap();
         let reader = GrowingReader::new(&bytes, usize::MAX);
         let reader_position = reader.clone();
         let mut segment =
@@ -582,14 +704,14 @@ mod tests {
                 .unwrap();
 
         assert!(matches!(
-            segment.read_next().await,
+            segment.read_next(segment_end).await,
             Ok(SegmentRead::Frame(frame)) if frame.record_id() == 0
         ));
         let expected_position = Position::new(0, u64::try_from(first.len()).unwrap(), 1);
 
         for _ in 0..2 {
             assert!(matches!(
-                segment.read_next().await,
+                segment.read_next(segment_end).await,
                 Err(ReadableSegmentError::Frame {
                     segment_byte_offset,
                     source: FrameDecodeError::InvalidMagic { .. },
@@ -607,6 +729,7 @@ mod tests {
         *corrupt.last_mut().unwrap() ^= 0xff;
         let mut bytes = first.to_vec();
         bytes.extend_from_slice(&corrupt);
+        let segment_end = u64::try_from(bytes.len()).unwrap();
         let reader = GrowingReader::new(&bytes, usize::MAX);
         let reader_position = reader.clone();
         let mut segment =
@@ -615,14 +738,14 @@ mod tests {
                 .unwrap();
 
         assert!(matches!(
-            segment.read_next().await,
+            segment.read_next(segment_end).await,
             Ok(SegmentRead::Frame(frame)) if frame.record_id() == 0
         ));
         let expected_position = Position::new(0, u64::try_from(first.len()).unwrap(), 1);
 
         for _ in 0..2 {
             assert!(matches!(
-                segment.read_next().await,
+                segment.read_next(segment_end).await,
                 Err(ReadableSegmentError::Frame {
                     segment_byte_offset,
                     source: FrameDecodeError::ChecksumMismatch { .. },

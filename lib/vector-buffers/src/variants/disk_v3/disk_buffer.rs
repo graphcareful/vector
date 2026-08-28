@@ -690,26 +690,16 @@ impl<T> DiskBufferReceiver<T> {
     ) -> Result<Option<PendingAcknowledgement>, DiskBufferError> {
         loop {
             let writer_state = self.state.borrow().clone();
-            let read_position = self.reader.read_position();
-            if read_position.next_record_id() < writer_state.committed.next_record_id() {
-                let read = self
-                    .reader
-                    .read_next()
-                    .await
-                    .map_err(|source| DiskBufferError::Reader { source })?;
-                let SegmentedRead::Frame { frame, position } = read else {
-                    return Err(DiskBufferError::CommittedDataUnavailable {
-                        read_position,
-                        committed: writer_state.committed,
-                    });
-                };
-                return Ok(Some(PendingAcknowledgement { frame, position }));
-            }
-            if read_position.next_record_id() > writer_state.committed.next_record_id() {
-                return Err(DiskBufferError::ReaderBeyondCommitted {
-                    read_position,
-                    committed: writer_state.committed,
-                });
+            match self
+                .reader
+                .read_next(writer_state.committed)
+                .await
+                .map_err(|source| DiskBufferError::Reader { source })?
+            {
+                SegmentedRead::Frame { frame, position } => {
+                    return Ok(Some(PendingAcknowledgement { frame, position }));
+                }
+                SegmentedRead::CaughtUp => {}
             }
 
             match writer_state.status {
@@ -887,20 +877,4 @@ pub(crate) enum DiskBufferError {
 
     #[snafu(display("disk buffer writer actor failed: {reason}"))]
     ActorFailed { reason: Arc<str> },
-
-    #[snafu(display(
-        "reader at {read_position:?} could not read data committed through {committed:?}"
-    ))]
-    CommittedDataUnavailable {
-        read_position: Position,
-        committed: Position,
-    },
-
-    #[snafu(display(
-        "reader position {read_position:?} advanced beyond committed position {committed:?}"
-    ))]
-    ReaderBeyondCommitted {
-        read_position: Position,
-        committed: Position,
-    },
 }

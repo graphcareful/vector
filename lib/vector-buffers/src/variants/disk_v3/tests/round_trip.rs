@@ -18,11 +18,12 @@ async fn writes_rolls_and_reads_frames_with_restartable_positions() {
     let frame_len = frames[0].encoded_len();
     assert!(frames.iter().all(|frame| frame.encoded_len() == frame_len));
     let segment_size = u64::try_from(frame_len * FRAMES_PER_SEGMENT).unwrap();
+    let committed = expected_position_after(RECORD_COUNT - 1, frame_len);
 
     write_and_assert_rolls(&harness, &frames, segment_size).await;
     assert_segment_files(&harness, &frames, segment_size).await;
-    let positions = read_and_assert_frames(&harness, &frames, frame_len).await;
-    assert_positions_are_restartable(&harness, &frames, &positions, frame_len).await;
+    let positions = read_and_assert_frames(&harness, &frames, frame_len, committed).await;
+    assert_positions_are_restartable(&harness, &frames, &positions, frame_len, committed).await;
 }
 
 fn test_frames(harness: &DiskV3Harness) -> Vec<TestFrame> {
@@ -83,6 +84,7 @@ async fn read_and_assert_frames(
     harness: &DiskV3Harness,
     frames: &[TestFrame],
     frame_len: usize,
+    committed: Position,
 ) -> Vec<Position> {
     let mut reader = harness
         .open_reader(Position::at_segment_start(FIRST_RECORD_ID))
@@ -90,7 +92,8 @@ async fn read_and_assert_frames(
     let mut positions = Vec::with_capacity(frames.len());
 
     for (index, expected_frame) in frames.iter().enumerate() {
-        let SegmentedRead::Frame { frame, position } = reader.read_next().await.unwrap() else {
+        let SegmentedRead::Frame { frame, position } = reader.read_next(committed).await.unwrap()
+        else {
             panic!("expected frame {index}");
         };
         let expected_position = expected_position_after(index, frame_len);
@@ -106,8 +109,8 @@ async fn read_and_assert_frames(
     }
 
     assert_eq!(
-        reader.read_next().await.unwrap(),
-        SegmentedRead::EndOfAvailableData
+        reader.read_next(committed).await.unwrap(),
+        SegmentedRead::CaughtUp
     );
     assert_eq!(reader.read_position(), *positions.last().unwrap());
     positions
@@ -118,6 +121,7 @@ async fn assert_positions_are_restartable(
     frames: &[TestFrame],
     positions: &[Position],
     frame_len: usize,
+    committed: Position,
 ) {
     // Include checkpoints at exact segment ends in the restart coverage.
     for (index, position) in positions.iter().copied().enumerate() {
@@ -125,14 +129,14 @@ async fn assert_positions_are_restartable(
 
         if index + 1 == frames.len() {
             assert_eq!(
-                restarted.read_next().await.unwrap(),
-                SegmentedRead::EndOfAvailableData
+                restarted.read_next(committed).await.unwrap(),
+                SegmentedRead::CaughtUp
             );
         } else {
             let SegmentedRead::Frame {
                 frame,
                 position: next_position,
-            } = restarted.read_next().await.unwrap()
+            } = restarted.read_next(committed).await.unwrap()
             else {
                 panic!("expected frame after checkpoint {index}");
             };
