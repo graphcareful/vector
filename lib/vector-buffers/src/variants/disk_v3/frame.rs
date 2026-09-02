@@ -312,6 +312,33 @@ pub(crate) enum FrameDecodeError {
     ChecksumMismatch { calculated: u32, actual: u32 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FrameDecodeErrorKind {
+    RecoverableCorruption,
+    IncompatibleFormat,
+    IncompleteData,
+}
+
+impl FrameDecodeError {
+    #[must_use]
+    pub(crate) const fn kind(&self) -> FrameDecodeErrorKind {
+        match self {
+            Self::InvalidMagic { .. }
+            | Self::DeclaredFrameTooLarge { .. }
+            | Self::LengthOverflow
+            | Self::ZeroEventCount
+            | Self::NonzeroReservedField { .. }
+            | Self::ChecksumMismatch { .. } => FrameDecodeErrorKind::RecoverableCorruption,
+            Self::UnsupportedVersion { .. }
+            | Self::UnsupportedFlags { .. }
+            | Self::UnsupportedPayloadCodec { .. } => FrameDecodeErrorKind::IncompatibleFormat,
+            Self::IncompleteHeader { .. } | Self::IncompleteFrame { .. } => {
+                FrameDecodeErrorKind::IncompleteData
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +482,67 @@ mod tests {
                 version: FRAME_VERSION + 1,
             })
         );
+    }
+
+    #[test]
+    fn decode_errors_are_classified() {
+        use FrameDecodeErrorKind::{IncompatibleFormat, IncompleteData, RecoverableCorruption};
+
+        let cases = [
+            (
+                FrameDecodeError::IncompleteHeader {
+                    available: 1,
+                    required: FRAME_HEADER_LEN,
+                },
+                IncompleteData,
+            ),
+            (
+                FrameDecodeError::InvalidMagic { actual: [0; 4] },
+                RecoverableCorruption,
+            ),
+            (
+                FrameDecodeError::UnsupportedVersion { version: 2 },
+                IncompatibleFormat,
+            ),
+            (
+                FrameDecodeError::UnsupportedFlags { flags: 1 },
+                IncompatibleFormat,
+            ),
+            (
+                FrameDecodeError::DeclaredFrameTooLarge {
+                    frame_len: 1025,
+                    limit: 1024,
+                },
+                RecoverableCorruption,
+            ),
+            (FrameDecodeError::LengthOverflow, RecoverableCorruption),
+            (FrameDecodeError::ZeroEventCount, RecoverableCorruption),
+            (
+                FrameDecodeError::UnsupportedPayloadCodec { codec: 2 },
+                IncompatibleFormat,
+            ),
+            (
+                FrameDecodeError::NonzeroReservedField { value: 1 },
+                RecoverableCorruption,
+            ),
+            (
+                FrameDecodeError::IncompleteFrame {
+                    available: FRAME_HEADER_LEN,
+                    required: FRAME_HEADER_LEN + 1,
+                },
+                IncompleteData,
+            ),
+            (
+                FrameDecodeError::ChecksumMismatch {
+                    calculated: 1,
+                    actual: 2,
+                },
+                RecoverableCorruption,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.kind(), expected, "{error}");
+        }
     }
 }

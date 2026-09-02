@@ -8,7 +8,7 @@ use tokio::{
 };
 
 use super::{
-    frame::{FRAME_HEADER_LEN, FrameDecodeError, decode_frame_header},
+    frame::{FRAME_HEADER_LEN, FrameDecodeError, FrameDecodeErrorKind, decode_frame_header},
     position::Position,
 };
 
@@ -140,9 +140,13 @@ where
         };
         decode_frame_header(&header_bytes, self.max_frame_len)
             .map(|header| Some(header.record_id()))
-            .map_err(|source| ReadableSegmentError::Frame {
-                segment_byte_offset: self.position.segment_byte_offset(),
-                source,
+            .map_err(|source| {
+                let kind = source.kind();
+                ReadableSegmentError::Frame {
+                    segment_byte_offset: self.position.segment_byte_offset(),
+                    kind,
+                    source,
+                }
             })
     }
 
@@ -260,9 +264,11 @@ where
         frame_error: FrameDecodeError,
     ) -> ReadableSegmentError {
         let segment_byte_offset = self.position.segment_byte_offset();
+        let kind = frame_error.kind();
         match self.file.seek(SeekFrom::Start(segment_byte_offset)).await {
             Ok(_) => ReadableSegmentError::Frame {
                 segment_byte_offset,
+                kind,
                 source: frame_error,
             },
             Err(source) => ReadableSegmentError::FramePositionRestore {
@@ -406,6 +412,7 @@ pub(crate) enum ReadableSegmentError {
     #[snafu(display("invalid frame in segment at byte {segment_byte_offset}: {source}"))]
     Frame {
         segment_byte_offset: u64,
+        kind: FrameDecodeErrorKind,
         source: FrameDecodeError,
     },
 
@@ -714,6 +721,7 @@ mod tests {
                 segment.read_next(segment_end).await,
                 Err(ReadableSegmentError::Frame {
                     segment_byte_offset,
+                    kind: FrameDecodeErrorKind::RecoverableCorruption,
                     source: FrameDecodeError::InvalidMagic { .. },
                 }) if segment_byte_offset == u64::try_from(first.len()).unwrap()
             ));
@@ -748,6 +756,7 @@ mod tests {
                 segment.read_next(segment_end).await,
                 Err(ReadableSegmentError::Frame {
                     segment_byte_offset,
+                    kind: FrameDecodeErrorKind::RecoverableCorruption,
                     source: FrameDecodeError::ChecksumMismatch { .. },
                 }) if segment_byte_offset == u64::try_from(first.len()).unwrap()
             ));
